@@ -12,7 +12,8 @@ export default async function AdminLayout({ children }: { children: React.ReactN
         <Link href="/admin/candidates" className="underline">Candidates</Link>
         <Link href="/admin/dedupe" className="underline">Dedupe</Link>
         <Link href="/admin/roles" className="underline">Roles</Link>
-        <Link href="/admin/banks" className="underline">Item bank</Link>
+        <Link href="/admin/banks" className="underline">Reasoning bank</Link>
+        <Link href="/admin/quiz-bank" className="underline">Quiz bank</Link>
       </nav>
       {children}
     </div>

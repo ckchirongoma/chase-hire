@@ -3,6 +3,8 @@ import { notFound, redirect } from "next/navigation";
 import { z } from "zod";
 import { requireAdmin } from "@/lib/server/auth";
 import { fmtDate, STAGE_LABEL, STATUS_LABEL } from "@/lib/format";
+import InterviewPanel from "@/components/admin/interview-panel";
+import { QuizPanel } from "@/components/admin/quiz-panel";
 
 export const dynamic = "force-dynamic";
 
@@ -124,6 +126,14 @@ export default async function CandidateDetail({
         })}
         {!applications.data?.length && <p className="muted">No applications yet.</p>}
       </section>
+
+      {applications.data?.map((a) => (
+        <section key={`detail-${a.id}`} className="space-y-4">
+          <h2 className="h2">{(a.roles as unknown as { title: string } | null)?.title}: assessment detail</h2>
+          <InterviewPanel applicationId={a.id} />
+          <QuizPanel applicationId={a.id} />
+        </section>
+      ))}
 
       <section className="card space-y-2">
         <h2 className="h2">Dedupe flags</h2>

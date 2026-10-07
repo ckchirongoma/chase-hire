@@ -73,6 +73,12 @@ export default async function RolePage({
               </p>
             )}
             {applied && <p className="notice">Application received.</p>}
+            {["in_progress", "advanced"].includes(application.status) && application.stage === "interview" && (
+              <Link href={`/apply/${role.slug}/interview`} className="btn">Next: AI CV interview (about 20 minutes)</Link>
+            )}
+            {["in_progress", "advanced"].includes(application.status) && application.stage === "quiz" && (
+              <Link href={`/apply/${role.slug}/quiz`} className="btn">Next: role quiz (12 minutes)</Link>
+            )}
             <Link href="/me/results" className="btn-secondary">See my results</Link>
           </>
         ) : !user ? (

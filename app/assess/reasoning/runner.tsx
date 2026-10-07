@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { logSignal } from "@/lib/client/signals";
+import { quizClock } from "@/lib/quiz/clock";
 
 type Stem = { prompt: string; table?: { columns: string[]; rows: (string | number)[][] }; footnote?: string };
 type State =
@@ -17,7 +18,7 @@ export default function Runner({ resume }: { resume: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [remaining, setRemaining] = useState<number>(0);
   const offset = useRef(0); // server clock minus client clock
-  const expiredFor = useRef<string | null>(null);
+  const lastExpiryCheck = useRef<number | null>(null);
 
   const apply = useCallback((s: State) => {
     setState(s);
@@ -54,10 +55,13 @@ export default function Runner({ resume }: { resume: boolean }) {
     if (state?.status !== "active") return;
     const deadline = new Date(state.deadlineAt).getTime();
     const tick = () => {
-      const left = deadline - (Date.now() + offset.current);
-      setRemaining(Math.max(0, left));
-      if (left <= 0 && expiredFor.current !== state.attemptId) {
-        expiredFor.current = state.attemptId;
+      // Same grace rules as the quiz: ask for the result once the server's grace has passed,
+      // and keep asking every few seconds until it reports the attempt as done.
+      const now = Date.now() + offset.current;
+      const clock = quizClock(deadline, now, lastExpiryCheck.current);
+      setRemaining(clock.remainingMs);
+      if (clock.expiryCheckDue) {
+        lastExpiryCheck.current = now;
         call("/api/reasoning/state");
       }
     };

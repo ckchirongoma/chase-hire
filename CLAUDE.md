@@ -23,6 +23,7 @@ Expected volume is hundreds of applicants from a LinkedIn post, so the early sta
   - pgvector (CV dedupe)
   - `pg_cron` if needed
 - **OpenRouter:** every LLM call (CV parsing, AI interviewer, stakeholder persona, graders). Use structured JSON output. The model ID lives in config, never hard-coded.
+- **JEV (TypeSafe System One):** fast typed decisions for flow control only (interview probing, persona fact gating, injection pre-screen). Never for grades or hiring decisions. See `docs/15-jev-system-one.md`.
 - Nothing else unless a doc explicitly says so.
 
 ## Hard rules
@@ -64,6 +65,7 @@ Expected volume is hundreds of applicants from a LinkedIn post, so the early sta
 | `docs/12-compliance.md` | POPIA, EEA s8, HPCSA, retention, candidate notices |
 | `docs/13-reference-spiky-pov.md` | Gold-standard BA Part 1 answer (calibration anchor) |
 | `docs/14-research-and-sources.md` | The evidence behind the design decisions |
+| `docs/15-jev-system-one.md` | JEV: what it is, benefits, limits and exactly where it is used |
 | `context/cosmo-defect-catalogue.md` | INTERNAL: the real workbook defects the synthetic data mirrors |
 | `context/client-context.md` | INTERNAL: Cosmo, the label project, Aurachain. Never shown to candidates |
 

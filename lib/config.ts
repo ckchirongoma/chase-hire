@@ -18,6 +18,10 @@ const serverSchema = z.object({
   OPENROUTER_MODEL_CV_PARSE: z.string().min(1),
   OPENROUTER_MODEL_CV_VISION: z.string().min(1),
   OPENROUTER_MODEL_EMBED: z.string().min(1).default("openai/text-embedding-3-small"),
+  /** Strong reasoning model for all graders (3 samples per criterion). */
+  OPENROUTER_MODEL_GRADER: z.string().min(1),
+  /** Cheap fast model for the BA stakeholder persona's replies. */
+  OPENROUTER_MODEL_PERSONA: z.string().min(1),
   CRON_SECRET: z.string().min(16).optional(),
 });
 

@@ -15,6 +15,11 @@ const local = {
   OPENROUTER_MODEL_CV_PARSE: "stub/cv-parse",
   OPENROUTER_MODEL_CV_VISION: "stub/cv-vision",
   OPENROUTER_MODEL_EMBED: "stub/embed",
+  OPENROUTER_MODEL_GRADER: "stub/grader",
+  OPENROUTER_MODEL_PERSONA: "stub/persona",
+  TYPESAFE_API_KEY: "stub",
+  TYPESAFE_BASE_URL: "http://127.0.0.1:4010",
+  CRON_SECRET: "e2e-cron-secret-123456",
 };
 
 export default defineConfig({
@@ -29,7 +34,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: [
-    { command: "node tests/e2e/openrouter-stub.mjs", url: "http://127.0.0.1:4010/health", reuseExistingServer: true },
+    { command: "node tests/stubs/ai-stub.mjs", url: "http://127.0.0.1:4010/health", reuseExistingServer: true },
     {
       command: "npx next build && npx next start -p 3000",
       url: "http://localhost:3000",

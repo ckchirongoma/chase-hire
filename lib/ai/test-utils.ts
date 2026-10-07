@@ -9,6 +9,8 @@ export const TEST_ENV = {
   OPENROUTER_MODEL_CV_PARSE: "test/cv-parse-model",
   OPENROUTER_MODEL_CV_VISION: "test/cv-vision-model",
   OPENROUTER_MODEL_EMBED: "test/embed-model",
+  OPENROUTER_MODEL_GRADER: "test/grader-model",
+  OPENROUTER_MODEL_PERSONA: "test/persona-model",
 } as const;
 
 export function stubAiEnv(): void {

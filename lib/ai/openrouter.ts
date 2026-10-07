@@ -65,7 +65,7 @@ const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_ERROR_CHARS = 2000;
 
 /** POSTs JSON to OpenRouter. Retries once after ~1s on 429/5xx or a network error. */
-async function postJson(path: string, body: unknown): Promise<unknown> {
+async function postJson(path: string, body: unknown, extraHeaders: Record<string, string> = {}): Promise<unknown> {
   const env = serverEnv();
   const url = `${env.OPENROUTER_BASE_URL.replace(/\/+$/, "")}${path}`;
   const init = (): RequestInit => ({
@@ -73,6 +73,8 @@ async function postJson(path: string, body: unknown): Promise<unknown> {
     headers: {
       Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
       "Content-Type": "application/json",
+      "X-Title": "Chase Hire",
+      ...extraHeaders,
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -190,7 +192,7 @@ export async function chatJson<T>(opts: ChatJsonOptions<T>): Promise<ChatJsonRes
         messages: msgs,
         response_format: { type: "json_object" },
         provider: { data_collection: "deny" },
-      }),
+      }, { "X-Prompt-Version": opts.promptVersion }),
     );
 
   const first = await send(messages);

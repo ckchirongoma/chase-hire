@@ -12,6 +12,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/integration/**/*.test.ts"],
+    globalSetup: ["tests/helpers/ai-stub-setup.ts"],
+    setupFiles: ["tests/helpers/ai-stub-env.ts"],
     fileParallelism: false,
     testTimeout: 30_000,
   },

@@ -1,0 +1,70 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 861 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+50 790 Td
+(Ayanda Fixture) Tj
+T*
+(Software Engineer | Johannesburg) Tj
+T*
+(Email: ayanda.fixture@example.org | Phone: +27 71 555 0199) Tj
+T*
+(GitHub: github.com/ayanda-fixture) Tj
+T*
+T*
+(EXPERIENCE) Tj
+T*
+(Software Engineer, Sample Payments \(2021-06 to present\)) Tj
+T*
+(- Moved the settlement service to Postgres with row-level security for 3 tenants.) Tj
+T*
+(- Cut p95 API latency from 900 ms to 180 ms by adding caching and query indexes.) Tj
+T*
+(- Set up CI with automated tests, raising coverage from 35% to 80%.) Tj
+T*
+(Junior Developer, Placeholder Media \(2019-02 to 2021-05\)) Tj
+T*
+(- Built a Next.js content site serving 200,000 monthly visitors.) Tj
+T*
+T*
+(EDUCATION) Tj
+T*
+(BSc Computer Science, Example Technical University, 2018) Tj
+T*
+T*
+(SKILLS) Tj
+T*
+(TypeScript, Next.js, Node.js, PostgreSQL, Docker, AWS, Vitest) Tj
+T*
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1256
+%%EOF

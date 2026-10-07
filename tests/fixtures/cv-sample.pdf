@@ -1,0 +1,72 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 973 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+50 790 Td
+(Test Candidate) Tj
+T*
+(Business Analyst | Cape Town) Tj
+T*
+(Email: test.candidate@example.co.za | Phone: 082 555 0101) Tj
+T*
+(LinkedIn: linkedin.com/in/test-candidate) Tj
+T*
+T*
+(EXPERIENCE) Tj
+T*
+(Senior Business Analyst, Example Retail Group \(2022-03 to present\)) Tj
+T*
+(- Mapped the month-end close process and cut it from 10 working days to 4.) Tj
+T*
+(- Found 1,240 duplicate supplier records in the vendor master, saving R1.2m a year.) Tj
+T*
+(- Ran 18 discovery workshops with finance and operations stakeholders.) Tj
+T*
+(Business Analyst, Fictional Logistics \(2019-01 to 2022-02\)) Tj
+T*
+(- Built a Power BI dashboard used by 45 depot managers every week.) Tj
+T*
+(- Wrote the requirements for a route-planning MVP that reduced fuel spend by 12%.) Tj
+T*
+T*
+(EDUCATION) Tj
+T*
+(BCom Information Systems, University of Example, 2018) Tj
+T*
+T*
+(SKILLS) Tj
+T*
+(Requirements elicitation, SQL, Power BI, Excel, process mapping, Figma) Tj
+T*
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1368
+%%EOF

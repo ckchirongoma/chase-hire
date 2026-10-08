@@ -21,16 +21,20 @@ export type ClaimReason =
   | "role_title"
   | "generic"
   | "skill_unevidenced"
-  | "cv_consistency";
+  | "cv_consistency"
+  | "role_requirement"
+  | "requirement_gap";
 
 export interface PlanClaim {
   /** CV claim id (c1…), or r1… for a role-title stand-in, or g1… for a generic stand-in. */
   id: string;
   text: string;
-  kind: "claim" | "role" | "generic" | "skill" | "consistency";
+  kind: "claim" | "role" | "generic" | "skill" | "consistency" | "gap";
   why: ClaimReason;
   roleTitle: string | null;
   employer: string | null;
+  /** The part of the job this topic is evidence for (lib/interview/requirements.ts). */
+  requirement?: { key: string; text: string };
 }
 
 export interface PlanQuestion {
@@ -52,6 +56,8 @@ export interface PlanSelection {
   ms: number | null;
   impressive: { choice: string | null; probabilities: Record<string, number> } | null;
   closest: { choice: string | null; probabilities: Record<string, number> } | null;
+  /** JEV's pick per role requirement ("none" = the CV shows nothing for it). */
+  requirements?: Record<string, { choice: string | null; probabilities: Record<string, number> }>;
 }
 
 export interface InterviewPlan {
@@ -121,7 +127,7 @@ export type InterviewView =
       deadlineAt: string;
       serverNow: string;
       done: boolean;
-      endReason: "completed" | "timeout" | null;
+      endReason: "completed" | "timeout" | "ended_by_candidate" | null;
       /** The question currently awaiting an answer (null when done). */
       current: { label: string; text: string } | null;
       totalQuestions: number;

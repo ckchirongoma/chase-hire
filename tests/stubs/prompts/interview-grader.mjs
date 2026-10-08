@@ -63,6 +63,10 @@ export function jev(body) {
         choice = keys.reduce((a, b) => (biggest(q.criteria[b]) > biggest(q.criteria[a]) ? b : a), keys[0]);
       } else if (id === "closest_claim") {
         choice = keys.find((k) => /workshop|discovery|stakeholder|requirement/i.test(q.criteria[k])) ?? keys[0];
+      } else if (id.startsWith("req_")) {
+        // Role requirement → the first claim with matching words, else "none".
+        const re = { data: /dataset|spreadsheet|excel/i, discovery: /workshop|discovery|stakeholder/i, prototype: /built|automat|prototype/i }[id.slice(4)];
+        choice = (re && keys.find((k) => k !== "none" && re.test(q.criteria[k]))) || "none";
       }
       answers[id] = { type: "choice", choice, confidence: 0.8, probabilities: Object.fromEntries(keys.map((k) => [k, k === choice ? 0.8 : 0.2 / Math.max(1, keys.length - 1)])) };
     }

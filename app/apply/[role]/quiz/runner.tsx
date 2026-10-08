@@ -186,11 +186,12 @@ export default function Runner({
         <h2 className="h2">Quiz complete</h2>
         <QuizScore rawScore={r.rawScore} total={r.total} pct={r.pct} topicScores={r.topicScores} roleSlug={role} />
         <p className="notice">
-          What happens next: our team reviews your results; no decision is automatic. You can see your results, and ask
-          for a review, at any time.
+          Well done, that&apos;s the work-readiness part finished. Take a break. Our team reviews your results before the work
+          assessments open, and no decision is automatic. Someone will get back to you by email, and your application page
+          shows what&apos;s next.
         </p>
         <Link href="/me/results" className="btn">
-          See my results
+          Back to my application
         </Link>
       </div>
     );

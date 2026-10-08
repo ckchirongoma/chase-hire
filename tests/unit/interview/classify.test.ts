@@ -4,8 +4,10 @@ vi.mock("@/lib/jev", () => ({ systemOne: vi.fn() }));
 import { systemOne } from "@/lib/jev";
 import { classifyTurn, fallbackTarget, FALLBACK_SUFFICIENT_WORDS, wordCount } from "@/lib/interview/classify";
 import { openScript, applyTurn } from "@/lib/interview/engine";
-import { FOLLOWUP_TARGETS, NO_FOLLOWUP_MS, PROBES, WARMUP_QUESTION } from "@/lib/interview/script";
+import { FOLLOWUP_TARGETS, NO_FOLLOWUP_MS, PROBES, openingQuestion } from "@/lib/interview/script";
 import type { InterviewPlan, Progress } from "@/lib/interview/types";
+
+const WARMUP_QUESTION = openingQuestion("AI-native Software Engineer");
 
 const jev = vi.mocked(systemOne);
 
@@ -77,10 +79,20 @@ describe("classifyTurn without JEV (deterministic fallback)", () => {
     expect((await classifyTurn({ plan, progress: atClaim, message: longNoNumber })).followupTarget).toBe("specifics");
   });
 
-  it("never follows up the warm-up, or with too little time left", async () => {
+  it("follows up the opening question, never the situational one, nor with too little time left", async () => {
     const warm = await classifyTurn({ plan, progress: atWarmup, message: short });
-    expect(warm).toMatchObject({ kind: "answer", followupTarget: null });
-    expect(warm.meta.probe_allowed).toBe(false);
+    expect(warm.kind).toBe("answer");
+    expect(warm.followupTarget).not.toBeNull();
+    expect(warm.meta.probe_allowed).toBe(true);
+    const sitIdx = plan.questions.findIndex((q) => q.step === "situational");
+    const atSituational = {
+      ...atWarmup,
+      qIdx: sitIdx,
+      current: { step: "situational" as const, claimId: null, text: plan.questions[sitIdx].text, questionNo: plan.questions[sitIdx].no },
+    };
+    const sit = await classifyTurn({ plan, progress: atSituational, message: short });
+    expect(sit).toMatchObject({ kind: "answer", followupTarget: null });
+    expect(sit.meta.probe_allowed).toBe(false);
     const late = await classifyTurn({ plan, progress: atClaim, message: short, remainingMs: NO_FOLLOWUP_MS - 1 });
     expect(late.followupTarget).toBeNull();
   });
@@ -100,9 +112,9 @@ describe("classifyTurn without JEV (deterministic fallback)", () => {
 describe("classifyTurn with JEV", () => {
   it("asks only the questions that apply, and passes the question and CV topic as state", async () => {
     jev.mockResolvedValue(jevResult(calm));
-    await classifyTurn({ plan, progress: atWarmup, message: short });
+    await classifyTurn({ plan, progress: atWarmup, message: short, remainingMs: NO_FOLLOWUP_MS - 1 });
     const [state, questions] = jev.mock.calls[0];
-    expect(Object.keys(questions)).toEqual(["off_script", "role_question"]);
+    expect(Object.keys(questions)).toEqual(["off_script", "role_question"]); // too little time left for a follow-up
     expect(state).toMatchObject({ interviewer_question: WARMUP_QUESTION, candidate_answer: short, question_type: "warmup", cv_topic: null });
     expect(String((state as { context: string }).context)).toMatch(/screening conversation/);
 

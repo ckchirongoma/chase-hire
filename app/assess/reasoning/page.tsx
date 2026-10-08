@@ -24,9 +24,13 @@ export default async function ReasoningPage() {
         <h1 className="h1">Reasoning Assessment</h1>
         <ReasoningResultCard rawScore={a.raw_score ?? 0} percentile={Number(a.percentile)} stars={a.stars!} normVersion={a.norm_version} />
         <p className="muted">You can retake the assessment from {nextDate.toLocaleDateString("en-ZA")}.</p>
+        <p className="text-sm">
+          Take a break if you like. When you apply to a role, the next step is a spoken AI interview about your CV (about 25
+          to 30 minutes). It only starts when you press Start, so you can apply now and do it later.
+        </p>
         <div className="flex gap-3">
           <Link href="/roles" className="btn">Apply to a role</Link>
-          <Link href="/me/results" className="btn-secondary">My results</Link>
+          <Link href="/me/results" className="btn-secondary">My application</Link>
         </div>
       </div>
     );

@@ -71,20 +71,13 @@ export default async function ResultsPage({ searchParams }: { searchParams: Prom
 
   return (
     <div className="space-y-6">
-      <h1 className="h1">My results</h1>
-
-      {reasoning ? (
-        <ReasoningResultCard
-          rawScore={reasoning.raw_score}
-          percentile={Number(reasoning.percentile)}
-          stars={reasoning.stars}
-          normVersion={reasoning.norm_version}
-        />
-      ) : (
-        <p className="notice">
-          You haven&apos;t completed the Reasoning Assessment yet. <Link href="/start" className="underline">Continue</Link>
+      <div>
+        <h1 className="h1">My application</h1>
+        <p className="muted">
+          Where you are, what&apos;s next and every score so far. People on our team make every decision, and someone will
+          get back to you at each step.
         </p>
-      )}
+      </div>
 
       {results.error || !parsed.success ? (
         <p className="error">We couldn&apos;t load your applications just now. Please refresh the page.</p>
@@ -94,52 +87,89 @@ export default async function ResultsPage({ searchParams }: { searchParams: Prom
         <section className="card">
           <h2 className="h2">Applications</h2>
           <p className="muted">
-            No applications yet. <Link href="/roles" className="underline">See open roles</Link>.
+            {reasoning ? "No applications yet. " : null}
+            <Link href={reasoning ? "/roles" : "/start"} className="underline">
+              {reasoning ? "See open roles" : "Continue setting up your account"}
+            </Link>
+            .
           </p>
         </section>
       )}
 
-      <section className="card space-y-3">
-        <h2 className="h2">Request a review</h2>
-        <p className="muted">
-          You can ask a person on our team to review any score or decision, and tell us anything you think we should
-          take into account. We will reply here.
-        </p>
-        <form action={requestReview} className="space-y-3">
-          <select name="target" className="input" defaultValue="reasoning:" aria-label="What should we review?">
-            {reviewTargets(applications).map((t) => (
-              <option key={t.value} value={t.value}>
-                {t.label}
-              </option>
-            ))}
-          </select>
-          <textarea
-            name="message"
-            className="input"
-            rows={4}
-            minLength={10}
-            maxLength={4000}
-            required
-            placeholder="What would you like us to review, and why?"
-          />
-          {error && <p className="error">{error}</p>}
-          {sent && <p className="notice">Sent. We will reply here.</p>}
-          <button className="btn">Send request</button>
-        </form>
-        {!!reviews?.length && (
-          <ul className="space-y-2 text-sm">
-            {reviews.map((r) => (
-              <li key={r.id} className="rounded border border-slate-200 p-3">
-                <p className="muted">
-                  {fmtDate(r.created_at)} · {REVIEW_STAGE_LABEL[r.stage] ?? r.stage} · {r.status}
-                </p>
-                <p>{r.message}</p>
-                {r.response && <p className="mt-1 border-l-2 border-slate-300 pl-2">Our reply: {r.response}</p>}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      <details className="group card" open={!applications.length}>
+        <summary className="flex cursor-pointer list-none items-center justify-between [&::-webkit-details-marker]:hidden">
+          <h2 className="h2 mb-0">Reasoning Assessment</h2>
+          <span className="flex items-center gap-3 text-sm text-slate-600">
+            {reasoning ? `${"★".repeat(reasoning.stars)} · ${reasoning.raw_score} of 30` : "Not done yet"}
+            <span className="transition-transform group-open:rotate-180" aria-hidden="true">▾</span>
+          </span>
+        </summary>
+        <div className="mt-3">
+          {reasoning ? (
+            <ReasoningResultCard
+              rawScore={reasoning.raw_score}
+              percentile={Number(reasoning.percentile)}
+              stars={reasoning.stars}
+              normVersion={reasoning.norm_version}
+            />
+          ) : (
+            <p className="notice">
+              You haven&apos;t completed the Reasoning Assessment yet. <Link href="/start" className="underline">Continue</Link>
+            </p>
+          )}
+        </div>
+      </details>
+
+      <details className="group card" open={!!error || !!sent}>
+        <summary className="flex cursor-pointer list-none items-center justify-between [&::-webkit-details-marker]:hidden">
+          <h2 className="h2 mb-0">Ask a person to review something</h2>
+          <span className="flex items-center gap-3 text-sm text-slate-600">
+            {reviews?.length ? `${reviews.length} request${reviews.length === 1 ? "" : "s"}` : null}
+            <span className="transition-transform group-open:rotate-180" aria-hidden="true">▾</span>
+          </span>
+        </summary>
+        <div className="mt-3 space-y-3">
+          <p className="muted">
+            You can ask a person on our team to review any score or decision, ask for an adjustment (for example typing
+            your interview answers if you can&apos;t use a microphone), or tell us anything we should take into account. We
+            will reply here.
+          </p>
+          <form action={requestReview} className="space-y-3">
+            <select name="target" className="input" defaultValue="reasoning:" aria-label="What should we review?">
+              {reviewTargets(applications).map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+            <textarea
+              name="message"
+              className="input"
+              rows={4}
+              minLength={10}
+              maxLength={4000}
+              required
+              placeholder="What would you like us to review, and why?"
+            />
+            {error && <p className="error">{error}</p>}
+            {sent && <p className="notice">Sent. We will reply here.</p>}
+            <button className="btn">Send request</button>
+          </form>
+          {!!reviews?.length && (
+            <ul className="space-y-2 text-sm">
+              {reviews.map((r) => (
+                <li key={r.id} className="rounded border border-slate-200 p-3">
+                  <p className="muted">
+                    {fmtDate(r.created_at)} · {REVIEW_STAGE_LABEL[r.stage] ?? r.stage} · {r.status}
+                  </p>
+                  <p>{r.message}</p>
+                  {r.response && <p className="mt-1 border-l-2 border-slate-300 pl-2">Our reply: {r.response}</p>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </details>
 
       <p className="muted">
         Optional: <Link href="/me/demographics" className="underline">help us check our assessments are fair</Link> (kept apart from

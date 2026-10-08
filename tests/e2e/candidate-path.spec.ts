@@ -89,8 +89,9 @@ test("candidate signs up, uploads a CV, gets a star rating and applies; admin se
   await expect(page.getByText("You have applied")).toBeVisible();
 
   await page.goto("/me/results");
-  await expect(page.getByRole("heading", { name: "Reasoning Assessment result" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Reasoning Assessment", exact: true })).toBeVisible();
   await expect(page.getByTestId("application-software-engineer")).toBeVisible();
+  await expect(page.getByTestId("application-software-engineer").getByTestId("journey")).toBeVisible();
 
   // Random answers usually land below the 3-star hurdle: the application is queued for a
   // person, never rejected. The admin releases it with a written reason.
@@ -131,7 +132,8 @@ test("candidate signs up, uploads a CV, gets a star rating and applies; admin se
   await expect(page.getByText("Thank you, the interview is complete")).toBeVisible();
 
   // Wave 2: timed role quiz.
-  await page.getByRole("link", { name: "Go to the role quiz" }).click();
+  await expect(page.getByTestId("interview-done")).toContainText("Take a break");
+  await page.getByRole("link", { name: "I'm ready for the quiz" }).click();
   await page.getByRole("button", { name: /Start the 12-minute quiz/ }).click();
   for (let i = 1; i <= 15; i++) {
     await expect(page.getByText(`Question ${i} of 15`)).toBeVisible();
@@ -143,6 +145,7 @@ test("candidate signs up, uploads a CV, gets a star rating and applies; admin se
   // Scores appear on the results page once grading (run right after the interview) finishes.
   await expect(async () => {
     await page.goto("/me/results");
+    await page.getByTestId("application-software-engineer").getByRole("heading", { name: "AI CV interview" }).click(); // open the section
     await expect(page.getByTestId("interview-score")).toBeVisible({ timeout: 1000 });
   }).toPass({ timeout: 60_000 });
   await expect(page.getByTestId("application-software-engineer").getByRole("heading", { name: "Role quiz" })).toBeVisible();

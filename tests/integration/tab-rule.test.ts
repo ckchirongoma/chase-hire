@@ -7,10 +7,11 @@ vi.mock("@/lib/supabase/server", () => ({ createClient: async () => h.client }))
 
 import { answer as answerReasoning, finaliseExpired, getState as reasoningState, startAttempt } from "@/lib/server/reasoning";
 import { answerQuiz, finaliseExpiredQuizzes, getQuizState, startQuiz, type QuizState } from "@/lib/server/quiz";
-import { endExpiredInterviews, getInterviewState, InterviewConflict, LOCKED_NOTICE, postInterviewMessage, startInterview } from "@/lib/server/interview";
-import { recordTabLeave } from "@/lib/server/integrity";
+import { endExpiredInterviews, endInterviewEarly, getInterviewState, InterviewConflict, LOCKED_NOTICE, postInterviewMessage, startInterview } from "@/lib/server/interview";
+import { markAway, markBack, recordTabLeave } from "@/lib/server/integrity";
 import type { InterviewView } from "@/lib/interview/types";
 import { POST as leaveRoute } from "@/app/api/integrity/leave/route";
+import { POST as presenceRoute } from "@/app/api/integrity/presence/route";
 import { anon, consent, fakeFinishedAttempt, fakeParsedCv, makeAdmin, newUser, psql, service } from "../helpers/local";
 
 /**
@@ -287,5 +288,119 @@ describe("POST /api/integrity/leave", () => {
       const { error } = await client.rpc("record_tab_leave", { p_kind: "reasoning", p_id: u.id, p_user: u.id, p_hidden_ms: 5000 });
       expect(error).not.toBeNull();
     }
+  });
+});
+
+describe("tab rule: closing the tab, reloading or navigating away", () => {
+  // Pretend the page went away `ms` ago (the DB clock times the absence).
+  const awayFor = (table: string, id: string, ms: number) =>
+    admin.from(table).update({ away_since: new Date(Date.now() - ms).toISOString() }).eq("id", id);
+
+  it("counts a close-and-reopen like a tab switch: pause, then lock; a quick reload is ignored", async () => {
+    const u = await newUser("tab-close");
+    await consent(u.client);
+    await fakeParsedCv(u.id);
+    const s = await startAttempt(admin, u.id);
+    if (s.status !== "active") throw new Error("expected an active attempt");
+
+    // Fresh page, never away.
+    expect(await markBack(admin, u.id, "reasoning", s.attemptId, null)).toBe("ignored");
+    // Reload: away then back within a second.
+    await markAway(admin, u.id, "reasoning", s.attemptId, "closed");
+    expect(await markBack(admin, u.id, "reasoning", s.attemptId, null)).toBe("ignored");
+    expect(await signals(u.id, "page_closed")).toHaveLength(1);
+
+    // Closed the tab and came back 40 s later: paused.
+    await markAway(admin, u.id, "reasoning", s.attemptId, "closed");
+    await awayFor("reasoning_attempts", s.attemptId, 40_000);
+    expect(await markBack(admin, u.id, "reasoning", s.attemptId, null)).toBe("paused");
+    const [pause] = await signals(u.id, "tab_pause");
+    expect(pause.payload.hidden_ms).toBeGreaterThanOrEqual(40_000);
+
+    // A second time: locked, and the away clock is cleared.
+    await markAway(admin, u.id, "reasoning", s.attemptId, "hidden");
+    await awayFor("reasoning_attempts", s.attemptId, 10_000);
+    expect(await markBack(admin, u.id, "reasoning", s.attemptId, null)).toBe("locked");
+    const { data } = await admin.from("reasoning_attempts").select("away_since, locked_at").eq("id", s.attemptId).single();
+    expect(data!.away_since).toBeNull();
+    expect(data!.locked_at).not.toBeNull();
+    // A locked stage doesn't start a new away clock.
+    await markAway(admin, u.id, "reasoning", s.attemptId, "closed");
+    expect((await admin.from("reasoning_attempts").select("away_since").eq("id", s.attemptId).single()).data!.away_since).toBeNull();
+  });
+
+  it("a late 'away' beacon can't inflate a short hide; someone else's session is not found", async () => {
+    const u = await applicant("tab-stale");
+    psql(`alter table public.applications disable trigger applications_status_guard;
+          update public.applications set stage = 'quiz', status = 'in_progress' where id = '${u.appId}';
+          alter table public.applications enable trigger applications_status_guard;`);
+    const q = await startQuiz(admin, u.id, BA);
+    if (q.status !== "active") throw new Error("expected an active quiz");
+    await awayFor("quiz_attempts", q.attemptId, 60_000);
+    // The page says it was hidden for half a second: 0.5 s + 5 s slack < 2 s? No: 5.5 s, so it still counts,
+    // but it is capped at what the page saw, not the 60 s of the stale timestamp.
+    expect(await markBack(admin, u.id, "quiz", q.attemptId, 500)).toBe("paused");
+    const [pause] = await signals(u.id, "tab_pause");
+    expect(pause.payload.hidden_ms).toBe(5500);
+
+    const other = await newUser("tab-stale-other");
+    await expect(markBack(admin, other.id, "quiz", q.attemptId, null)).rejects.toMatchObject({ status: 404 });
+    // Marking someone else's session away does nothing.
+    await markAway(admin, other.id, "quiz", q.attemptId, "closed");
+    expect((await admin.from("quiz_attempts").select("away_since").eq("id", q.attemptId).single()).data!.away_since).toBeNull();
+  });
+
+  it("POST /api/integrity/presence: away then back through the route, for the signed-in owner only", async () => {
+    const u = await applicant("tab-presence");
+    const s = (await startInterview(admin, u.id, u.appId)) as Live;
+    const post = (body: unknown) =>
+      presenceRoute(new Request("http://x/api/integrity/presence", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+
+    h.client = anon();
+    expect((await post({ event: "away", kind: "interview", id: s.sessionId, reason: "closed" })).status).toBe(401);
+    h.client = u.client;
+    expect((await post({ event: "away", kind: "interview", id: s.sessionId })).status).toBe(400);
+    expect(await (await post({ event: "away", kind: "interview", id: s.sessionId, reason: "closed" })).json()).toEqual({ status: "away" });
+    await awayFor("interview_sessions", s.sessionId, 30_000);
+    expect(await (await post({ event: "back", kind: "interview", id: s.sessionId, hiddenMs: null })).json()).toEqual({ status: "paused" });
+    expect(await (await post({ event: "back", kind: "interview", id: s.sessionId, hiddenMs: null })).json()).toEqual({ status: "ignored" });
+    expect(await signals(u.id, "page_closed")).toHaveLength(1);
+  });
+});
+
+describe("ending the AI interview early", () => {
+  it("ends it, keeps what was answered, moves on to the quiz and queues grading", async () => {
+    const u = await applicant("end-early");
+    psql(`update public.applications set interview_answer_mode = 'typed' where id = '${u.appId}'`);
+    await expect(endInterviewEarly(admin, u.id, u.appId)).rejects.toMatchObject({ status: 409 }); // not started
+    const s = (await startInterview(admin, u.id, u.appId)) as Live;
+    await postInterviewMessage(admin, u.id, u.appId, {
+      content: "I have run discovery with operations teams for four years and built the dashboards they use every day, mostly in SQL and Power BI.",
+      turn: s.turn,
+    });
+
+    const other = await newUser("end-early-other");
+    await expect(endInterviewEarly(admin, other.id, u.appId)).rejects.toMatchObject({ status: 404 });
+
+    const done = (await endInterviewEarly(admin, u.id, u.appId)) as Live;
+    expect(done).toMatchObject({ status: "done", done: true, endReason: "ended_by_candidate", current: null });
+    expect(done.messages.at(-1)).toMatchObject({ step: "close" });
+    expect(done.messages.at(-1)!.content).toMatch(/You've ended the interview/);
+    expect(done.messages.filter((m) => m.role === "candidate")).toHaveLength(1);
+    // Idempotent: ending again just returns the finished state.
+    expect(((await endInterviewEarly(admin, u.id, u.appId)) as Live).messages).toHaveLength(done.messages.length);
+
+    const { data: app } = await admin.from("applications").select("stage, status").eq("id", u.appId).single();
+    expect(app).toEqual({ stage: "quiz", status: "in_progress" });
+    const { data: jobs } = await admin.from("grading_jobs").select("subject_type").eq("subject_id", done.sessionId);
+    expect(jobs?.map((j) => j.subject_type)).toEqual(["interview"]);
+  });
+
+  it("a locked interview can't be ended by the candidate", async () => {
+    const u = await applicant("end-locked");
+    const s = (await startInterview(admin, u.id, u.appId)) as Live;
+    await recordTabLeave(admin, u.id, "interview", s.sessionId, 3000);
+    await recordTabLeave(admin, u.id, "interview", s.sessionId, 3000);
+    await expect(endInterviewEarly(admin, u.id, u.appId)).rejects.toMatchObject({ status: 409 });
   });
 });

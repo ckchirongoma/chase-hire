@@ -168,7 +168,7 @@ export default function WorkClient({ initial, userId, brief }: { initial: WorkVi
       <div className="space-y-3">
         <p className="notice">{view.notice ?? "This assessment isn't available right now."}</p>
         <Link href="/me/results" className="btn-secondary">
-          My results
+          My application
         </Link>
       </div>
     );
@@ -541,10 +541,11 @@ function Submitted({ view, brief }: { view: WorkView; brief: ReactNode }) {
   return (
     <div className="space-y-4">
       <section className="card space-y-3 text-sm">
-        <h2 className="h2">Submitted</h2>
+        <h2 className="h2">Submitted. Take a break.</h2>
         <p>
           We received your submission{s ? ` on ${fmtDate(s.submittedAt)}` : ""}. Grading is in progress; people on our team review every result and make every
-          decision. Your scores appear on your results page once grading has finished.
+          decision. Your scores appear on your application page once grading has finished, and someone will get back to you
+          by email about the next step. Nothing else starts until you choose to start it.
         </p>
         {s && (
           <ul className="list-disc space-y-1 pl-5">
@@ -561,7 +562,7 @@ function Submitted({ view, brief }: { view: WorkView; brief: ReactNode }) {
           </ul>
         )}
         <Link href="/me/results" className="btn">
-          My results
+          My application
         </Link>
       </section>
       <details className="card text-sm">

@@ -1,5 +1,6 @@
 import {
   introMessage,
+  MAX_FOLLOWUPS_OPENER,
   MAX_FOLLOWUPS_PER_TOPIC,
   NO_FOLLOWUP_MS,
   OFF_SCRIPT_REPLY,
@@ -59,14 +60,17 @@ export function unusedProbes(plan: InterviewPlan, progress: Progress): ProbeDef[
 }
 
 /**
- * A follow-up may come after an answer to a topic question or a follow-up, up to
- * MAX_FOLLOWUPS_PER_TOPIC per topic, and only while enough time is left.
+ * A follow-up may come after an answer to the opening question, a topic question or a follow-up,
+ * up to MAX_FOLLOWUPS_OPENER on the opening question and MAX_FOLLOWUPS_PER_TOPIC per topic, and
+ * only while enough time is left.
  */
 export function canProbe(plan: InterviewPlan, progress: Progress, remainingMs?: number): boolean {
   if (progress.done) return false;
-  if (progress.current.step !== "claim" && progress.current.step !== "probe") return false;
+  const main = plan.questions[progress.qIdx]?.step;
+  if (main !== "claim" && main !== "warmup") return false;
+  if (progress.current.step !== main && progress.current.step !== "probe") return false;
   if (remainingMs !== undefined && remainingMs < NO_FOLLOWUP_MS) return false;
-  return progress.probesAsked.length < MAX_FOLLOWUPS_PER_TOPIC;
+  return progress.probesAsked.length < (main === "warmup" ? MAX_FOLLOWUPS_OPENER : MAX_FOLLOWUPS_PER_TOPIC);
 }
 
 /**

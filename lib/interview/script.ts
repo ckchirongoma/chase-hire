@@ -30,7 +30,13 @@ export const SKIP_TO_LOGISTICS_MS = 3 * 60_000;
 /** No new follow-ups with less than this left. */
 export const NO_FOLLOWUP_MS = 5 * 60_000;
 
-export const WARMUP_QUESTION = "In two or three sentences, what kind of work do you do best?";
+/** Follow-ups on the opening question before moving to the CV topics. */
+export const MAX_FOLLOWUPS_OPENER = 2;
+
+/** The first question: why the candidate fits this role, in their own words. */
+export function openingQuestion(roleTitle: string): string {
+  return `Let's start with the big picture. What in your experience makes you a strong fit for the ${roleTitle} role? Tell me about the work you've done that you think qualifies you, and the one or two examples you'd point to first.`;
+}
 
 /** Template follow-ups per target (fallback when the LLM follow-up is unavailable or invalid). */
 export const PROBES: readonly ProbeDef[] = [
@@ -88,7 +94,11 @@ export function quoteClaim(text: string, max = 280): string {
 }
 
 export function starQuestion(claim: PlanClaim): string {
-  if (claim.kind === "claim") return `Your CV says you '${quoteClaim(claim.text)}'. ${STAR_TAIL}`;
+  const need = claim.requirement ? `This role involves ${claim.requirement.text}. ` : "";
+  if (claim.kind === "gap") {
+    return `This role involves ${claim.text}. That doesn't come through clearly on your CV. What's the closest you've done to it? Pick one example and walk me through what you personally did, which tools you used, and how it turned out.`;
+  }
+  if (claim.kind === "claim") return `${need}Your CV says you '${quoteClaim(claim.text)}'. ${STAR_TAIL}`;
   if (claim.kind === "role") {
     const where = [claim.roleTitle ? `as ${claim.roleTitle}` : null, claim.employer ? `at ${claim.employer}` : null]
       .filter(Boolean)
@@ -114,8 +124,8 @@ export const GENERIC_TOPICS = [
 export function introMessage(roleTitle: string, mode: "voice" | "typed" = "voice"): string {
   return [
     `Hi, I'm the Chase Agents screening interviewer for the ${roleTitle} role.`,
-    `This is a conversation about the work on your CV. It takes about ${TARGET_MINUTES} minutes, with a hard limit of ${HARD_LIMIT_MINUTES}.`,
-    "I'll ask about a few pieces of work and follow up on your answers, so please be specific: say what you personally did, and name the tools, numbers and decisions involved.",
+    `This is a conversation about how your experience fits this role. It takes about ${TARGET_MINUTES} minutes, with a hard limit of ${HARD_LIMIT_MINUTES}.`,
+    "I'll ask about the parts of your CV that matter most for the job and follow up on your answers, so please be specific: say what you personally did, and name the tools, numbers and decisions involved.",
     mode === "voice"
       ? "Answer out loud: press Record, speak, then press Stop and send. Each answer can be up to 3 minutes."
       : "You have been set up to type your answers. Paste is turned off.",
@@ -130,3 +140,5 @@ export const CLOSING_COMPLETED =
   "Thank you, that was the last question. The interview is complete and your answers have been saved. You'll find your next step on your results page.";
 export const CLOSING_TIMEOUT =
   "Time is up, so the interview has ended. Everything you sent before the deadline has been saved. You'll find your next step on your results page.";
+export const CLOSING_ENDED =
+  "You've ended the interview. Everything you answered has been saved and will be assessed as it is. You'll find your next step on your results page.";

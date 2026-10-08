@@ -9,6 +9,7 @@ export function InterviewScore({ interview }: { interview: InterviewResult }) {
   return (
     <div className="space-y-2">
       {interview.end_reason === "timeout" && <p className="muted">The interview ended when the time ran out.</p>}
+      {interview.end_reason === "ended_by_candidate" && <p className="muted">You ended the interview early; it was assessed on what you answered.</p>}
       {interview.score != null ? (
         <p className="text-sm" data-testid="interview-score">
           Interview score: <strong>{Math.round(interview.score)} / 100</strong>

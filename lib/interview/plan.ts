@@ -9,18 +9,23 @@ import {
   logisticsQuestion,
   PROBES,
   situationalQuestion,
+  openingQuestion,
   starQuestion,
-  WARMUP_QUESTION,
 } from "./script";
+import { REQUIREMENT_TOPICS, requirementsFor, type RoleRequirement } from "./requirements";
 import type { InterviewPlan, PlanClaim, PlanQuestion, PlanSelection } from "./types";
 
 /**
- * Builds the per-candidate conversation plan from the parsed CV (docs/05 Part A, v2). Topics:
- *   1. every role current or ended within 5 years (up to 3), via its strongest claim,
- *   2. the most impressive quantified claim (JEV choice; fallback: longest quantified claim),
- *   3. the claim closest to the role spec (JEV choice; fallback: keyword overlap),
- *   4. a CV consistency question when dates overlap, leave a gap or run backwards (deterministic),
- *   5. one skill the CV lists but never evidences (JEV choice; fallback: keyword overlap).
+ * Builds the per-candidate conversation plan from the parsed CV (docs/05 Part A, v3). It opens
+ * with "what makes you a fit for this role", then topics, by priority:
+ *   1. the role's top requirements (lib/interview/requirements.ts), each with the CV claim that
+ *      best evidences it (JEV choice; fallback: requirement keywords), asked as "This role
+ *      involves X. Your CV says you Y…",
+ *   2. a CV consistency question when dates overlap, leave a gap or run backwards (deterministic),
+ *   3. every role current or ended within 5 years (up to 3) not already covered,
+ *   4. the closest experience to the first requirement the CV shows nothing for,
+ *   5. the most impressive quantified claim (JEV choice; fallback: longest quantified claim),
+ *   6. one skill the CV lists but never evidences (JEV choice; fallback: keyword overlap).
  * Capped at MAX_TOPICS by priority, at least MIN_TOPICS (filled from other claims, role titles,
  * generic topics). JEV only picks between things the candidate wrote; it never writes questions.
  */
@@ -229,53 +234,57 @@ function bestClaimOf(role: CvRole, all: readonly FlatClaim[], used: Set<string>)
 
 type TopicPick = { claim: PlanClaim; priority: number; order: number };
 
+/** Keyword evidence that a claim shows a requirement (the fallback when JEV is unavailable). */
+export function requirementScore(claim: Pick<FlatClaim, "text" | "skills">, req: RoleRequirement): number {
+  const text = `${claim.text} ${claim.skills.join(" ")}`.toLowerCase();
+  return req.keywords.reduce((n, k) => (text.includes(k) ? n + 1 : n), 0);
+}
+
 export async function buildPlan(input: { cv: ParsedCv | null; cvId: string | null; role: RoleInfo; now?: Date }): Promise<InterviewPlan> {
   const { role } = input;
   const all = flattenClaims(input.cv);
   const used = new Set<string>();
   const picks: TopicPick[] = [];
   let order = 0;
-  const takeClaim = (c: FlatClaim, why: PlanClaim["why"], priority: number) => {
+  const takeClaim = (c: FlatClaim, why: PlanClaim["why"], priority: number, requirement?: RoleRequirement) => {
     used.add(c.id);
-    picks.push({ claim: { id: c.id, text: c.text, kind: "claim", why, roleTitle: c.roleTitle, employer: c.employer }, priority, order: order++ });
+    picks.push({
+      claim: {
+        id: c.id,
+        text: c.text,
+        kind: "claim",
+        why,
+        roleTitle: c.roleTitle,
+        employer: c.employer,
+        ...(requirement ? { requirement: { key: requirement.key, text: requirement.text } } : {}),
+      },
+      priority,
+      order: order++,
+    });
   };
 
-  // 1. Every recent role (up to MAX_RECENT_ROLES), represented by its strongest claim or the role itself.
-  const recent = recentRoles(input.cv, input.now).slice(0, MAX_RECENT_ROLES);
-  const ordered = input.cv ? rolesByRecency(input.cv.roles) : [];
-  recent.forEach((r, i) => {
-    const c = bestClaimOf(r, all, used);
-    // The most recent role is always kept; older recent roles are dropped first when over the cap.
-    const priority = i === 0 ? 0 : 5 + i;
-    if (c) takeClaim(c, "recent_role", priority);
-    else if (r.title || r.employer) {
-      picks.push({
-        claim: { id: `r${ordered.indexOf(r) + 1}`, text: [r.title, r.employer].filter(Boolean).join(" at "), kind: "role", why: "role_title", roleTitle: r.title, employer: r.employer },
-        priority,
-        order: order++,
-      });
-    }
-  });
-  if (!recent.length && all.length) takeClaim(all[0], "recent_role", 0);
-
-  // 2-4. One JEV call: most impressive quantified claim, closest to the role, most important unevidenced skill.
-  const quantified = all.filter((c) => c.quantified && !used.has(c.id));
-  const others = all.filter((c) => !used.has(c.id));
+  // One JEV call: for each of the role's top requirements, the claim that best evidences it
+  // (or "none"), plus the most impressive quantified claim and the key unevidenced skill.
+  const reqs = requirementsFor(role.slug).slice(0, REQUIREMENT_TOPICS);
+  const options = all.slice(0, 40);
+  const quantified = all.filter((c) => c.quantified);
   const skills = unevidencedSkills(input.cv).slice(0, 40);
   const questions: Record<string, { type: "choice"; instructions: string; criteria: Record<string, string> }> = {};
+  if (options.length) {
+    for (const r of reqs) {
+      questions[`req_${r.key}`] = {
+        type: "choice",
+        instructions: `This role involves ${r.text}. Which of these CV claims is the strongest evidence that the candidate has done this kind of work? Choose "none" if none of them shows it.`,
+        criteria: { ...Object.fromEntries(options.map((c) => [c.id, optionText(c)])), none: "None of these claims shows this kind of work" },
+      };
+    }
+  }
   if (quantified.length >= 2) {
     questions.impressive_claim = {
       type: "choice",
       instructions:
         "Which of these CV claims describes the most impressive, concrete, measurable achievement (scale of the result, not wording)?",
       criteria: Object.fromEntries(quantified.map((c) => [c.id, optionText(c)])),
-    };
-  }
-  if (others.length >= 2) {
-    questions.closest_claim = {
-      type: "choice",
-      instructions: "Which of these CV claims is closest to the day-to-day work described in the role spec in the state?",
-      criteria: Object.fromEntries(others.map((c) => [c.id, optionText(c)])),
     };
   }
   if (skills.length >= 2) {
@@ -286,7 +295,7 @@ export async function buildPlan(input: { cv: ParsedCv | null; cvId: string | nul
     };
   }
 
-  const selection: PlanSelection = { via: "none", model: null, ms: null, impressive: null, closest: null };
+  const selection: PlanSelection = { via: "none", model: null, ms: null, impressive: null, closest: null, requirements: {} };
   const jev = Object.keys(questions).length
     ? await systemOne(
         {
@@ -302,39 +311,84 @@ export async function buildPlan(input: { cv: ParsedCv | null; cvId: string | nul
     selection.ms = jev.ms;
   }
 
-  // 2. Most impressive quantified claim.
-  if (quantified.length === 1) takeClaim(quantified[0], "impressive_quantified", 1);
-  else if (quantified.length >= 2) {
+  // 1. The role's top requirements, each with the CV claim that best shows it. The first
+  //    requirement the CV shows nothing for becomes a "closest experience" question.
+  let gap: RoleRequirement | null = null;
+  reqs.forEach((r, i) => {
+    let pick: FlatClaim | null = null;
+    const ans = jev?.answers[`req_${r.key}`];
+    if (ans) {
+      selection.requirements![r.key] = { choice: ans.choice, probabilities: ans.probabilities };
+      if (ans.choice !== "none") {
+        // The chosen claim, or the next-best unused one when an earlier requirement took it.
+        const ranked = rankByProbability(ans.choice, ans.probabilities, [...options.map((c) => c.id), "none"]);
+        for (const id of ranked) {
+          if (id === "none") break;
+          if (used.has(id)) continue;
+          if (id !== ans.choice && (ans.probabilities[id] ?? 0) < 0.15) break;
+          pick = options.find((c) => c.id === id) ?? null;
+          break;
+        }
+      }
+    } else {
+      const best = all
+        .filter((c) => !used.has(c.id))
+        .map((c) => ({ c, n: requirementScore(c, r) }))
+        .reduce<{ c: FlatClaim; n: number } | null>((b, x) => (x.n > (b?.n ?? 0) ? x : b), null);
+      pick = best?.c ?? null;
+    }
+    if (pick) takeClaim(pick, "role_requirement", i, r);
+    else gap ??= r;
+  });
+
+  // 2. A CV consistency question when dates overlap, leave a gap or run backwards (deterministic).
+  const issue = consistencyIssues(input.cv)[0];
+  if (issue) {
+    picks.push({ claim: { id: "k1", text: issue, kind: "consistency", why: "cv_consistency", roleTitle: null, employer: null }, priority: 3, order: 1000 });
+  }
+
+  // 3. Every recent role not already covered (up to MAX_RECENT_ROLES), via its strongest claim.
+  const recent = recentRoles(input.cv, input.now).slice(0, MAX_RECENT_ROLES);
+  const ordered = input.cv ? rolesByRecency(input.cv.roles) : [];
+  const covered = (r: CvRole) => picks.some((p) => r.claims.some((rc) => rc.id === p.claim.id));
+  recent.forEach((r, i) => {
+    if (covered(r)) return;
+    const c = bestClaimOf(r, all, used);
+    // The most recent role is kept before older ones, which are dropped first when over the cap.
+    const priority = i === 0 ? 4 : 7 + i;
+    if (c) takeClaim(c, "recent_role", priority);
+    else if (r.title || r.employer) {
+      picks.push({
+        claim: { id: `r${ordered.indexOf(r) + 1}`, text: [r.title, r.employer].filter(Boolean).join(" at "), kind: "role", why: "role_title", roleTitle: r.title, employer: r.employer },
+        priority,
+        order: order++,
+      });
+    }
+  });
+  if (!picks.some((p) => p.claim.kind === "claim" || p.claim.kind === "role") && all.length) takeClaim(all[0], "recent_role", 4);
+
+  // 4. The closest experience to a requirement the CV doesn't show.
+  if (gap) {
+    const g: RoleRequirement = gap;
+    picks.push({
+      claim: { id: `q_${g.key}`, text: g.text, kind: "gap", why: "requirement_gap", roleTitle: null, employer: null, requirement: { key: g.key, text: g.text } },
+      priority: 5,
+      order: 500,
+    });
+  }
+
+  // 5. The most impressive quantified claim, then 6. one skill the CV lists but never evidences.
+  const freshQuantified = quantified.filter((c) => !used.has(c.id));
+  if (freshQuantified.length) {
     const ans = jev?.answers.impressive_claim;
     let pick: FlatClaim | null = null;
     if (ans) {
       selection.impressive = { choice: ans.choice, probabilities: ans.probabilities };
       const ranked = rankByProbability(ans.choice, ans.probabilities, quantified.map((c) => c.id));
-      pick = quantified.find((c) => c.id === ranked[0]) ?? null;
+      pick = freshQuantified.find((c) => c.id === ranked.find((id) => !used.has(id))) ?? null;
     }
-    pick ??= longestQuantified(quantified);
-    if (pick) takeClaim(pick, "impressive_quantified", 1);
-  }
-
-  // 3. Claim closest to the role.
-  const remaining = all.filter((c) => !used.has(c.id));
-  if (remaining.length) {
-    const ans = jev?.answers.closest_claim;
-    let pick: FlatClaim | null = null;
-    if (ans) {
-      selection.closest = { choice: ans.choice, probabilities: ans.probabilities };
-      const ranked = rankByProbability(ans.choice, ans.probabilities, others.map((c) => c.id));
-      const id = ranked.find((x) => !used.has(x));
-      pick = remaining.find((c) => c.id === id) ?? null;
-    }
-    pick ??= closestByKeywords(remaining, role);
-    if (pick) takeClaim(pick, "closest_to_role", 2);
-  }
-
-  // 4. A CV consistency question (deterministic), then 5. an unevidenced skill.
-  const issue = consistencyIssues(input.cv)[0];
-  if (issue) {
-    picks.push({ claim: { id: "k1", text: issue, kind: "consistency", why: "cv_consistency", roleTitle: null, employer: null }, priority: 3, order: 1000 });
+    pick ??= longestQuantified(freshQuantified);
+    if (pick) takeClaim(pick, "impressive_quantified", 6);
   }
   if (skills.length) {
     const ans = jev?.answers.key_skill;
@@ -344,11 +398,12 @@ export async function buildPlan(input: { cv: ParsedCv | null; cvId: string | nul
       skill = [...skills].sort((a, b) => keywordOverlap({ text: b, skills: [] }, roleWords) - keywordOverlap({ text: a, skills: [] }, roleWords))[0];
     }
     if (skill) {
-      picks.push({ claim: { id: "s1", text: skill, kind: "skill", why: "skill_unevidenced", roleTitle: null, employer: null }, priority: 4, order: 999 });
+      picks.push({ claim: { id: "s1", text: skill, kind: "skill", why: "skill_unevidenced", roleTitle: null, employer: null }, priority: 7, order: 999 });
     }
   }
 
-  // Keep the highest-priority topics up to the cap, then present them in a natural order.
+  // Keep the highest-priority topics up to the cap. Requirement topics come first (in the
+  // role's order of importance), then the rest in a natural order.
   let chosen = [...picks].sort((a, b) => a.priority - b.priority || a.order - b.order).slice(0, MAX_TOPICS);
 
   // Too few topics: fill from remaining claims, role titles, then generic topics.
@@ -373,11 +428,12 @@ export async function buildPlan(input: { cv: ParsedCv | null; cvId: string | nul
   for (let g = 0; chosen.length < MIN_TOPICS && g < GENERIC_TOPICS.length; g++) {
     fill({ id: `g${g + 1}`, text: GENERIC_TOPICS[g], kind: "generic", why: "generic", roleTitle: null, employer: null });
   }
-  chosen = chosen.sort((a, b) => a.order - b.order);
+  const rank = (p: TopicPick) => (p.claim.why === "role_requirement" ? p.priority : 100 + p.order);
+  chosen = chosen.sort((a, b) => rank(a) - rank(b));
 
   const claims = chosen.map((p) => p.claim);
   const qs: Omit<PlanQuestion, "no">[] = [
-    { step: "warmup", claimId: null, text: WARMUP_QUESTION },
+    { step: "warmup", claimId: null, text: openingQuestion(role.title) },
     ...claims.map((c) => ({ step: "claim" as const, claimId: c.id, text: starQuestion(c) })),
     { step: "situational", claimId: null, text: situationalQuestion(role.slug) },
     { step: "logistics", claimId: null, text: logisticsQuestion(role) },

@@ -63,7 +63,7 @@ export default async function QuizPage({ params }: { params: Promise<{ role: str
           </p>
           {app.stage === "interview" && <p>The quiz opens as soon as you finish the AI CV interview.</p>}
         </div>
-        <Link href="/me/results" className="btn-secondary">My results</Link>
+        <Link href="/me/results" className="btn-secondary">My application</Link>
       </div>
     );
   }

@@ -16,7 +16,9 @@ import {
   unevidencedSkills,
   type RoleInfo,
 } from "@/lib/interview/plan";
-import { MAX_TOPICS, PROBES, SITUATIONAL, WARMUP_QUESTION } from "@/lib/interview/script";
+import { MAX_TOPICS, PROBES, SITUATIONAL, openingQuestion } from "@/lib/interview/script";
+
+const WARMUP_QUESTION = openingQuestion("AI-native Business Analyst");
 
 const jev = vi.mocked(systemOne);
 
@@ -143,65 +145,80 @@ describe("CV checks", () => {
 });
 
 describe("buildPlan", () => {
-  it("falls back to deterministic rules when JEV is unavailable", async () => {
+  it("opens with role fit, then matches CV claims to the role's requirements (fallback rules without JEV)", async () => {
     jev.mockResolvedValue(null);
     const plan = await buildPlan({ cv, cvId: "cv-1", role: BA, now: NOW });
     expect(plan.v).toBe(2);
-    // New Co is the only role in the last 5 years: its strongest (longest quantified) claim.
-    expect(plan.claims.map((c) => [c.id, c.why])).toEqual([
-      ["c4", "recent_role"],
-      ["c1", "impressive_quantified"],
-      ["c2", "closest_to_role"],
-      ["s1", "skill_unevidenced"],
+    const [, questions] = jev.mock.calls[0];
+    expect(Object.keys(questions)).toEqual(["req_data", "req_discovery", "req_prototype", "impressive_claim"]); // one unevidenced skill: nothing to choose
+    // Requirement keywords pick the evidence; New Co (the only recent role) is already covered by c3.
+    expect(plan.claims.map((c) => [c.id, c.why, c.requirement?.key ?? null])).toEqual([
+      ["c1", "role_requirement", "data"],
+      ["c2", "role_requirement", "discovery"],
+      ["c3", "role_requirement", "prototype"],
+      ["c4", "impressive_quantified", null],
+      ["s1", "skill_unevidenced", null],
     ]);
-    expect(plan.claims[3]).toMatchObject({ kind: "skill", text: "SQL" });
+    expect(plan.claims[4]).toMatchObject({ kind: "skill", text: "SQL" });
     expect(plan.selection.via).toBe("fallback");
-    expect(plan.questions.map((q) => q.step)).toEqual(["warmup", "claim", "claim", "claim", "claim", "situational", "logistics"]);
-    expect(plan.questions.map((q) => q.no)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(plan.questions.map((q) => q.step)).toEqual(["warmup", "claim", "claim", "claim", "claim", "claim", "situational", "logistics"]);
+    expect(plan.questions.map((q) => q.no)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(plan.questions[0].text).toBe(WARMUP_QUESTION);
+    expect(plan.questions[0].text).toContain("strong fit for the AI-native Business Analyst role");
     expect(plan.questions[1].text).toBe(
+      "This role involves digging into messy spreadsheets and system data to find what's missing or wrong. Your CV says you 'cleaned a 50,000-row customer dataset and removed 3,000 duplicates'. Walk me through what you personally did, which tools you used, and how you measured the result.",
+    );
+    expect(plan.questions[4].text).toBe(
       "Your CV says you 'automated a weekly reporting pipeline that saved 20 hours a week across 4 teams'. Walk me through what you personally did, which tools you used, and how you measured the result.",
     );
-    expect(plan.questions[4].text).toMatch(/^Your CV lists SQL as a skill\./);
-    expect(plan.questions[5].text).toBe(SITUATIONAL["business-analyst"]);
-    expect(plan.questions[6].text).toContain("R30,000–R32,500 a month plus year-end profit share");
-    expect(plan.questions[6].text).toContain("when could you start?");
+    expect(plan.questions[5].text).toMatch(/^Your CV lists SQL as a skill\./);
+    expect(plan.questions[6].text).toBe(SITUATIONAL["business-analyst"]);
+    expect(plan.questions[7].text).toContain("R30,000–R32,500 a month plus year-end profit share");
+    expect(plan.questions[7].text).toContain("when could you start?");
     expect(plan.probes).toEqual(PROBES);
     expect(plan.cvId).toBe("cv-1");
   });
 
-  it("uses JEV's choices in one call, and de-duplicates by probability rank", async () => {
+  it("uses JEV's requirement matches in one call, takes the next-best unused claim, and asks about a gap", async () => {
     jev.mockResolvedValue({
       model: "jev-1.13.0",
       ms: 500,
       answers: {
-        impressive_claim: choice("c5", { c5: 0.7, c1: 0.3 }),
-        // JEV's top pick for "closest" is the claim already chosen as most impressive: take the next-best.
-        closest_claim: choice("c5", { c5: 0.4, c3: 0.35, c2: 0.2, c1: 0.05 }),
+        req_data: choice("c1", { c1: 0.8, c3: 0.1, none: 0.1 }),
+        // JEV's top pick is the claim the first requirement already took: use the next-best.
+        req_discovery: choice("c1", { c1: 0.5, c2: 0.4, none: 0.1 }),
+        req_prototype: choice("none", { none: 0.7, c3: 0.2, c4: 0.1 }),
+        impressive_claim: choice("c5", { c5: 0.7, c4: 0.2, c1: 0.1 }),
       },
     } as never);
     const plan = await buildPlan({ cv, cvId: null, role: BA, now: NOW });
     expect(jev).toHaveBeenCalledTimes(1);
     const [state, questions] = jev.mock.calls[0];
-    expect(Object.keys(questions)).toEqual(["impressive_claim", "closest_claim"]); // one unevidenced skill: nothing to choose
-    expect(Object.keys((questions as Record<string, { criteria: object }>).impressive_claim.criteria)).toEqual(["c5", "c1"]);
+    const q = questions as Record<string, { criteria: object; instructions: string }>;
+    expect(Object.keys(q.req_data.criteria)).toEqual(["c3", "c4", "c5", "c1", "c2", "none"]);
+    expect(q.req_data.instructions).toContain("This role involves digging into messy spreadsheets");
     expect(JSON.stringify(state)).toContain("discovery workshops");
     expect(plan.claims.map((c) => [c.id, c.why])).toEqual([
+      ["c1", "role_requirement"],
+      ["c2", "role_requirement"],
       ["c4", "recent_role"],
       ["c5", "impressive_quantified"],
-      ["c3", "closest_to_role"],
+      ["q_prototype", "requirement_gap"],
       ["s1", "skill_unevidenced"],
     ]);
-    expect(plan.selection).toMatchObject({ via: "jev", model: "jev-1.13.0", impressive: { choice: "c5" }, closest: { choice: "c5" } });
+    expect(plan.claims[4]).toMatchObject({ kind: "gap", requirement: { key: "prototype" } });
+    expect(plan.questions.find((x) => x.claimId === "q_prototype")?.text).toBe(
+      "This role involves building a first working version of a solution yourself, with AI tools or code. That doesn't come through clearly on your CV. What's the closest you've done to it? Pick one example and walk me through what you personally did, which tools you used, and how it turned out.",
+    );
+    expect(plan.selection).toMatchObject({
+      via: "jev",
+      model: "jev-1.13.0",
+      impressive: { choice: "c5" },
+      requirements: { data: { choice: "c1" }, discovery: { choice: "c1" }, prototype: { choice: "none" } },
+    });
   });
 
-  it("falls back per question when a JEV choice is missing", async () => {
-    jev.mockResolvedValue({ model: "jev", ms: 1, answers: { impressive_claim: choice("c5", { c5: 0.8, c1: 0.2 }) } } as never);
-    const plan = await buildPlan({ cv, cvId: null, role: BA, now: NOW });
-    expect(plan.claims.map((c) => c.id)).toEqual(["c4", "c5", "c2", "s1"]);
-  });
-
-  it("covers every recent role, a gap and an unevidenced skill, capped at 6 by priority", async () => {
+  it("caps at 6 topics by priority: requirements, a CV gap, the latest role, a requirement gap, a skill", async () => {
     const busy = ParsedCv.parse({
       skills: ["Tableau", "Python"],
       roles: [
@@ -220,14 +237,14 @@ describe("buildPlan", () => {
     jev.mockResolvedValue({ model: "jev", ms: 1, answers: { key_skill: choice("s1", { s0: 0.3, s1: 0.7 }) } } as never);
     const plan = await buildPlan({ cv: busy, cvId: null, role: BA, now: NOW });
     const [, questions] = jev.mock.calls[0];
-    expect(Object.keys(questions)).toEqual(["closest_claim", "key_skill"]); // one quantified claim left: no choice needed
+    expect(Object.keys(questions)).toEqual(["req_data", "req_discovery", "req_prototype", "impressive_claim", "key_skill"]);
     expect(plan.claims).toHaveLength(MAX_TOPICS);
-    // The third recent role (lowest priority) is dropped; the rest keep their natural order.
+    // Older recent roles (lowest priority) are dropped; requirement topics lead, the rest keep their natural order.
     expect(plan.claims.map((c) => [c.id, c.why])).toEqual([
+      ["d1", "role_requirement"],
+      ["d2", "role_requirement"],
       ["a1", "recent_role"],
-      ["b1", "recent_role"],
-      ["d1", "impressive_quantified"],
-      ["d2", "closest_to_role"],
+      ["q_prototype", "requirement_gap"],
       ["s1", "skill_unevidenced"],
       ["k1", "cv_consistency"],
     ]);
@@ -237,7 +254,7 @@ describe("buildPlan", () => {
     expect(plan.questions).toHaveLength(1 + MAX_TOPICS + 2);
   });
 
-  it("uses role titles when the CV has fewer than 3 topics, then generic topics", async () => {
+  it("uses role titles and a requirement gap when the CV is thin, then generic topics", async () => {
     jev.mockResolvedValue(null);
     const thin = ParsedCv.parse({
       roles: [
@@ -246,17 +263,19 @@ describe("buildPlan", () => {
       ],
     });
     const plan = await buildPlan({ cv: thin, cvId: null, role: BA, now: NOW });
-    expect(jev).not.toHaveBeenCalled(); // nothing to choose between
     expect(plan.claims.map((c) => [c.id, c.kind])).toEqual([
       ["c1", "claim"],
       ["r2", "role"],
-      ["r1", "role"],
+      ["q_data", "gap"],
     ]);
     expect(plan.questions[2].text).toMatch(/^Your CV lists your role as Intern at Beta\. Pick one piece of work/);
 
+    jev.mockClear();
     const none = await buildPlan({ cv: null, cvId: null, role: { ...BA, slug: "software-engineer" }, now: NOW });
-    expect(none.claims.map((c) => c.kind)).toEqual(["generic", "generic", "generic"]);
+    expect(jev).not.toHaveBeenCalled(); // nothing to choose between
+    expect(none.claims.map((c) => c.kind)).toEqual(["generic", "generic", "gap"]);
     expect(none.questions[1].text).toMatch(/^Tell me about a recent piece of work you are proud of\./);
+    expect(none.questions[3].text).toMatch(/^This role involves taking an existing app and making it secure/);
     expect(none.questions[4].text).toBe(SITUATIONAL["software-engineer"]);
     expect(new Set(none.questions.map((q) => q.text)).size).toBe(6);
   });

@@ -88,6 +88,7 @@ They also see a **"Request a review"** button on every scored stage. It creates 
 | `paste_attempt` | interview, quiz, persona chat | `onPaste` preventDefault + log |
 | `blur` / `focus` | all timed stages | `visibilitychange` events with timestamps |
 | `tab_pause` / `session_locked` / `session_reopened` | reasoning, quiz, interview | a leave of 2 s or more: the first pauses the stage (the candidate confirms to continue), the second locks it until an admin reopens it with the remaining time. A procedural pause, never a rejection |
+| `page_closed` | reasoning, quiz, interview | the stage page was closed, reloaded or left for another page. The away time is measured by the DB clock (`mark_away` / `mark_back`, migration 0021), so a close-and-reopen counts as a leave just like a tab switch; a reload under 2 s is ignored |
 | `burst_input` | text inputs | more than 150 characters arriving within 500 ms without key events |
 | `answer_time` | reasoning, quiz | per-item server timestamps; flag a correct answer under 4 s on a hard item, or a long stall followed by a correct answer |
 | `live_delta` | live retest | online percentile minus live percentile > 25 points → flag for discussion |

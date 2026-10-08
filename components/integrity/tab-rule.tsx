@@ -29,7 +29,7 @@ export function LockedNotice() {
         and you&apos;ll get back the time you had left. This is not a rejection. Check your results page for updates.
       </p>
       <a href="/me/results" className="btn-secondary">
-        My results
+        My application
       </a>
     </div>
   );
@@ -37,4 +37,4 @@ export function LockedNotice() {
 
 /** One line for intro screens, so the rule is clear before the clock starts. */
 export const TAB_RULE_TEXT =
-  "Stay on this page until you finish. Leaving it once pauses the stage; leaving it a second time locks it until our team reopens it (not a rejection).";
+  "Stay on this page until you finish. Switching tabs, closing the tab or reloading counts as leaving: once pauses the stage; a second time locks it until our team reopens it (not a rejection).";

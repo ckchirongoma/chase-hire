@@ -14,14 +14,17 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
   return (
     <html lang="en">
       <body className="antialiased">
-        <header className="border-b border-slate-200 bg-white">
-          <nav className="mx-auto flex max-w-5xl flex-wrap items-center gap-4 px-4 py-3 text-sm">
-            <Link href="/" className="font-semibold">
+        <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur">
+          <nav className="mx-auto flex max-w-5xl flex-wrap items-center gap-5 px-4 py-3 text-sm">
+            <Link href="/" className="flex items-center gap-2 font-semibold">
+              <span className="flex h-7 w-7 items-center justify-center rounded-md bg-slate-900 text-xs font-bold text-white" aria-hidden="true">
+                CA
+              </span>
               Chase Agents Careers
             </Link>
-            <Link href="/roles">Roles</Link>
-            {user && <Link href="/me/results">My results</Link>}
-            {admin && <Link href="/admin/candidates">Admin</Link>}
+            <Link href="/roles" className="text-slate-600 hover:text-slate-900">Roles</Link>
+            {user && !admin && <Link href="/me/results" className="text-slate-600 hover:text-slate-900">My application</Link>}
+            {admin && <Link href="/admin/pipeline" className="text-slate-600 hover:text-slate-900">Admin</Link>}
             <span className="ml-auto" />
             {user ? (
               <form action="/auth/signout" method="post">

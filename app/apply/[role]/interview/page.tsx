@@ -59,7 +59,7 @@ export default async function InterviewPage({ params }: { params: Promise<{ role
         <div className="space-y-4">
           {header}
           <p className="notice">{blocked}</p>
-          <Link href="/me/results" className="btn-secondary">My results</Link>
+          <Link href="/me/results" className="btn-secondary">My application</Link>
         </div>
       );
     }
@@ -72,17 +72,19 @@ export default async function InterviewPage({ params }: { params: Promise<{ role
       {!session && typed && (
         <div className="card space-y-2 text-sm">
           <p>
-            A typed conversation about the work on your CV (we agreed a typed interview with you). It checks that the claims
-            on your CV are your own work and how you approach problems in this role. The interviewer asks follow-up questions
-            based on what you write.
+            A typed conversation about how your experience fits this role (we agreed a typed interview with you). It starts
+            with why you think you&apos;re a fit, then goes into the parts of your CV that matter most for the job. The
+            interviewer asks follow-up questions based on what you write.
           </p>
           <ul className="list-disc space-y-1 pl-5">
             <li>It takes about 25 to 30 minutes. There is a hard limit of 35 minutes; the clock runs on our server.</li>
             <li>Paste is turned off, so type your answers. Notes on paper are fine.</li>
             <li>
-              Stay on this tab. If you leave it, the interview pauses and you confirm to carry on. If you leave a second time,
-              it locks until a person on our team reopens it. A lock is never a rejection, and you keep your remaining time.
+              Stay on this page. Switching tabs, closing the tab or reloading counts as leaving: the first time the interview
+              pauses and you confirm to carry on; the second time it locks until a person on our team reopens it. A lock is
+              never a rejection, and you keep your remaining time.
             </li>
+            <li>You can end the interview early at any time. What you answered is kept and assessed as it is.</li>
             <li>Be specific: say what you personally did, and name the tools, numbers and decisions.</li>
             <li>The interviewer won&apos;t comment on your answers. People on our team review the results; nothing is decided automatically.</li>
           </ul>
@@ -91,8 +93,9 @@ export default async function InterviewPage({ params }: { params: Promise<{ role
       {!session && !typed && (
         <div className="card space-y-2 text-sm">
           <p>
-            A spoken conversation about the work on your CV. It checks that the claims on your CV are your own work and how
-            you approach problems in this role. The interviewer asks follow-up questions based on what you say.
+            A spoken conversation about how your experience fits this role. It starts with why you think you&apos;re a fit,
+            then goes into the parts of your CV that matter most for the job. The interviewer asks follow-up questions based
+            on what you say.
           </p>
           <ul className="list-disc space-y-1 pl-5">
             <li>
@@ -101,9 +104,11 @@ export default async function InterviewPage({ params }: { params: Promise<{ role
             </li>
             <li>It takes about 25 to 30 minutes. There is a hard limit of 35 minutes; the clock runs on our server.</li>
             <li>
-              Stay on this tab. If you leave it, the interview pauses and you confirm to carry on. If you leave a second time,
-              it locks until a person on our team reopens it. A lock is never a rejection, and you keep your remaining time.
+              Stay on this page. Switching tabs, closing the tab or reloading counts as leaving: the first time the interview
+              pauses and you confirm to carry on; the second time it locks until a person on our team reopens it. A lock is
+              never a rejection, and you keep your remaining time.
             </li>
+            <li>You can end the interview early at any time. What you answered is kept and assessed as it is.</li>
             <li>Be specific: say what you personally did, and name the tools, numbers and decisions.</li>
             <li>
               We transcribe your answers and judge what you say, never your accent or how you sound. If you can&apos;t use a

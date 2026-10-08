@@ -60,9 +60,12 @@ The special-category exclusion keeps us within POPIA's special personal informat
 > PROBES: {{probes}}
 > ROLE_FACTS: {{role_facts}}
 
-> **As built (v2, docs/05):** the script itself is deterministic (`lib/interview/engine.ts`): the opening questions, topic order and time rules are code, not a prompt, so every candidate gets the same frame. Only the adaptive follow-up questions are written by an LLM, with `interviewer-followup.v1` below. This interviewer.v1 prompt is kept as the specification of the interviewer's rules.
+> **As built (v2, docs/05):** the script itself is deterministic (`lib/interview/engine.ts`): the opening questions, topic order and time rules are code, not a prompt, so every candidate gets the same frame. Only the adaptive follow-up questions are written by an LLM, with `interviewer-followup` below (live version: v2). This interviewer.v1 prompt is kept as the specification of the interviewer's rules.
 
-## interviewer-followup.v1
+## interviewer-followup.v1 (superseded by v2)
+
+v2 (`prompts/interviewer-followup.v2.md`, live) adds ROLE NEEDS (the role's requirements) and tells the model to connect each answer to the CV entry it came from and to what the role needs, including after the opening "why are you a fit" question. Everything else below still applies.
+
 
 File: `prompts/interviewer-followup.v1.md`. Model: `OPENROUTER_MODEL_INTERVIEWER` (falls back to the persona model). One call per follow-up, with an 8-second budget.
 

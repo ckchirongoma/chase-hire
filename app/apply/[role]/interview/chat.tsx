@@ -17,6 +17,7 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
   const [error, setError] = useState<string | null>(null);
   /** Set when the last answer arrived after the deadline and was not stored. */
   const [lateAnswer, setLateAnswer] = useState(false);
+  const [confirmEnd, setConfirmEnd] = useState(false);
   const [remaining, setRemaining] = useState(0);
   const offset = useRef(0); // server clock minus client clock
   const expiredFor = useRef<string | null>(null);
@@ -208,18 +209,25 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
       </div>
 
       {state.done ? (
-        <div className="card space-y-3 text-sm">
+        <div className="card space-y-3 text-sm" data-testid="interview-done">
+          <h2 className="h2">Interview done. Take a break if you like.</h2>
           <p>
-            {state.endReason !== "timeout"
-              ? "Thank you, the interview is complete and your answers have been saved."
-              : lateAnswer
-                ? "Time ran out before your last answer reached us, so that answer was not saved. Your earlier answers were saved."
-                : "Time ran out, so the interview ended. Every answer that reached us before the deadline has been saved."}{" "}
-            People on our team review the results; nothing is decided automatically. Your scores appear on your results page once grading has finished.
+            {state.endReason === "ended_by_candidate"
+              ? "You ended the interview early. Everything you answered has been saved and will be assessed as it is."
+              : state.endReason !== "timeout"
+                ? "Thank you, the interview is complete and your answers have been saved."
+                : lateAnswer
+                  ? "Time ran out before your last answer reached us, so that answer was not saved. Your earlier answers were saved."
+                  : "Time ran out, so the interview ended. Every answer that reached us before the deadline has been saved."}{" "}
+            People on our team review the results; nothing is decided automatically.
+          </p>
+          <p>
+            Next is the role quiz: 15 questions in 12 minutes. It doesn&apos;t start until you press Start on the quiz
+            page, so come back to it whenever you&apos;re ready.
           </p>
           <div className="flex flex-wrap gap-3">
-            <Link href={`/apply/${roleSlug}/quiz`} className="btn">Go to the role quiz</Link>
-            <Link href="/me/results" className="btn-secondary">My results</Link>
+            <Link href="/me/results" className="btn">Back to my application</Link>
+            <Link href={`/apply/${roleSlug}/quiz`} className="btn-secondary">I&apos;m ready for the quiz</Link>
           </div>
         </div>
       ) : state.notice ? (
@@ -284,6 +292,36 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
           {error && <p className="error">{error}</p>}
           </>
           )}
+          <div className="border-t border-slate-100 pt-3">
+            {!confirmEnd ? (
+              <button type="button" className="text-sm text-slate-500 underline" disabled={busy} onClick={() => setConfirmEnd(true)}>
+                End the interview now
+              </button>
+            ) : (
+              <div className="space-y-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm" role="alertdialog" aria-label="End the interview">
+                <p>
+                  End the interview now? Everything you&apos;ve answered is saved and will be assessed as it is. You
+                  can&apos;t come back to it afterwards.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={async () => {
+                      const next = await call("end", {});
+                      if (next) setConfirmEnd(false);
+                    }}
+                  >
+                    {busy ? "Ending…" : "Yes, end the interview"}
+                  </button>
+                  <button type="button" className="btn-secondary" disabled={busy} onClick={() => setConfirmEnd(false)}>
+                    Keep going
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

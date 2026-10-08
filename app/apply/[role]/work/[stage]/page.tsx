@@ -79,7 +79,7 @@ export default async function WorkPage({ params }: { params: Promise<{ role: str
         <div className="space-y-3">
           <p className="notice">{view.notice ?? "This assessment isn't available right now."}</p>
           <Link href="/me/results" className="btn-secondary">
-            My results
+            My application
           </Link>
         </div>
       )}

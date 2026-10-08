@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { applyTurn, canProbe, labelFor, nextQuestionIndex, openScript, unusedProbes } from "@/lib/interview/engine";
 import {
   HARD_LIMIT_MINUTES,
+  MAX_FOLLOWUPS_OPENER,
   MAX_FOLLOWUPS_PER_TOPIC,
   NO_FOLLOWUP_MS,
   OFF_SCRIPT_REPLY,
@@ -9,9 +10,11 @@ import {
   ROLE_QUESTION_REPLY,
   SKIP_TO_LOGISTICS_MS,
   SKIP_TO_SITUATIONAL_MS,
-  WARMUP_QUESTION,
+  openingQuestion,
 } from "@/lib/interview/script";
 import type { FollowupTarget, InterviewPlan, Progress, TurnDecision } from "@/lib/interview/types";
+
+const WARMUP_QUESTION = openingQuestion("AI-native Business Analyst");
 
 const plan: InterviewPlan = {
   v: 2,
@@ -125,12 +128,19 @@ describe("applyTurn", () => {
     expect(r.messages[0].meta).toMatchObject({ probe_key: "failure", followup_via: "template" });
   });
 
-  it("does not follow up the warm-up, situational or logistics answers", () => {
+  it("follows up the opening question up to MAX_FOLLOWUPS_OPENER times, never situational or logistics answers", () => {
     const { progress } = openScript(plan);
-    expect(canProbe(plan, progress)).toBe(false);
-    const r = advance(progress, answer("specifics"));
-    expect(r.messages[0].step).toBe("claim");
+    expect(canProbe(plan, progress)).toBe(true);
+    let p = progress;
+    for (let i = 0; i < MAX_FOLLOWUPS_OPENER; i++) {
+      const r = advance(p, answer(PROBES[i].key));
+      expect(r.messages[0]).toMatchObject({ step: "probe", meta: { question_no: 1 } });
+      p = r.progress;
+    }
+    expect(canProbe(plan, p)).toBe(false);
+    expect(advance(p, answer("ai_use")).messages[0].step).toBe("claim");
     const sit: Progress = { ...progress, qIdx: 4, current: { step: "situational", claimId: null, text: "Q sit", questionNo: 5 } };
+    expect(canProbe(plan, sit)).toBe(false);
     expect(advance(sit, answer("specifics")).messages[0].step).toBe("logistics");
   });
 

@@ -17,3 +17,27 @@ export async function recordTabLeave(admin: SupabaseClient, userId: string, kind
   }
   return data as TabStatus;
 }
+
+/** The stage page is going away (hidden, closed, reloaded or navigated off): start the away clock. */
+export async function markAway(admin: SupabaseClient, userId: string, kind: TabKind, id: string, reason: "hidden" | "closed"): Promise<void> {
+  const { error } = await admin.rpc("mark_away", { p_kind: kind, p_id: id, p_user: userId, p_reason: reason });
+  if (error) throw new Error(error.message);
+}
+
+/**
+ * The stage page is showing again (after a hide, or loaded again after a close or reload). The
+ * time away is measured by the DB clock and goes through the tab rule.
+ */
+export async function markBack(admin: SupabaseClient, userId: string, kind: TabKind, id: string, clientHiddenMs: number | null): Promise<TabStatus> {
+  const { data, error } = await admin.rpc("mark_back", {
+    p_kind: kind,
+    p_id: id,
+    p_user: userId,
+    p_client_ms: clientHiddenMs === null ? null : Math.round(clientHiddenMs),
+  });
+  if (error) {
+    if (error.message.includes("not_found")) throw Object.assign(new Error("Not found"), { status: 404 });
+    throw new Error(error.message);
+  }
+  return data as TabStatus;
+}

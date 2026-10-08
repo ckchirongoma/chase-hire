@@ -11,8 +11,9 @@ import { criterionBlock, criterionTo100, mapLimit, RubricRow, weightedMean } fro
 import { applyTurn, labelFor, openScript } from "@/lib/interview/engine";
 import { classifyTurn, JEV_TURN_BUDGET_MS } from "@/lib/interview/classify";
 import { FollowupOutput, resolveFollowup } from "@/lib/interview/followup";
+import { requirementsFor } from "@/lib/interview/requirements";
 import { buildPlan, type RoleInfo } from "@/lib/interview/plan";
-import { CLOSING_COMPLETED, CLOSING_TIMEOUT } from "@/lib/interview/script";
+import { CLOSING_COMPLETED, CLOSING_ENDED, CLOSING_TIMEOUT } from "@/lib/interview/script";
 import { renderTranscript, type TranscriptMessage } from "@/lib/interview/transcript";
 import type { InterviewMessageView, InterviewPlan, InterviewView, OutMessage, Progress, TurnDecision } from "@/lib/interview/types";
 import {
@@ -76,7 +77,7 @@ export type Defer = (task: () => Promise<unknown>) => void;
 export const INTERVIEW_GRACE_MS = 5000;
 export const INTERVIEW_RUBRIC = { key: "interview", version: 2 } as const;
 const GRADER_PROMPT = { key: "interview-grader", version: 2 } as const;
-const FOLLOWUP_PROMPT = { key: "interviewer-followup", version: 1 } as const;
+const FOLLOWUP_PROMPT = { key: "interviewer-followup", version: 2 } as const;
 /** Longest the candidate waits for an LLM-written follow-up before the template is used. */
 export const FOLLOWUP_BUDGET_MS = 8000;
 /** Longest a spoken answer may take to transcribe before it is stored as untranscribed. */
@@ -114,7 +115,7 @@ type SessionRow = {
   started_at: string;
   deadline_at: string;
   ended_at: string | null;
-  end_reason: "completed" | "timeout" | null;
+  end_reason: "completed" | "timeout" | "ended_by_candidate" | null;
   locked_at: string | null;
   tab_leaves: number;
   answer_mode: "voice" | "typed";
@@ -342,6 +343,19 @@ export async function getInterviewState(
   return toView(app, s, rows);
 }
 
+/**
+ * The candidate ends the interview before the last question. Everything answered so far is kept
+ * and graded the same way; unanswered topics simply have no evidence. Never a rejection.
+ */
+export async function endInterviewEarly(admin: SupabaseClient, userId: string, applicationId: string, defer?: Defer): Promise<InterviewView> {
+  const app = await ownApplication(admin, userId, applicationId);
+  const s = await sessionFor(admin, app.id);
+  if (!s) throw new InterviewError("The interview hasn't started yet", 409);
+  if (s.locked_at && !s.ended_at) throw new InterviewError("This interview is locked until our team reopens it", 409);
+  if (!s.ended_at) await endInterview(admin, s.id, isExpired(s) ? "timeout" : "ended_by_candidate", defer);
+  return getInterviewState(admin, userId, applicationId, defer);
+}
+
 // ───────────────────────── Message ─────────────────────────
 
 type Live = Extract<InterviewView, { status: "active" | "done" }>;
@@ -556,7 +570,7 @@ async function generateFollowup(
 ): Promise<{ output: FollowupOutput | null; model: string | null; promptVersion: string; error: string | null }> {
   const prompt = loadPrompt(FOLLOWUP_PROMPT.key, FOLLOWUP_PROMPT.version);
   const topic = s.plan.claims.find((c) => c.id === s.progress.current.claimId) ?? null;
-  const topicRows = rows.filter((m) => m.role === "candidate" || m.step === "claim" || m.step === "probe").filter((m) => {
+  const topicRows = rows.filter((m) => m.role === "candidate" || m.step === "warmup" || m.step === "claim" || m.step === "probe").filter((m) => {
     const claimId = (m as MessageRow & { claim_id?: string | null }).claim_id;
     return claimId === undefined || claimId === s.progress.current.claimId;
   });
@@ -571,7 +585,12 @@ async function generateFollowup(
       system: prompt.system,
       user: [
         `ROLE: ${s.plan.role.title}`,
-        `TOPIC: ${topic ? `${topic.kind}: ${topic.text}` : s.progress.current.text}`,
+        `ROLE NEEDS:\n${requirementsFor(s.plan.role.slug).map((r) => `- ${r.text}`).join("\n")}`,
+        `TOPIC: ${
+          topic
+            ? `${topic.kind}: ${topic.text}${topic.requirement ? ` (evidence for: ${topic.requirement.text})` : ""}`
+            : `opening question (why the candidate fits the role): ${s.plan.questions[s.progress.qIdx]?.text ?? s.progress.current.text}`
+        }`,
         `TARGET: ${target}`,
         `CV:\n${wrapUntrusted("cv", JSON.stringify(cvRow?.parsed ?? {}))}`,
         `CONVERSATION:\n${wrapUntrusted("conversation", conversation.slice(-12_000))}`,
@@ -667,7 +686,7 @@ async function processAnswer(admin: SupabaseClient, userId: string, s: SessionRo
 export async function endInterview(
   admin: SupabaseClient,
   sessionId: string,
-  reason: "completed" | "timeout",
+  reason: "completed" | "timeout" | "ended_by_candidate",
   defer?: Defer,
 ): Promise<boolean> {
   const { data: s, error } = await admin.from("interview_sessions").select(SESSION_COLS).eq("id", sessionId).maybeSingle<SessionRow>();
@@ -698,7 +717,7 @@ export async function endInterview(
   await admin.from("interview_messages").insert({
     session_id: s.id,
     role: "interviewer",
-    content: reason === "completed" ? CLOSING_COMPLETED : CLOSING_TIMEOUT,
+    content: reason === "completed" ? CLOSING_COMPLETED : reason === "timeout" ? CLOSING_TIMEOUT : CLOSING_ENDED,
     step: "close",
     claim_id: null,
     meta: { idx: closingIdx, reason },

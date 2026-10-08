@@ -29,17 +29,18 @@ Why voice: a typed interview can be answered by retyping an LLM's output from a 
 
 The frame is the same for every candidate: the same opening, the same topic-selection rules, the same follow-up targets, the same time limits and the same rubric. What adapts is which CV topics are chosen and what the follow-ups say.
 
-1. **Warm-up (1 question):** "In two or three sentences, what kind of work do you do best?"
+1. **Opening: role fit (1 question, up to 2 follow-ups).** "Let's start with the big picture. What in your experience makes you a strong fit for the {role} role? Tell me about the work you've done that you think qualifies you, and the one or two examples you'd point to first." The follow-ups take the example that matters most for the role, find it on the CV (which role, which employer) and go deeper.
 2. **CV topics (3 to 6), chosen in this priority order:**
-   1. every role that ended in the last **5 years** (up to 3, most recent first), each opened on that role's strongest claim;
-   2. the most impressive quantified claim;
-   3. the claim closest to the role spec;
-   4. a **CV consistency** issue, if the dates don't add up (a role that ends before it starts, overlapping full-time roles of 3+ months, or a gap of 6+ months);
-   5. a key skill the CV lists but **never evidences** in any role.
+   1. the role's **top 3 requirements** (`lib/interview/requirements.ts`, from the competencies in doc 03), each with the CV claim that best evidences it. The question says which part of the job the claim is evidence for: "This role involves digging into messy spreadsheets and system data to find what's missing or wrong. Your CV says you 'cleaned a 50,000-row customer dataset…'. Walk me through what you personally did, which tools you used, and how you measured the result.";
+   2. a **CV consistency** issue, if the dates don't add up (a role that ends before it starts, overlapping full-time roles of 3+ months, or a gap of 6+ months);
+   3. every role that ended in the last **5 years** and isn't already covered (up to 3, most recent first), opened on that role's strongest claim;
+   4. the **closest experience** to the first top requirement the CV shows nothing for: "This role involves X. That doesn't come through clearly on your CV. What's the closest you've done to it?";
+   5. the most impressive quantified claim;
+   6. a key skill the CV lists but **never evidences** in any role.
 
-   Choosing "most impressive", "closest to the role" and "key skill" is a JEV call with a deterministic fallback (doc 15).
-   Each topic opens with a **behavioural STAR** question. Example: "Your CV says you 'built an automated reporting pipeline that saved 20 hours a week.' Walk me through what you personally did, which tools you used, and how you measured the result."
-3. **Adaptive follow-ups (up to 4 per topic).** After each answer, JEV decides whether the answer is specific enough to move on and, if not, what is missing. The target is one of:
+   Requirement topics are asked first, in the role's order of importance; the rest follow in a natural order. Matching claims to requirements, "most impressive" and "key skill" is one JEV call with a deterministic keyword fallback (doc 15).
+   Each topic opens with a **behavioural STAR** question.
+3. **Adaptive follow-ups (up to 4 per topic, 2 on the opening question).** After each answer, JEV decides whether the answer is specific enough to move on and, if not, what is missing. The target is one of:
    - **specifics** (tools, numbers, dates)
    - **ownership** (what they personally did vs. the team)
    - **failure** (what broke and how they found out)
@@ -47,7 +48,7 @@ The frame is the same for every candidate: the same opening, the same topic-sele
    - **consistency** (how it fits the CV's dates and roles)
    - **AI use** (what AI tools did and how they checked it)
 
-   An LLM then writes one follow-up question that builds on the candidate's own words and digs for that target (`prompts/interviewer-followup.v1.md`). The question is validated (length, a single question, no evaluation, no markup, not a repeat); if it fails, or the LLM is slow or down, a standard template for that target is used instead. Without JEV, a fixed rule decides (long enough and contains a number = move on).
+   An LLM then writes one follow-up question that builds on the candidate's own words and digs for that target (`prompts/interviewer-followup.v2.md`: it also receives the role's requirements and connects the answer to the CV and to what the role needs). The question is validated (length, a single question, no evaluation, no markup, not a repeat); if it fails, or the LLM is slow or down, a standard template for that target is used instead. Without JEV, a fixed rule decides (long enough and contains a number = move on).
 4. **Role situational (1 question, fixed per role):**
    - **BA:** "A client's ops head says 'just put all our leads on WhatsApp.' You have a spreadsheet of 5,000 customer lines with no phone numbers on most rows. What do you do in your first week?"
    - **SWE:** "You inherit a Next.js + Supabase app a colleague built with an AI tool in two days. The client goes live Monday. What do you check first, in order, and why?"
@@ -198,3 +199,7 @@ This is a job-knowledge check. Validity is about .40 per Sackett et al. (2022), 
 - The result is the percentage correct. It is shown to the candidate along with their topic-level breakdown.
 - Results below the role's quiz flag line (doc 03) are flagged for admin attention, not rejected.
 - Item statistics are maintained the same way as for the reasoning test.
+
+### Ending early
+
+The candidate can end the interview at any time ("End the interview now", with a confirmation). Everything answered so far is kept and graded the same way; the session ends with `end_reason = 'ended_by_candidate'` and the application moves on to the quiz exactly as when the interview completes. It is never a rejection.

@@ -100,11 +100,65 @@ export async function questionsFor(supabase: SupabaseClient, roleSlug: string, a
   return { byKind, kinds, concerns: interview.concerns, followups: interview.followups };
 }
 
-/** Scorecards this viewer may see (RLS: their own, plus others' once they have submitted that kind). */
-export async function visibleScorecards(supabase: SupabaseClient, applicationId: string): Promise<Scorecard[]> {
-  const { data, error } = await supabase.from("live_scorecards").select(CARD_COLS).eq("application_id", applicationId).order("created_at");
+/**
+ * Scorecards this viewer may see: their own (drafts included), plus the other panellists'
+ * SUBMITTED cards for a part once the viewer has submitted theirs. RLS enforces it (migration
+ * 0019); the filter here is defence in depth, so another panellist's draft never reaches a page.
+ */
+export async function visibleScorecards(supabase: SupabaseClient, applicationId: string, viewerId: string): Promise<Scorecard[]> {
+  const { data, error } = await supabase
+    .from("live_scorecards")
+    .select(CARD_COLS)
+    .eq("application_id", applicationId)
+    .or(`submitted_at.not.is.null,rater.eq.${viewerId}`)
+    .order("created_at");
   if (error) throw new LiveError(error.message);
-  return ((data ?? []) as Scorecard[]).map((c) => ({ ...c, total: c.total === null ? null : Number(c.total) }));
+  return ((data ?? []) as Scorecard[])
+    .filter((c) => c.rater === viewerId || c.submitted_at !== null)
+    .map((c) => ({ ...c, total: c.total === null ? null : Number(c.total) }));
+}
+
+export type RecordedRetest = {
+  id: string;
+  rater: string;
+  raw: number | null;
+  seed: number | null;
+  livePercentile: number | null;
+  onlinePercentile: number | null;
+  delta: number | null;
+  normVersion: string | null;
+  submittedAt: string | null;
+};
+
+/**
+ * The reasoning retest recorded for an application (one per application, DB guard), or null.
+ * A retest is an objective count of correct answers, not a panellist's judgement, so every admin
+ * sees it once it is recorded: read with the service role after the caller's admin check.
+ */
+export async function recordedRetest(admin: SupabaseClient, applicationId: string): Promise<RecordedRetest | null> {
+  const { data, error } = await admin
+    .from("live_scorecards")
+    .select("id, rater, scores, total, submitted_at")
+    .eq("application_id", applicationId)
+    .eq("kind", "reasoning_retest")
+    .order("created_at")
+    .limit(1);
+  if (error) throw new LiveError(error.message);
+  const r = data?.[0];
+  if (!r) return null;
+  const s = (r.scores ?? {}) as Record<string, unknown>;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  return {
+    id: r.id as string,
+    rater: r.rater as string,
+    raw: n(s.raw),
+    seed: n(s.seed),
+    livePercentile: r.total === null ? null : Number(r.total),
+    onlinePercentile: n(s.online_percentile),
+    delta: n(s.delta),
+    normVersion: typeof s.norm_version === "string" ? s.norm_version : null,
+    submittedAt: (r.submitted_at as string | null) ?? null,
+  };
 }
 
 export type KindCount = { submitted: number; drafts: number; mine: "submitted" | "draft" | null };

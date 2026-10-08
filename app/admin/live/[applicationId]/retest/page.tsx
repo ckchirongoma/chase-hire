@@ -5,7 +5,7 @@ import { requireAdmin } from "@/lib/server/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { fmtDate } from "@/lib/format";
 import { deltaNeedsDiscussion, formCode, LIVE_DELTA_THRESHOLD, LIVE_ITEM_COUNT, LIVE_MINUTES, LIVE_NORM } from "@/lib/live/retest";
-import { chooseSeed, loadApplication, onlineReasoning, retestForm, visibleScorecards } from "@/lib/server/live";
+import { chooseSeed, loadApplication, onlineReasoning, raterNames, recordedRetest, retestForm } from "@/lib/server/live";
 import { RetestKey, RetestSheet } from "@/components/admin/live-retest-form";
 import { recordRetest } from "../../actions";
 
@@ -37,33 +37,26 @@ export default async function RetestPage({
   params: Promise<{ applicationId: string }>;
   searchParams: Promise<{ seed?: string; ok?: string; error?: string }>;
 }) {
-  const { supabase, user } = await requireAdmin();
+  const { supabase } = await requireAdmin();
   const { applicationId } = await params;
   const { seed: requested, ok, error } = await searchParams;
   if (!z.uuid().safeParse(applicationId).success) notFound();
   const app = await loadApplication(supabase, applicationId);
   if (!app) notFound();
 
-  // The seed already recorded for this candidate (any panellist) keeps reprints identical. Seeds aren't scores.
-  const { data: recorded } = await createAdminClient()
-    .from("live_scorecards")
-    .select("scores, submitted_at")
-    .eq("application_id", app.id)
-    .eq("kind", "reasoning_retest")
-    .order("updated_at", { ascending: false })
-    .limit(1);
-  const recordedSeed = Number((recorded?.[0]?.scores as { seed?: unknown } | undefined)?.seed);
-  const seed = chooseSeed(app.id, requested, Number.isInteger(recordedSeed) && recordedSeed > 0 ? recordedSeed : null);
+  // One retest per candidate. Once recorded, its seed keeps reprints identical; it is an objective
+  // count (not a panellist's judgement), so every admin sees it.
+  const service = createAdminClient();
+  const recorded = await recordedRetest(service, app.id);
+  const seed = chooseSeed(app.id, recorded ? undefined : requested, recorded?.seed && Number.isInteger(recorded.seed) && recorded.seed > 0 ? recorded.seed : null);
 
-  const [items, online, cards, profile] = await Promise.all([
+  const [items, online, profile] = await Promise.all([
     retestForm(supabase, app.user_id, seed),
     onlineReasoning(supabase, app.user_id),
-    visibleScorecards(supabase, app.id),
     supabase.from("profiles").select("full_name").eq("user_id", app.user_id).maybeSingle(),
   ]);
+  const recordedBy = recorded ? (await raterNames(service, [recorded.rater])).get(recorded.rater) : null;
   const reference = `${app.id.slice(0, 8)}-${formCode(seed)}`;
-  const mine = cards.find((c) => c.kind === "reasoning_retest" && c.rater === user.id && c.submitted_at);
-  const retests = cards.filter((c) => c.kind === "reasoning_retest" && c.submitted_at);
   const another = Math.floor(Math.random() * 2_000_000_000) + 1;
 
   return (
@@ -82,9 +75,13 @@ export default async function RetestPage({
           <p>
             Print this page: the candidate&apos;s sheet ({LIVE_ITEM_COUNT} questions, {LIVE_MINUTES} minutes, timed by you), then the answer key on a separate page for
             you. The form is generated from the live pool with this candidate&apos;s seed ({seed}); questions they saw online are left out. Reprints show the same form.{" "}
-            <Link href={`/admin/live/${app.id}/retest?seed=${another}`} className="underline">
-              Generate a different form
-            </Link>
+            {recorded ? (
+              <span className="muted">This is the form the recorded retest used.</span>
+            ) : (
+              <Link href={`/admin/live/${app.id}/retest?seed=${another}`} className="underline">
+                Generate a different form
+              </Link>
+            )}
           </p>
           <p className="muted">
             Online result:{" "}
@@ -97,10 +94,16 @@ export default async function RetestPage({
 
         <section className="card space-y-3" id="enter">
           <h2 className="h2">Enter the score</h2>
-          {mine ? (
-            <p className="text-sm" data-testid="retest-recorded">
-              You recorded {String((mine.scores as { raw?: unknown }).raw)}/{LIVE_ITEM_COUNT} on {fmtDate(mine.submitted_at)} (live percentile {mine.total}). It is final.
-            </p>
+          {recorded ? (
+            <div className="space-y-1 text-sm" data-testid="retest-recorded">
+              <p>
+                Recorded by {recordedBy} on {fmtDate(recorded.submittedAt)}: {recorded.raw ?? "?"}/{LIVE_ITEM_COUNT}, live percentile {recorded.livePercentile ?? "—"}
+                {recorded.onlinePercentile !== null ? `, online percentile ${recorded.onlinePercentile}` : ""}
+                {recorded.delta !== null ? `, delta ${recorded.delta}` : ""}{" "}
+                {deltaNeedsDiscussion(recorded.delta) && <span className="badge-warn">for discussion</span>}
+              </p>
+              <p className="muted">One retest per candidate. It is final and can&apos;t be recorded again.</p>
+            </div>
           ) : (
             <form action={recordRetest} className="flex flex-wrap items-end gap-3 text-sm">
               <input type="hidden" name="application_id" value={app.id} />
@@ -111,37 +114,8 @@ export default async function RetestPage({
                 </label>
                 <input id="raw" name="raw" type="number" min={0} max={LIVE_ITEM_COUNT} step={1} required className="input w-32" />
               </div>
-              <button className="btn">Record retest (final)</button>
+              <button className="btn">Record retest (final, one per candidate)</button>
             </form>
-          )}
-          {retests.length > 0 && (
-            <table className="table text-sm">
-              <thead>
-                <tr>
-                  <th>Recorded</th>
-                  <th>Raw</th>
-                  <th>Live percentile</th>
-                  <th>Online percentile</th>
-                  <th>Delta</th>
-                </tr>
-              </thead>
-              <tbody>
-                {retests.map((c) => {
-                  const s = c.scores as { raw?: number; online_percentile?: number | null; delta?: number | null };
-                  return (
-                    <tr key={c.id}>
-                      <td>{fmtDate(c.submitted_at)}</td>
-                      <td>{s.raw ?? "—"}</td>
-                      <td>{c.total ?? "—"}</td>
-                      <td>{s.online_percentile ?? "—"}</td>
-                      <td>
-                        {s.delta ?? "—"} {deltaNeedsDiscussion(s.delta) && <span className="badge-warn">for discussion</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
           )}
           <p className="muted">
             Delta = online percentile − live percentile. Above {LIVE_DELTA_THRESHOLD} points it is flagged for discussion in the room: ask the candidate about it.

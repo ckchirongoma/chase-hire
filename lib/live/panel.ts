@@ -66,10 +66,26 @@ export const CONCERN_ANCHORS: Anchors = {
   "5": "Specific and consistent with the CV; gets more specific under probing (systems, numbers, dates, what went wrong); the concern is resolved with checkable detail",
 };
 
-export function concernQuestion(concern: Concern, index: number, position: number): LiveQuestion {
+/**
+ * A verification question's key, from the claim itself (FNV-1a of the lower-cased claim), so a
+ * score saved against it stays with that claim even if the AI-interview summary is re-graded and
+ * its concerns change order.
+ */
+export function concernKey(claim: string): string {
+  let h = 0x811c9dc5;
+  for (const ch of oneLine(claim).toLowerCase()) {
+    h ^= ch.codePointAt(0)!;
+    h = Math.imul(h, 0x01000193);
+  }
+  return `concern_${(h >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+export const isConcernKey = (key: string) => /^concern_[0-9a-f]{8}(_\d)?$/.test(key);
+
+export function concernQuestion(concern: Concern, position: number): LiveQuestion {
   const reason = concern.reason ? ` The AI interview noted: ${concern.reason}` : "";
   return {
-    key: `concern_${index + 1}`,
+    key: concernKey(concern.claim),
     position,
     text: `Verification: your CV or interview said "${concern.claim}".${reason} Walk us through exactly what you did, with the tools, numbers and dates.`,
     probes: [...CONCERN_PROBES],
@@ -106,7 +122,9 @@ export function assemblePanel(bank: readonly BankQuestion[], concerns: readonly 
 
   const out = questions.map(asQuestion);
   chosen.forEach((slot, n) => {
-    out[slot] = concernQuestion(concerns[n], n, questions[slot].position);
+    const q = concernQuestion(concerns[n], questions[slot].position);
+    // Two different claims hashing alike (vanishingly rare) still get distinct keys.
+    out[slot] = out.some((o) => o.key === q.key) ? { ...q, key: `${q.key}_${n + 1}` } : q;
   });
   return out;
 }

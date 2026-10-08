@@ -208,7 +208,9 @@ describe("retention queue rules (docs/12, notice: 6 months, 12 for the talent po
           update public.applications set created_at = now() - interval '5 months' where user_id = '${optedOut.id}';`);
 
     const open = await applicant("ret-open");
-    backdate(open.id, 10); // old, but still in play
+    backdate(open.id, 10); // signed up and applied long ago, but still in play: a quiz last month
+    seed(`insert into public.quiz_attempts (application_id, user_id, seed, started_at, deadline_at, submitted_at, raw_score, pct)
+          values ('${open.appId}', '${open.id}', 1, now() - interval '1 month', now() - interval '1 month' + interval '20 minutes', now() - interval '1 month' + interval '15 minutes', 5, 50);`);
 
     const disputing = await applicant("ret-dispute");
     rejectAt(disputing.appId, boss.id, 8);
@@ -223,6 +225,13 @@ describe("retention queue rules (docs/12, notice: 6 months, 12 for the talent po
     const staff = await newUser("ret-staff");
     await makeAdmin(staff.id);
     backdate(staff.id, 12);
+
+    // A former admin: removed from admins, but named on a decision (a staff record).
+    const former = await newUser("ret-former-staff");
+    await consent(former.client);
+    seed(`insert into public.decisions (application_id, stage, decision, reason, decided_by)
+            values ('${disputing.appId}', 'quiz', 'hold', 'Test setup: held while the dispute is looked at.', '${former.id}');`);
+    backdate(former.id, 12);
 
     const never = await newUser("ret-never");
     await consent(never.client);
@@ -251,6 +260,9 @@ describe("retention queue rules (docs/12, notice: 6 months, 12 for the talent po
     expect(await queueRow(disputing.id)).toBeNull();
     expect(await queueRow(hired.id)).toBeNull();
     expect(await queueRow(staff.id)).toBeNull();
+    expect(await queueRow(former.id)).toBeNull();
+    const { data: formerSched } = await admin.rpc("retention_schedule", { p_user_ids: [former.id] });
+    expect(formerSched).toEqual([]);
 
     // Re-opening an application (an admin releases the rejection) takes the person off the queue.
     seed(`update public.applications set status = 'awaiting_review', closed_at = null where id = '${rejected.appId}';`);
@@ -325,6 +337,9 @@ describe("purge (docs/12 §1 retention automation)", () => {
     const hash = hashUserId(u.id);
     expect(hash).toBe(createHash("sha256").update(u.id + retentionPepper()).digest("hex"));
     expect(storageCount([u.id, u.sub])).toBe(105);
+    // Start from an empty holding table so this person's held answers can be read back.
+    await admin.rpc("retention_release_archive", { p_min_people: 1 });
+    expect(one(`select count(*) from public.retention_archive_pending`)).toBe("0");
     const items0 = Number(one(`select count(*) from public.item_response_archive`));
 
     const report = await purgeDue(admin, { userIds: [u.id], triggeredBy: "test" });
@@ -339,7 +354,19 @@ describe("purge (docs/12 §1 retention automation)", () => {
     expect(dec![0]).toMatchObject({ role_slug: SWE, stage: "quiz", decision: "reject", reason: "Test setup: below the quiz bar on two of the topics." });
     expect(JSON.stringify(dec)).not.toContain(u.id);
 
-    // Item responses: 3 reasoning (unanswered counts as wrong) + 2 quiz, with a fresh attempt ref.
+    // Item responses: 3 reasoning (unanswered counts as wrong) + 2 quiz, with a fresh attempt ref,
+    // held until at least 5 finished purges can be released together.
+    expect(Number(one(`select count(*) from public.item_response_archive`))).toBe(items0);
+    const { data: held } = await admin.from("retention_archive_pending").select("*");
+    expect(held).toHaveLength(5);
+    expect(new Set(held!.map((r) => r.purge_ref)).size).toBe(1);
+    expect(one(`select count(*) from public.retention_purges where archive_ref = '${held![0].purge_ref}'`)).toBe("0");
+    expect(JSON.stringify(held)).not.toContain(u.id);
+    // The statistics count finished purges' held answers already.
+    const { data: kr } = await admin.rpc("retention_release_archive", { p_min_people: 5 });
+    expect(kr).toBe(0); // only one person waiting: nothing released
+    const { data: moved } = await admin.rpc("retention_release_archive", { p_min_people: 1 });
+    expect(moved).toBe(5);
     const items1 = Number(one(`select count(*) from public.item_response_archive`));
     expect(items1 - items0).toBe(5);
     const { data: arch } = await admin.from("item_response_archive").select("*").order("id", { ascending: false }).limit(5);
@@ -358,6 +385,9 @@ describe("purge (docs/12 §1 retention automation)", () => {
     expect(Object.keys(arch![0]).sort()).toEqual(
       ["archived_at", "attempt_ref", "attempt_score", "cohort_month", "correct", "family_or_topic", "form", "id", "item_id", "position", "seconds", "served", "source", "tier"].sort(),
     );
+    // Kept to the month, so a row's time can't be matched to one purge.
+    const monthStart = one(`select to_char(date_trunc('month', now()) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS')`);
+    for (const r of arch!) expect(new Date(r.archived_at).toISOString().slice(0, 19)).toBe(monthStart);
     expect(JSON.stringify(arch)).not.toContain(u.id);
 
     // Storage: nothing left in any bucket (cvs, submissions, interview-audio, snapshots).

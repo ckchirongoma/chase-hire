@@ -9,7 +9,7 @@ import { purgeNow } from "@/app/admin/compliance/actions";
 import { recomputeItemStats } from "@/app/admin/banks/actions";
 import { deleteDemographics, saveDemographics } from "@/app/me/demographics/actions";
 import { DEMOGRAPHICS_NOTICE_VERSION } from "@/app/me/demographics/notice";
-import { adverseImpactAll, adverseImpact, demographicsCoverage, reliability, retentionOverview } from "@/lib/server/compliance";
+import { adverseImpactAll, adverseImpact, CohortFilter, demographicsCoverage, reliability, retentionOverview } from "@/lib/server/compliance";
 import { anon, consent, makeAdmin, newUser as newUserRaw, psql, service } from "../helpers/local";
 
 const admin = service();
@@ -101,7 +101,7 @@ describe("adverse impact report (docs/09 §9)", () => {
 
     // Gender at the quiz stage, decided by an admin:
     //   female 32 (24 advanced = .75), male 30 (12 advanced = .40, ratio .53: flagged),
-    //   non-binary 4 and not disclosed 6 (both under 30: hidden).
+    //   non-binary 4 and not disclosed 6 (both under 30: never returned).
     // Plus three female applications that must not count: two only held, one undecided.
     const groups: { gender: string | null; n: number; advanced: number }[] = [
       { gender: "female", n: 32, advanced: 24 },
@@ -141,13 +141,12 @@ describe("adverse impact report (docs/09 §9)", () => {
     seed(sql.join("\n"));
   }, 60_000);
 
-  it("reports decided applications per group, hides groups under 30 and flags the four-fifths breach", async () => {
+  it("reports decided applications per group, leaves out groups under 30 and flags the four-fifths breach", async () => {
     const r = await adverseImpact(boss.client, "quiz", "gender", { role: slug });
     expect(r.rows.map((x) => [x.group, x.candidates, x.advanced])).toEqual([
       ["female", 32, 24],
       ["male", 30, 12],
     ]);
-    expect(r.hidden.sort()).toEqual(["non_binary", "not_disclosed"]);
     expect(r.reference).toEqual({ group: "female", rate: 0.75 });
     expect(r.flagged).toEqual(["male"]);
     const male = r.rows.find((x) => x.group === "male")!;
@@ -160,21 +159,75 @@ describe("adverse impact report (docs/09 §9)", () => {
     expect(interview.rows.find((x) => x.group === "female")).toMatchObject({ candidates: 32, advanced: 32 });
   });
 
-  it("never returns counts for a group under 30, whatever minimum is asked for", async () => {
+  it("never names or counts a group under 30, whatever minimum is asked for", async () => {
     const { data, error } = await boss.client.rpc("adverse_impact_report", { p_stage: "quiz", p_dimension: "gender", p_min_n: 2, p_role_slug: slug });
     expect(error).toBeNull();
-    const nb = (data as { grp: string; candidates: number | null; suppressed: boolean }[]).find((x) => x.grp === "non_binary");
-    expect(nb).toMatchObject({ candidates: null, suppressed: true });
+    const rows = data as Record<string, unknown>[];
+    // Only the two groups of 30+ come back: no row (and no hint) for non-binary or not disclosed.
+    expect(rows.map((x) => x.grp)).toEqual(["female", "male"]);
+    expect(JSON.stringify(rows)).not.toMatch(/non_binary|not_disclosed|hidden|suppressed/);
+    expect(Object.keys(rows[0]).sort()).toEqual(["advanced", "candidates", "grp", "rate"]);
   });
 
-  it("filters by cohort window and role", async () => {
-    const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
-    const later = await adverseImpact(boss.client, "quiz", "gender", { role: slug, from: tomorrow });
-    expect(later.rows).toEqual([]);
-    expect(later.hidden).toEqual([]);
-    const today = new Date().toISOString().slice(0, 10);
-    const now = await adverseImpact(boss.client, "quiz", "gender", { role: slug, from: today, to: today });
-    expect(now.flagged).toEqual(["male"]);
+  it("returns nothing when a group's complement is under 30 (everyone in one group here)", async () => {
+    // Nobody in this cohort disclosed a population group or disability: "not disclosed" holds
+    // all 72, so showing it would tell an admin every person's answer.
+    for (const dimension of ["population_group", "disability"] as const) {
+      const r = await adverseImpact(boss.client, "quiz", dimension, { role: slug });
+      expect(r.rows).toEqual([]);
+      expect(r.decided).toBe(0);
+    }
+  });
+
+  it("filters by whole cohort months and role, and refuses free date ranges", async () => {
+    const now = new Date();
+    const month = now.toISOString().slice(0, 7);
+    const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString().slice(0, 7);
+    expect((await adverseImpact(boss.client, "quiz", "gender", { role: slug, month: next })).rows).toEqual([]);
+    expect((await adverseImpact(boss.client, "quiz", "gender", { role: slug, month })).flagged).toEqual(["male"]);
+    // Any day in the month means the whole month.
+    const { data: mid } = await boss.client.rpc("adverse_impact_report", { p_stage: "quiz", p_dimension: "gender", p_cohort_month: `${month}-17`, p_role_slug: slug });
+    expect((mid as { grp: string }[]).map((x) => x.grp)).toEqual(["female", "male"]);
+    // The old day-range parameters are gone.
+    const { error: rangeErr } = await boss.client.rpc("adverse_impact_report", {
+      p_stage: "quiz", p_dimension: "gender", p_from: `${month}-01T00:00:00Z`, p_to: `${month}-02T00:00:00Z`,
+    });
+    expect(rangeErr).not.toBeNull();
+    // The filter parser keeps months only.
+    expect(CohortFilter.parse({ month: "2026-13" })).toEqual({ month: undefined });
+    expect(CohortFilter.parse({ month: "2026-09-04" })).toEqual({ month: undefined });
+    expect(CohortFilter.parse({ month: "2026-09", role: slug })).toEqual({ month: "2026-09", role: slug });
+  });
+
+  it("a cohort of one decided person returns no group names in any dimension", async () => {
+    const [uid] = await bulkUsers("ai-one", 1);
+    const oneSlug = `ai-one-${randomUUID().slice(0, 8)}`;
+    const { data: role, error } = await admin
+      .from("roles")
+      .insert({ slug: oneSlug, title: "One-person cohort", summary: "Test only.", salary_min: 1, salary_max: 1, active: false })
+      .select("id")
+      .single();
+    if (error) throw error;
+    const app = randomUUID();
+    seed(`
+      insert into public.demographics (user_id, population_group, gender, disability) values ('${uid}', 'indian', 'female', 'yes');
+      insert into public.applications (id, user_id, role_id, stage, status, created_at) values ('${app}', '${uid}', '${role.id}', 'interview', 'rejected', '1999-03-04');
+      insert into public.decisions (application_id, stage, decision, reason, decided_by) values ('${app}', 'interview', 'reject', 'Test setup: below the interview bar on two criteria.', '${boss.id}');`);
+    try {
+      for (const dim of ["population_group", "gender", "disability"]) {
+        for (const args of [
+          { p_cohort_month: "1999-03-01", p_role_slug: oneSlug },
+          { p_role_slug: oneSlug },
+          { p_cohort_month: "1999-03-04" },
+        ]) {
+          const { data, error: rpcErr } = await boss.client.rpc("adverse_impact_report", { p_stage: "interview", p_dimension: dim, p_min_n: 1, ...args });
+          expect(rpcErr).toBeNull();
+          expect(data).toEqual([]);
+        }
+      }
+    } finally {
+      psql(`delete from auth.users where id = '${uid}'; delete from public.roles where id = '${role.id}';`);
+    }
   });
 
   it("is admin-only, and rejects unknown stages and dimensions", async () => {

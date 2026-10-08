@@ -35,8 +35,26 @@ export const LIVE_BLUEPRINT: Record<Family, Record<Tier, number>> = {
 const FAMILIES = Object.keys(LIVE_BLUEPRINT) as Family[];
 const MAX_RESEEDS = 50;
 
-/** A stable key for an item's stem, used to avoid repeating items the candidate saw online. */
-export const stemKey = (stem: GeneratedItem["stem"]) => JSON.stringify(stem);
+/** Object keys sorted at every level, so a value read back from jsonb (which reorders keys) keys the same. */
+function canonical(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonical);
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(o)
+        .filter((k) => o[k] !== undefined)
+        .sort()
+        .map((k) => [k, canonical(o[k])]),
+    );
+  }
+  return v;
+}
+
+/**
+ * A stable key for an item's stem, used to avoid repeating items the candidate saw online. Key
+ * order doesn't matter: stems stored in reasoning_responses come back from jsonb reordered.
+ */
+export const stemKey = (stem: GeneratedItem["stem"] | Record<string, unknown>) => JSON.stringify(canonical(stem));
 
 /** Tiers to try for a family when a (family, tier) template has been retired: nearest first. */
 const FALLBACK: Record<Tier, Tier[]> = { easy: ["easy", "medium", "hard"], medium: ["medium", "easy", "hard"], hard: ["hard", "medium", "easy"] };

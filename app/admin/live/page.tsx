@@ -43,8 +43,8 @@ export default async function LivePage({ searchParams }: { searchParams: Promise
       <p className="muted">
         Structured panel interview, live defence of work, BA live elicitation or SWE exec scenario, and the paper reasoning retest.
         Every panellist scores on their own scorecard before any discussion; you see the others&apos; scores for a part only after you
-        submit yours. The final composite is 50% pre-live + 50% live once every live part has a submitted scorecard. It sorts; the
-        panel decides, with a written reason, on the candidate page.{" "}
+        submit yours, and the final only once you have submitted every part. The final composite is 50% pre-live + 50% live once every
+        live part has a submitted scorecard. It sorts; the panel decides, with a written reason, on the candidate page.{" "}
         <Link href="/admin/live/bank" className="underline">Question bank and anchors</Link>
       </p>
       <form className="flex flex-wrap items-center gap-2 text-sm">
@@ -76,6 +76,8 @@ export default async function LivePage({ searchParams }: { searchParams: Promise
                 const c = counts.get(a.id);
                 const kinds = kindsForRole(a.roles?.slug ?? "");
                 const delta = a.live_delta === null ? null : Number(a.live_delta);
+                // The final includes other panellists' scores: shown only once this viewer has submitted every part.
+                const mineAll = kinds.length > 0 && kinds.every((k) => c?.get(k)?.mine === "submitted");
                 return (
                   <tr key={a.id} data-testid="live-row">
                     <td>
@@ -108,7 +110,9 @@ export default async function LivePage({ searchParams }: { searchParams: Promise
                     </td>
                     <td>
                       <p>Pre-live {a.composite_score ?? "—"}</p>
-                      <p className="muted">Final {a.final_score ?? "pending"}</p>
+                      <p className="muted" data-testid="live-row-final">
+                        {mineAll ? `Final ${a.final_score ?? "pending"}` : "Final hidden until you submit every part"}
+                      </p>
                     </td>
                   </tr>
                 );

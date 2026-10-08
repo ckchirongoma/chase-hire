@@ -10,6 +10,8 @@ import { purgeDue, RETENTION_SWEEP_LIMIT } from "@/lib/server/retention";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
+/** No new purge starts after this much of the run (each purge is resumable, but the response with `errors` must get out). */
+const PURGE_BUDGET_MS = 240_000;
 
 /**
  * Background safety net (Vercel Cron, or pg_cron + pg_net; see README). Every timed stage is
@@ -18,13 +20,15 @@ export const maxDuration = 300;
  * the composite scores. Then it recomputes the reasoning item statistics (docs/04 §4) and runs
  * the retention purge (docs/12, bounded per run; interrupted purges are finished first). Those
  * two steps report their errors in `errors` (and the log) without hiding the others' results.
- * It never advances or rejects anyone.
+ * The purge starts no new person after 240 s of the run (the rest are reported in `remaining`
+ * and done next run). It never advances or rejects anyone.
  */
 export async function GET(request: Request) {
   const secret = process.env.CRON_SECRET;
   if (!secret || request.headers.get("authorization") !== `Bearer ${secret}`) {
     return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
   }
+  const startedAt = Date.now();
   try {
     const admin = createAdminClient();
     const reasoning = await finaliseExpired(admin);
@@ -44,10 +48,10 @@ export async function GET(request: Request) {
       console.error("sweep: item statistics", err);
       errors.push(`item statistics: ${err instanceof Error ? err.message : String(err)}`);
     }
-    let retention: { due: number; purged: number; failed: number; remaining: number } | null = null;
+    let retention: { due: number; purged: number; failed: number; remaining: number; stoppedAtDeadline: boolean } | null = null;
     try {
-      const r = await purgeDue(admin, { limit: RETENTION_SWEEP_LIMIT, triggeredBy: "sweep" });
-      retention = { due: r.due, purged: r.purged, failed: r.failed, remaining: r.remaining };
+      const r = await purgeDue(admin, { limit: RETENTION_SWEEP_LIMIT, triggeredBy: "sweep", deadline: startedAt + PURGE_BUDGET_MS });
+      retention = { due: r.due, purged: r.purged, failed: r.failed, remaining: r.remaining, stoppedAtDeadline: r.stoppedAtDeadline };
       if (r.failed) errors.push(`retention: ${r.failed} purge(s) failed and will be retried`);
     } catch (err) {
       console.error("sweep: retention", err);

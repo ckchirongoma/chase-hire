@@ -39,44 +39,41 @@ export const GROUP_LABEL: Record<string, string> = {
   not_disclosed: "Not disclosed",
 };
 
+/**
+ * A cohort is a whole calendar month of application (UTC) and/or a role (a hiring round), never
+ * a free date range: two windows a day apart could be subtracted to reveal one person's group.
+ */
 export const CohortFilter = z.object({
   role: z.string().regex(/^[a-z0-9-]+$/).optional().catch(undefined),
-  from: z.iso.date().optional().catch(undefined),
-  to: z.iso.date().optional().catch(undefined),
+  month: z
+    .string()
+    .regex(/^\d{4}-(0[1-9]|1[0-2])$/)
+    .optional()
+    .catch(undefined),
 });
 export type CohortFilter = z.infer<typeof CohortFilter>;
 
 const ImpactRow = z.object({
   grp: z.string(),
-  candidates: z.coerce.number().nullable(),
-  advanced: z.coerce.number().nullable(),
-  rate: z.coerce.number().nullable(),
-  suppressed: z.boolean(),
+  candidates: z.coerce.number(),
+  advanced: z.coerce.number(),
+  rate: z.coerce.number(),
 });
 
 export type ImpactReport = {
   stage: ReportStage;
   dimension: Dimension;
-  /** Groups with at least 30 decided applications, with rates, impact ratios and flags. */
+  /**
+   * Groups with at least 30 decided applications, with rates, impact ratios and flags. Smaller
+   * groups are never returned, named or counted, and nothing is returned at all when a shown
+   * group's complement in the cohort is under 30 (see adverse_impact_report in migration 0018).
+   */
   rows: FourFifthsRow[];
-  /** Groups that exist but have fewer than 30 decided applications (counts withheld). */
-  hidden: string[];
   reference: { group: string; rate: number } | null;
   flagged: string[];
-  /** Decided applications across the shown groups. */
+  /** Decided applications across the shown groups (not the cohort's total). */
   decided: number;
 };
-
-/** Exclusive end: a "to" date includes that whole day. */
-function window(filter: CohortFilter) {
-  const to = filter.to ? new Date(`${filter.to}T00:00:00Z`) : null;
-  if (to) to.setUTCDate(to.getUTCDate() + 1);
-  return {
-    p_from: filter.from ? `${filter.from}T00:00:00Z` : null,
-    p_to: to ? to.toISOString() : null,
-    p_role_slug: filter.role ?? null,
-  };
-}
 
 /** Advance rates by group at one stage, with the four-fifths check. */
 export async function adverseImpact(supabase: SupabaseClient, stage: ReportStage, dimension: Dimension, filter: CohortFilter = {}): Promise<ImpactReport> {
@@ -84,20 +81,19 @@ export async function adverseImpact(supabase: SupabaseClient, stage: ReportStage
     p_stage: stage,
     p_dimension: dimension,
     p_min_n: MIN_GROUP_SIZE,
-    ...window(filter),
+    p_cohort_month: filter.month ? `${filter.month}-01` : null,
+    p_role_slug: filter.role ?? null,
   });
   if (error) throw new Error(`adverse_impact_report: ${error.message}`);
-  const parsed = z.array(ImpactRow).parse(data ?? []);
-  const shown = parsed.filter((r) => !r.suppressed);
+  const shown = z.array(ImpactRow).parse(data ?? []);
   const result = fourFifths(shown.map((r) => ({ group: r.grp, candidates: r.candidates, advanced: r.advanced })));
   return {
     stage,
     dimension,
     rows: result.rows,
-    hidden: parsed.filter((r) => r.suppressed).map((r) => r.grp),
     reference: result.reference,
     flagged: result.flagged,
-    decided: shown.reduce((a, r) => a + (r.candidates ?? 0), 0),
+    decided: shown.reduce((a, r) => a + r.candidates, 0),
   };
 }
 
@@ -230,9 +226,67 @@ export async function retentionOverview(supabase: SupabaseClient, opts: { now?: 
       startedAt: r.started_at as string,
       attempts: r.attempts as number,
       lastError: (r.last_error as string | null) ?? null,
-      step: r.auth_deleted_at ? "auth user deleted; writing the log" : r.storage_done_at ? "files deleted; deleting the auth user" : "archived; deleting files",
+      step: r.auth_deleted_at
+        ? r.storage_done_at
+          ? "account and files deleted; checking and writing the log"
+          : "account deleted; deleting files"
+        : "decisions archived; account still to delete",
     })),
   };
+}
+
+const StaleRow = z.object({
+  application_id: z.string(),
+  user_id: z.string(),
+  role_slug: z.string().nullable(),
+  stage: z.string(),
+  status: z.string(),
+  last_activity: z.string(),
+  round_closed_at: z.string().nullable(),
+  retention_from: z.string(),
+});
+
+export type StaleApplication = {
+  applicationId: string;
+  userId: string;
+  name: string;
+  role: string | null;
+  stage: string;
+  status: string;
+  lastActivity: string;
+  roundClosedAt: string | null;
+  /** When retention treats it as ended (the 6/12-month clock starts then). */
+  retentionFrom: string;
+};
+
+/**
+ * Applications still in play with no activity for `months` (or on a role whose round has
+ * closed): an admin should close them with a decision. Retention doesn't wait for that: an
+ * application idle for 6 months counts as lapsed, and one on a closed round as ended.
+ */
+export async function staleApplications(supabase: SupabaseClient, months = 3): Promise<StaleApplication[]> {
+  const { data, error } = await supabase.rpc("retention_stale_applications", { p_months: months });
+  if (error) throw new Error(`retention_stale_applications: ${error.message}`);
+  const rows = z.array(StaleRow).parse(data ?? []);
+  const names = await profileNames(supabase, rows.map((r) => r.user_id));
+  return rows.map((r) => ({
+    applicationId: r.application_id,
+    userId: r.user_id,
+    name: names.get(r.user_id) ?? r.user_id.slice(0, 8),
+    role: r.role_slug,
+    stage: r.stage,
+    status: r.status,
+    lastActivity: r.last_activity,
+    roundClosedAt: r.round_closed_at,
+    retentionFrom: r.retention_from,
+  }));
+}
+
+/** Former staff (no longer admins) named on decisions, scorecards etc.: the purge leaves them out. */
+export async function formerStaffCount(supabase: SupabaseClient): Promise<number> {
+  const { data, error } = await supabase.rpc("retention_former_staff_count");
+  if (error) throw new Error(`retention_former_staff_count: ${error.message}`);
+  return Number(data ?? 0);
 }
 
 /** "Name · email" for admins (profiles are admin-readable). */

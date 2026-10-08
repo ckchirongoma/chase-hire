@@ -32,8 +32,11 @@ export async function purgeNow(formData: FormData) {
   if (total === 0) back({ error: "Nobody is due for purging." });
   if (parsed.data!.confirm !== total) back({ error: `Confirm the exact number of people due (${total}).` });
 
-  const report = await purgeDue(admin, { limit: RETENTION_SWEEP_LIMIT, triggeredBy: `admin:${user.id}` });
+  // The page allows 300 s; start no new purge after 240 s (the rest wait for the next run).
+  const report = await purgeDue(admin, { limit: RETENTION_SWEEP_LIMIT, triggeredBy: `admin:${user.id}`, deadline: Date.now() + 240_000 });
   const parts = [`Purged ${report.purged} ${report.purged === 1 ? "person" : "people"}.`];
+  const cancelled = report.outcomes.filter((o) => o.status === "skipped" && o.reason.startsWith("cancelled")).length;
+  if (cancelled) parts.push(`${cancelled} no longer due: their purge was cancelled and undone.`);
   if (report.failed) parts.push(`${report.failed} failed and stay in progress (see below); the next run retries them.`);
   if (report.remaining) parts.push(`${report.remaining} left for the next run.`);
   back({ ok: parts.join(" ") });

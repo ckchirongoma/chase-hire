@@ -1,5 +1,6 @@
 import { fmtDate } from "@/lib/format";
 import { KIND_LABEL, parseNotes, SCORE_VALUES, type LiveQuestion, type ScoredKind } from "@/lib/live/scorecard";
+import { isConcernKey } from "@/lib/live/panel";
 import type { KindCount, Scorecard } from "@/lib/server/live";
 import { saveScorecard } from "@/app/admin/live/actions";
 import LiveSubmitButton from "./live-submit-button";
@@ -7,8 +8,9 @@ import LiveSubmitButton from "./live-submit-button";
 /**
  * One live scorecard (docs/09 §5) for the signed-in panellist: every question with its standard
  * probes and 1/3/5 behavioural anchors, a 1–5 score and a note each. Drafts are private; a
- * submitted card is final (DB guard). Other panellists' cards appear only after this panellist
- * has submitted theirs (RLS), so everyone scores independently before any discussion.
+ * submitted card is final (DB guard). Other panellists' submitted cards appear only after this
+ * panellist has submitted theirs (RLS; drafts never), so everyone scores independently before any
+ * discussion.
  */
 
 const num = (v: unknown) => (typeof v === "number" ? v : typeof v === "string" && v !== "" ? Number(v) : null);
@@ -51,7 +53,11 @@ function QuestionHead({ q, n }: { q: LiveQuestion; n: number }) {
 }
 
 function ReadOnlyCard({ card, questions, label }: { card: Scorecard; questions: LiveQuestion[]; label: string }) {
-  const notes = parseNotes(card.notes, questions.map((q) => q.key));
+  // Scores for questions no longer on the card (the AI-interview concerns changed after this card was
+  // submitted) stay visible under their own key rather than being shown against a different question.
+  const current = new Set(questions.map((q) => q.key));
+  const orphaned = Object.keys(card.scores ?? {}).filter((k) => !current.has(k));
+  const notes = parseNotes(card.notes, [...current, ...orphaned]);
   return (
     <div className="space-y-2 rounded-md border border-slate-200 p-3 text-sm" data-testid="live-card-readonly">
       <p>
@@ -65,6 +71,16 @@ function ReadOnlyCard({ card, questions, label }: { card: Scorecard; questions: 
               <td>{q.text.length > 90 ? `${q.text.slice(0, 90)}…` : q.text}</td>
               <td className="w-10 font-medium">{num(card.scores[q.key]) ?? "—"}</td>
               <td className="text-slate-600">{notes.perQuestion[q.key] ?? ""}</td>
+            </tr>
+          ))}
+          {orphaned.map((k) => (
+            <tr key={k} data-testid="live-card-orphaned">
+              <td className="w-8">·</td>
+              <td className="text-slate-600">
+                {isConcernKey(k) ? "Verification question no longer on the card (the AI-interview concerns changed since this was scored)" : `Question no longer in the bank (${k})`}
+              </td>
+              <td className="w-10 font-medium">{num(card.scores[k]) ?? "—"}</td>
+              <td className="text-slate-600">{notes.perQuestion[k] ?? ""}</td>
             </tr>
           ))}
         </tbody>

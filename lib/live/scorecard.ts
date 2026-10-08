@@ -1,4 +1,4 @@
-import { liveWeights, rubricTo100, type LiveKey } from "@/lib/scoring/composite";
+import { finalComposite, liveComposite, liveParts, liveWeights, rubricTo100, type LiveKey, type Weighted } from "@/lib/scoring/composite";
 
 /**
  * Live-stage scorecards (docs/09 §2 and §5): pure helpers shared by the admin pages, the server
@@ -70,6 +70,50 @@ export function scorecardTotal(scores: Record<string, number>, keys: readonly st
   const vals = keys.map((k) => scores[k]);
   if (!vals.every(isScore)) return null;
   return rubricTo100(vals.reduce((a, b) => a + b, 0) / vals.length);
+}
+
+// ───────────────────────── What a panellist may see ─────────────────────────
+
+export interface ViewerLiveScores {
+  /** Per scored kind the viewer has submitted: the mean of every submitted total for it. */
+  parts: Partial<Record<ScoredKind, number | null>>;
+  /** The role's scored kinds the viewer has not submitted: their scores stay hidden from them. */
+  hidden: ScoredKind[];
+  /** The live composite over the parts the viewer may see (null score while they see none). */
+  live: Weighted;
+  /** The viewer has submitted every scored part for the role. */
+  allSubmitted: boolean;
+  /** 50% pre-live + 50% live, only once the viewer has submitted every part (and both are complete). */
+  final: number | null;
+}
+
+/**
+ * Live and final scores as one panellist may see them (docs/09 §5: independent scoring). A part's
+ * score is shown only once the viewer has submitted their own card for it, and the final only once
+ * they have submitted every part, so an aggregate never reveals another panellist's scores early.
+ * Takes the cards RLS lets the viewer read; others' drafts are ignored.
+ */
+export function viewerLiveScores(
+  roleSlug: string,
+  cards: readonly { kind: string; rater: string; total: number | null; submitted_at: string | null }[],
+  viewerId: string,
+  preLive: Weighted | null,
+): ViewerLiveScores {
+  const kinds = kindsForRole(roleSlug);
+  const mine = new Set(cards.filter((c) => c.rater === viewerId && c.submitted_at).map((c) => c.kind));
+  const visible = cards.filter((c) => c.submitted_at && mine.has(c.kind) && isScoredKind(c.kind));
+  const all = liveParts(visible.map((c) => ({ kind: c.kind, total: c.total, submitted: true })));
+  const parts: Partial<Record<ScoredKind, number | null>> = {};
+  for (const k of kinds) if (mine.has(k)) parts[k] = all[k] ?? null;
+  const live = liveComposite(roleSlug, parts);
+  const allSubmitted = kinds.length > 0 && kinds.every((k) => mine.has(k));
+  return {
+    parts,
+    hidden: kinds.filter((k) => !mine.has(k)),
+    live,
+    allSubmitted,
+    final: allSubmitted && preLive ? finalComposite(preLive, live) : null,
+  };
 }
 
 // ───────────────────────── Notes ─────────────────────────

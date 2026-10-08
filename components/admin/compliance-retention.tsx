@@ -1,5 +1,6 @@
-import { fmtDate } from "@/lib/format";
-import type { InProgressPurge, PurgeLogEntry, QueueEntry } from "@/lib/server/compliance";
+import Link from "next/link";
+import { fmtDate, STAGE_LABEL, STATUS_LABEL } from "@/lib/format";
+import type { InProgressPurge, PurgeLogEntry, QueueEntry, StaleApplication } from "@/lib/server/compliance";
 import type { PlannedPurge } from "@/lib/server/retention";
 
 /** Display pieces for the retention section of /admin/compliance (server components). */
@@ -76,8 +77,11 @@ export function InProgressTable({ rows }: { rows: InProgressPurge[] }) {
     <div className="space-y-2">
       <h3 className="font-semibold">Purges in progress ({rows.length})</h3>
       <p className="muted">
-        These stopped halfway (for example a storage error) and are finished first on the next run. An error naming a table
-        means a row keyed by the person survived the cascade: fix the cause, then run the purge again.
+        These stopped halfway (for example a storage error) and are picked up again on the next run (up to half of each run, so
+        they never hold up people newly due). Until the account is deleted, every run re-checks the rules first and undoes the
+        purge if the person is no longer due; meanwhile their applications can&apos;t be re-opened. Files are deleted again on
+        every run, so a late upload is caught. An error naming a table means a row keyed by the person survived the cascade:
+        fix the cause, then run the purge again.
       </p>
       <table className="table" data-testid="purges-in-progress">
         <thead>
@@ -113,6 +117,20 @@ export function PurgeLogTable({ rows }: { rows: PurgeLogEntry[] }) {
             .filter(([k]) => Number(d[k] ?? 0) > 0)
             .map(([k, label]) => `${Number(d[k])} ${label}`);
           const by = typeof d.triggered_by === "string" ? (d.triggered_by.startsWith("admin:") ? "admin" : d.triggered_by) : "—";
+          if (r.scope === "cancelled") {
+            return (
+              <tr key={r.id}>
+                <td>{fmtDate(r.purgedAt)}</td>
+                <td className="font-mono text-xs">{short(r.hash)}</td>
+                <td>cancelled</td>
+                <td className="muted">
+                  No longer due ({String(d.reason ?? "")}): the archived decisions and held answers were removed; nothing was
+                  deleted.
+                </td>
+                <td>—</td>
+              </tr>
+            );
+          }
           return (
             <tr key={r.id}>
               <td>{fmtDate(r.purgedAt)}</td>
@@ -126,6 +144,28 @@ export function PurgeLogTable({ rows }: { rows: PurgeLogEntry[] }) {
             </tr>
           );
         })}
+      </tbody>
+    </table>
+  );
+}
+
+export function StaleApplicationsTable({ rows }: { rows: StaleApplication[] }) {
+  if (!rows.length) return <p className="muted">None: every application in play has had activity in the last 3 months.</p>;
+  return (
+    <table className="table" data-testid="stale-applications">
+      <thead>
+        <tr><th>Candidate</th><th>Role</th><th>Stage</th><th>Last activity</th><th>Counts as ended for retention</th></tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.applicationId}>
+            <td><Link href={`/admin/candidates/${r.userId}`} className="underline">{r.name}</Link></td>
+            <td>{r.role ?? "—"}{r.roundClosedAt && <div className="muted">round closed {fmtDate(r.roundClosedAt)}</div>}</td>
+            <td>{STAGE_LABEL[r.stage] ?? r.stage} · {STATUS_LABEL[r.status] ?? r.status}</td>
+            <td>{fmtDate(r.lastActivity)}</td>
+            <td>{fmtDate(r.retentionFrom)}</td>
+          </tr>
+        ))}
       </tbody>
     </table>
   );

@@ -9,9 +9,14 @@ const label = (g: string) => GROUP_LABEL[g] ?? g;
 
 /** One row per stage × dimension; the group breakdown opens underneath. */
 export function AdverseImpactTable({ reports }: { reports: ImpactReport[] }) {
-  const withData = reports.filter((r) => r.rows.length || r.hidden.length);
+  const withData = reports.filter((r) => r.rows.length);
   if (!withData.length) {
-    return <p className="muted">No decisions recorded in this cohort yet.</p>;
+    return (
+      <p className="muted">
+        Nothing to show for this cohort: no stage has a group with {MIN_GROUP_SIZE} or more decided applications whose
+        complement is also {MIN_GROUP_SIZE} or more. Smaller groups are never shown, named or counted.
+      </p>
+    );
   }
   return (
     <table className="table" data-testid="adverse-impact">
@@ -56,14 +61,12 @@ export function AdverseImpactTable({ reports }: { reports: ImpactReport[] }) {
                           </td>
                         </tr>
                       ))}
-                      {r.hidden.map((g) => (
-                        <tr key={`hidden-${g}`}>
-                          <td>{label(g)}</td>
-                          <td colSpan={4} className="muted">Hidden: fewer than {MIN_GROUP_SIZE} decided</td>
-                        </tr>
-                      ))}
                     </tbody>
                   </table>
+                  <p className="muted mt-1 text-xs">
+                    Groups with fewer than {MIN_GROUP_SIZE} decided applications are not listed, named or counted, so these rows
+                    need not add up to everyone decided.
+                  </p>
                 </details>
               </td>
             </tr>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assemblePanel, bankQuestions, CONCERN_ANCHORS, normaliseConcerns, PANEL_SIZE, type BankQuestion } from "@/lib/live/panel";
+import { assemblePanel, bankQuestions, CONCERN_ANCHORS, concernKey, isConcernKey, normaliseConcerns, PANEL_SIZE, type BankQuestion } from "@/lib/live/panel";
 
 const anchors = { "1": "weak", "3": "ok", "5": "strong" };
 const q = (n: number, replaceable = false, extra: Partial<BankQuestion> = {}): BankQuestion => ({
@@ -16,6 +16,8 @@ const BANK = [q(4), q(2), q(6, true), q(1), q(5, true), q(3)];
 const C1 = { claim: "Led the Postgres migration", reason: "Could not describe an index" };
 const C2 = { claim: "Saved 20 hours a week", reason: "No numbers when probed" };
 const C3 = { claim: "Built the data warehouse", reason: "Vague on tools" };
+const K1 = concernKey(C1.claim);
+const K2 = concernKey(C2.claim);
 
 describe("assemblePanel (docs/09 §5)", () => {
   it("with no concerns: the six bank questions in position order", () => {
@@ -26,7 +28,7 @@ describe("assemblePanel (docs/09 §5)", () => {
 
   it("with one concern: replaces only the first replaceable slot", () => {
     const p = assemblePanel(BANK, [C1]);
-    expect(p.map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", "concern_1", "q6"]);
+    expect(p.map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", K1, "q6"]);
     const c = p[4];
     expect(c).toMatchObject({ source: "concern", position: 5, anchors: CONCERN_ANCHORS });
     expect(c.text).toContain(C1.claim);
@@ -38,18 +40,29 @@ describe("assemblePanel (docs/09 §5)", () => {
     for (const concerns of [[C1, C2], [C1, C2, C3]]) {
       const p = assemblePanel(BANK, concerns);
       expect(p).toHaveLength(PANEL_SIZE);
-      expect(p.map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", "concern_1", "concern_2"]);
+      expect(p.map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", K1, K2]);
       expect(p[4].text).toContain(C1.claim);
       expect(p[5].text).toContain(C2.claim);
       expect(p.filter((x) => x.source === "concern")).toHaveLength(2);
     }
   });
 
+  it("keys a verification question on its claim, not its position, so re-ordered concerns keep their scores", () => {
+    expect(K1).toMatch(/^concern_[0-9a-f]{8}$/);
+    expect(isConcernKey(K1)).toBe(true);
+    expect(isConcernKey("ba_panel_data_problem")).toBe(false);
+    expect(K1).not.toBe(K2);
+    expect(concernKey("  Led the   POSTGRES migration ")).toBe(K1);
+    const swapped = assemblePanel(BANK, [C2, C1]);
+    expect(swapped.map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", K2, K1]);
+    expect(swapped[5].text).toContain(C1.claim);
+  });
+
   it("falls back to the last questions when the bank marks no replaceable slots", () => {
     const bank = BANK.map((x) => ({ ...x, replaceable: false }));
-    expect(assemblePanel(bank, [C1, C2]).map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", "concern_1", "concern_2"]);
+    expect(assemblePanel(bank, [C1, C2]).map((x) => x.key)).toEqual(["q1", "q2", "q3", "q4", K1, K2]);
     const one = BANK.map((x) => ({ ...x, replaceable: x.key === "q2" }));
-    expect(assemblePanel(one, [C1, C2]).map((x) => x.key)).toEqual(["q1", "concern_1", "q3", "q4", "q5", "concern_2"]);
+    expect(assemblePanel(one, [C1, C2]).map((x) => x.key)).toEqual(["q1", K1, "q3", "q4", "q5", K2]);
   });
 
   it("skips inactive questions and caps the card at six", () => {

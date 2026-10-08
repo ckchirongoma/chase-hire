@@ -4,14 +4,22 @@ import {
   adverseImpactAll,
   CohortFilter,
   demographicsCoverage,
+  formerStaffCount,
   profileNames,
   reliability,
   retentionOverview,
+  staleApplications,
 } from "@/lib/server/compliance";
 import { countDue, purgeDue, retentionPepper, type PurgeReport } from "@/lib/server/retention";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { FOUR_FIFTHS, MIN_GROUP_SIZE } from "@/lib/stats/four-fifths";
-import { DryRunTable, InProgressTable, PurgeLogTable, RetentionQueueTable } from "@/components/admin/compliance-retention";
+import {
+  DryRunTable,
+  InProgressTable,
+  PurgeLogTable,
+  RetentionQueueTable,
+  StaleApplicationsTable,
+} from "@/components/admin/compliance-retention";
 import { AdverseImpactTable, CoverageTable, ReliabilityTable } from "@/components/admin/compliance-fairness";
 import { purgeNow } from "./actions";
 
@@ -28,14 +36,16 @@ export const maxDuration = 300;
 export default async function CompliancePage({
   searchParams,
 }: {
-  searchParams: Promise<{ dry?: string; ok?: string; error?: string; role?: string; from?: string; to?: string }>;
+  searchParams: Promise<{ dry?: string; ok?: string; error?: string; role?: string; month?: string }>;
 }) {
   const { supabase } = await requireAdmin();
   const sp = await searchParams;
-  const filter = CohortFilter.parse({ role: sp.role || undefined, from: sp.from || undefined, to: sp.to || undefined });
+  const filter = CohortFilter.parse({ role: sp.role || undefined, month: sp.month || undefined });
 
-  const [overview, impact, kr20, coverage, { data: roles }] = await Promise.all([
+  const [overview, stale, formerStaff, impact, kr20, coverage, { data: roles }] = await Promise.all([
     retentionOverview(supabase),
+    staleApplications(supabase),
+    formerStaffCount(supabase),
     adverseImpactAll(supabase, filter),
     reliability(supabase),
     demographicsCoverage(supabase),
@@ -86,11 +96,15 @@ export default async function CompliancePage({
       <section id="retention" className="card space-y-4">
         <h2 className="h2">Retention</h2>
         <p className="muted">
-          As the privacy notice promises: if someone is not appointed, their information is deleted 6 months after their
-          application closed (12 months if they opted into the talent pool on their latest consent). Someone who never applied
-          is deleted 6 months after their last activity. Admins, anyone with an application still in play and appointed
-          candidates are never queued. A purge keeps only a decision log under a hashed id and anonymised item answers; it
-          deletes the CV, recordings, submissions, snapshots and the account. The nightly sweep purges up to 25 people a run.
+          As the privacy notice promises: if someone is not appointed, their information is deleted 6 months after the hiring
+          round closes for them (12 months if they opted into the talent pool on their latest consent). The clock starts when
+          their application closed, or when the role&apos;s round closed (an admin made the role inactive) if that was later. An
+          application left in play starts the clock when its role&apos;s round closes, or after 6 months without any activity
+          (it counts as lapsed; nobody is rejected for it). Someone who never applied is deleted 6 months after their last
+          activity. Admins, former staff, anyone with an application still in play or an open review request, and appointed
+          candidates are never queued. A purge keeps only a decision log under a hashed id and anonymised item answers (added
+          to the archive in shuffled batches of at least 5 people); it deletes the CV, recordings, submissions, snapshots and
+          the account. The nightly sweep purges up to 25 people a run.
         </p>
         {pepperProblem && <p className="error">{pepperProblem}</p>}
         <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
@@ -132,6 +146,22 @@ export default async function CompliancePage({
         <InProgressTable rows={overview.inProgress} />
 
         <div className="space-y-2">
+          <h3 className="font-semibold">Idle applications still in play ({stale.length})</h3>
+          <p className="muted">
+            No activity for 3 months or more, or on a role whose round has closed. Close them on the candidate&apos;s page with a
+            decision and a reason (they can still be advanced). If nobody does, retention treats each as ended on the date
+            shown and the person is queued from then.
+          </p>
+          <StaleApplicationsTable rows={stale} />
+        </div>
+        {formerStaff > 0 && (
+          <p className="muted" data-testid="former-staff">
+            {formerStaff} former staff {formerStaff === 1 ? "account is" : "accounts are"} left out of the purge: they are named
+            on decisions, scorecards or review responses as staff. Remove them by hand when those records may go.
+          </p>
+        )}
+
+        <div className="space-y-2">
           <h3 className="font-semibold">Queue (next {overview.next.length})</h3>
           <RetentionQueueTable rows={overview.next} today={overview.today} />
         </div>
@@ -148,9 +178,15 @@ export default async function CompliancePage({
           Advance rates by group at each stage, counting applications an admin decided there (advance or reject; holds and
           undecided ones are left out). A group whose rate is below {FOUR_FIFTHS} of the highest group&apos;s rate is flagged (the
           four-fifths rule): review that stage&apos;s items and anchors before the next cohort. A flag is about the assessment,
-          never about a candidate. Groups with fewer than {MIN_GROUP_SIZE} decided applications are hidden: rates on small
-          groups swing on one or two people, and showing them could identify someone. &ldquo;Not disclosed&rdquo; and
-          &ldquo;prefer not to say&rdquo; are shown but not compared.
+          never about a candidate. Groups with fewer than {MIN_GROUP_SIZE} decided applications are not shown, named or
+          counted: rates on small groups swing on one or two people, and naming a small group could identify someone. For the
+          same reason a stage shows nothing when everyone outside its largest group would be fewer than {MIN_GROUP_SIZE}.
+          &ldquo;Not disclosed&rdquo; and &ldquo;prefer not to say&rdquo; are shown but not compared.
+        </p>
+        <p className="muted">
+          A cohort is a whole month of applications and/or a role. Use the report to review stages, never people: comparing a
+          month with all months, or the report before and after one decision, can hint at one person&apos;s answers, and doing
+          that breaks the promise made to candidates on the demographics form.
         </p>
         <form className="flex flex-wrap items-end gap-3 text-sm" action="/admin/compliance#fairness">
           <label>
@@ -163,12 +199,8 @@ export default async function CompliancePage({
             </select>
           </label>
           <label>
-            <span className="label">Applied from</span>
-            <input type="date" name="from" defaultValue={filter.from ?? ""} className="input" />
-          </label>
-          <label>
-            <span className="label">to</span>
-            <input type="date" name="to" defaultValue={filter.to ?? ""} className="input" />
+            <span className="label">Applied in (month, blank = all)</span>
+            <input type="month" name="month" defaultValue={filter.month ?? ""} className="input" />
           </label>
           <button className="btn-secondary">Show cohort</button>
           {filterQuery.size > 0 && <Link href="/admin/compliance#fairness" className="underline">Clear</Link>}

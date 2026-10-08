@@ -6,7 +6,7 @@ import { refreshQuietly, refreshScores } from "@/lib/server/scores";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { cleanScores, formatNotes, isScoredKind, kindsForRole, scorecardTotal, type ScoredKind } from "@/lib/live/scorecard";
 import { deltaNeedsDiscussion, LIVE_ITEM_COUNT, liveDelta, livePercentile } from "@/lib/live/retest";
-import { LIVE_STAGES, loadApplication, onlineReasoning, questionsFor } from "@/lib/server/live";
+import { LIVE_STAGES, loadApplication, onlineReasoning, questionsFor, recordedRetest } from "@/lib/server/live";
 
 /**
  * Live-stage writes (docs/09 §2 and §5). Scorecards are written through the admin's own client,
@@ -75,7 +75,10 @@ export async function saveScorecard(formData: FormData) {
   const write = mine
     ? await supabase.from("live_scorecards").update(row).eq("id", mine.id).select("id")
     : await supabase.from("live_scorecards").insert({ application_id: appId, kind, ...row }).select("id");
-  if (write.error) go(back, { error: /scorecard_already_submitted/.test(write.error.message) ? FINAL : write.error.message }, kind);
+  if (write.error) {
+    const m = write.error.message;
+    go(back, { error: /scorecard_already_submitted/.test(m) ? FINAL : /scorecard_scores_(invalid|missing)/.test(m) ? "Scores must be whole numbers from 1 to 5, at least one." : m }, kind);
+  }
   if (!write.data?.length) go(back, { error: "The scorecard was not saved." }, kind);
 
   if (intent === "submit") {
@@ -89,6 +92,7 @@ export async function saveScorecard(formData: FormData) {
 // ───────────────────────── Reasoning retest ─────────────────────────
 
 const RAW_MSG = `Enter the raw score: a whole number from 0 to ${LIVE_ITEM_COUNT}.`;
+const RETEST_FINAL = "A retest is already recorded for this candidate, and it is final (one retest per candidate).";
 const Retest = z.object({
   application_id: z.uuid(),
   raw: z
@@ -106,11 +110,12 @@ const Retest = z.object({
 
 /**
  * Records the paper retest: raw 0–12 → live percentile (live norm) → live_delta = online − live.
- * Stored as the rater's reasoning_retest scorecard (final) and on applications.live_delta. A delta
- * above 25 logs a live_delta signal FOR DISCUSSION. Not part of any composite (docs/09 §2).
+ * One retest per candidate, stored as a final reasoning_retest scorecard and on
+ * applications.live_delta. A delta above 25 logs a live_delta signal FOR DISCUSSION. Not part of
+ * any composite (docs/09 §2).
  */
 export async function recordRetest(formData: FormData) {
-  const { supabase, user } = await requireAdmin();
+  const { supabase } = await requireAdmin();
   const appIdRaw = String(formData.get("application_id") ?? "");
   const parsed = Retest.safeParse({ application_id: appIdRaw, raw: String(formData.get("raw") ?? ""), seed: String(formData.get("seed") ?? "") });
   const back = z.uuid().safeParse(appIdRaw).success ? `/admin/live/${appIdRaw}/retest` : "/admin/live";
@@ -121,32 +126,24 @@ export async function recordRetest(formData: FormData) {
   if (!app) go("/admin/live", { error: "Application not found." });
   if (!(LIVE_STAGES as readonly string[]).includes(app!.stage)) go(back, { error: "This application is not at the shortlist or live stage." });
 
+  // One retest per candidate (DB guard): the first recorded count is the result, so live_delta
+  // and its signal can't be silently replaced by a second entry.
+  const service = createAdminClient();
+  if (await recordedRetest(service, appId)) go(back, { error: RETEST_FINAL });
+
   const online = await onlineReasoning(supabase, app!.user_id);
   const live = livePercentile(raw);
   const delta = liveDelta(online?.percentile, live.percentile);
-
-  const { data: mine, error: readErr } = await supabase
-    .from("live_scorecards")
-    .select("id, submitted_at")
-    .eq("application_id", appId)
-    .eq("kind", "reasoning_retest")
-    .eq("rater", user.id)
-    .maybeSingle();
-  if (readErr) go(back, { error: readErr.message });
-  if (mine?.submitted_at) go(back, { error: "You have already recorded this retest. It is final." });
   const row = {
     scores: { raw, seed, norm_version: live.normVersion, online_percentile: online?.percentile ?? null, live_percentile: live.percentile, delta },
     total: live.percentile,
     notes: null,
     submitted_at: new Date().toISOString(),
   };
-  const write = mine
-    ? await supabase.from("live_scorecards").update(row).eq("id", mine.id).select("id")
-    : await supabase.from("live_scorecards").insert({ application_id: appId, kind: "reasoning_retest", ...row }).select("id");
-  if (write.error) go(back, { error: /scorecard_already_submitted/.test(write.error.message) ? "This retest is already recorded and final." : write.error.message });
+  const write = await supabase.from("live_scorecards").insert({ application_id: appId, kind: "reasoning_retest", ...row }).select("id");
+  if (write.error) go(back, { error: /retest_already_recorded|scorecard_already_submitted|duplicate key/.test(write.error.message) ? RETEST_FINAL : write.error.message });
 
   // applications has no admin UPDATE policy: the service role writes live_delta after the admin check.
-  const service = createAdminClient();
   const { error: upErr } = await service.from("applications").update({ live_delta: delta }).eq("id", appId);
   if (upErr) go(back, { error: `Retest saved, but live_delta could not be stored: ${upErr.message}` });
   if (deltaNeedsDiscussion(delta)) {

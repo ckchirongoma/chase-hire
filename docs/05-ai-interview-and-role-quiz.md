@@ -16,7 +16,7 @@ So the AI interviewer is tightly scripted. It is not a free-form chat.
 
 ### Format (v2: spoken and adaptive)
 
-- **Spoken answers.** The interviewer's question appears on screen (the candidate can have it read aloud). The candidate records each answer (up to 3 minutes), can listen back and re-record, then sends it. The server stores the recording in the private `interview-audio` bucket and transcribes it through OpenRouter (`OPENROUTER_MODEL_TRANSCRIBE`, default `openai/whisper-1`). The transcript is what the interviewer and the grader see.
+- **Spoken answers.** The interviewer's question appears on screen (the candidate can have it read aloud). The candidate records each answer (up to 3 minutes), can listen back and re-record, then sends it. The server stores the recording in the private `interview-audio` bucket and transcribes it through OpenRouter (`OPENROUTER_MODEL_TRANSCRIBE`, default `openai/gpt-transcribe`). The transcript is what the interviewer and the grader see.
 - **Typed answers only as an accommodation.** An admin can switch one application to typed answers before its interview starts (`admin_set_interview_mode`, with a written reason), for example when a candidate can't use a microphone. Paste stays blocked in typed mode.
 - **About 25–30 minutes**, with a hard server-side `deadline_at` of **35 minutes** set by the DB clock.
 - The candidate is told the format, the time and the tab rule up front, and that answers should be specific. They are not told a question count, because follow-ups depend on their answers.

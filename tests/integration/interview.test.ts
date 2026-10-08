@@ -711,7 +711,7 @@ describe("spoken answers (voice mode, the default)", () => {
       audio_mime: "audio/webm",
       duration_ms: 42_000,
       transcribed: true,
-      transcription: { model: "openai/whisper-1", error: null },
+      transcription: { model: "openai/gpt-transcribe", error: null },
       decision: "answer",
     });
     const path = String(row.meta.audio_path);

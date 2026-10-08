@@ -48,7 +48,7 @@ A lock is never a rejection.
    | `OPENROUTER_MODEL_GRADER` | Strong reasoning model for every grader |
    | `OPENROUTER_MODEL_PERSONA` | Fast model for the BA stakeholder persona |
    | `OPENROUTER_MODEL_INTERVIEWER` | Writes the interview follow-ups (optional; falls back to the persona model) |
-   | `OPENROUTER_MODEL_TRANSCRIBE` | Speech-to-text, default `openai/whisper-1` |
+   | `OPENROUTER_MODEL_TRANSCRIBE` | Speech-to-text, default `openai/gpt-transcribe` |
    | `TYPESAFE_API_KEY`, `JEV_MODEL` | JEV (optional; every JEV decision has a deterministic fallback). Default model `jev-1.13.0` |
    | `CRON_SECRET` | 16+ characters; Vercel Cron sends it as a bearer token |
    | `RETENTION_PEPPER` | **Server only**, 16+ characters, never change it once set. Peppers the hashed ids in the decision archive; without it the retention purge pauses |

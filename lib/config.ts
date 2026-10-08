@@ -25,7 +25,7 @@ const serverSchema = z.object({
   /** Writes the AI interview's follow-up questions (falls back to the persona model). */
   OPENROUTER_MODEL_INTERVIEWER: z.string().min(1).optional(),
   /** Speech-to-text for spoken interview answers. */
-  OPENROUTER_MODEL_TRANSCRIBE: z.string().min(1).default("openai/whisper-1"),
+  OPENROUTER_MODEL_TRANSCRIBE: z.string().min(1).default("openai/gpt-transcribe"),
   CRON_SECRET: z.string().min(16).optional(),
 });
 

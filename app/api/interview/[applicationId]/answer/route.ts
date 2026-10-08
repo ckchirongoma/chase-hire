@@ -7,9 +7,11 @@ import { errorResponse, routeUser } from "@/lib/server/route";
 // Transcription + the next question + (for the last answer) grading kicked off after the response.
 export const maxDuration = 300;
 
+// Multipart fields arrive as strings (or null when missing): never coerce null to 0.
+const digits = z.string().regex(/^\d{1,9}$/).transform(Number);
 const Fields = z.object({
-  turn: z.coerce.number().int().min(0),
-  durationMs: z.coerce.number().int().min(0).max(10 * 60_000).nullable(),
+  turn: digits,
+  durationMs: digits.pipe(z.number().max(10 * 60_000)).nullable(),
 });
 
 /** A spoken answer (multipart: audio, turn, durationMs). Returns the interview state. */
@@ -21,7 +23,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ app
 
   const form = await request.formData().catch(() => null);
   const audio = form?.get("audio");
-  const fields = Fields.safeParse({ turn: form?.get("turn"), durationMs: form?.get("durationMs") ?? null });
+  const fields = Fields.safeParse({ turn: form?.get("turn"), durationMs: form?.get("durationMs") || null });
   if (!form || !(audio instanceof Blob) || !fields.success) return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   const mime = (audio.type || "").split(";")[0].toLowerCase();
   if (!AUDIO_TYPES[mime]) return NextResponse.json({ error: "Unsupported audio format" }, { status: 400 });

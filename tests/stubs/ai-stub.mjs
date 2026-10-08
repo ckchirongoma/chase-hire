@@ -81,6 +81,10 @@ const server = http.createServer((req, res) => {
         // (e.g. a real browser recording from a fake microphone) gets a fixed, specific answer.
         const bytes = Buffer.from(String(body?.input_audio?.data ?? ""), "base64");
         const asText = bytes.toString("utf8");
+        if (asText.includes("STUB:TRANSCRIBE_FAIL")) {
+          res.statusCode = 500;
+          return res.end(JSON.stringify({ error: { code: 500, message: "stub transcription failure" } }));
+        }
         const text = asText.startsWith("TEXT:") ? asText.slice(5) : STUB_TRANSCRIPT;
         return res.end(JSON.stringify({ text, model: body.model }));
       }

@@ -21,6 +21,7 @@ import {
   type SubjectType,
 } from "@/lib/grading";
 import { refreshQuietly, refreshScoresForSubject } from "@/lib/server/scores";
+import { calibrationReviewReason } from "@/lib/calibration/status";
 
 /**
  * Shared LLM grading core (docs/09 §7), reused by every AI-graded stage:
@@ -207,6 +208,13 @@ export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterio
     reasons.push(...(f.reviewReasons ?? []));
   }
   reasons.push(...(input.reviewReasons ?? []));
+  // Calibration go-live rule (docs/09 §8.3): a criterion the latest finished gold-set run marked
+  // 'review' or 'human_only' always goes to a person. Gold samples are what calibration measures,
+  // so they are graded as they are. With no finished run, nothing changes.
+  if (input.subjectType !== "gold") {
+    const calibration = await calibrationReviewReason(admin, input.rubricId, criterionKey);
+    if (calibration) reasons.push(calibration);
+  }
   if (reasons.length) summary = { ...summary, needsHumanReview: true, reviewReason: reasons.join("; ") };
   if (input.feedbackFilter) summary = { ...summary, feedback: input.feedbackFilter(summary.feedback) };
 
@@ -328,13 +336,15 @@ type Loader = GradingLoader;
 
 /**
  * subject_type → handler. Loaders are lazy so handler modules (which import this one) are not
- * a circular import at load time. 'submission' (Wave 3 work samples) is registered here, so any
- * importer of this module (the cron worker, the admin re-run route, submit routes) can run
- * submission jobs; lib/server/grade-submission also registers itself when imported directly.
+ * a circular import at load time. 'submission' (Wave 3 work samples) and 'gold' (calibration) are
+ * registered here, so any importer of this module (the cron worker, the admin re-run route, submit
+ * routes) can run those jobs; lib/server/grade-submission also registers itself when imported directly.
  */
 const registry = new Map<SubjectType, Loader>([
   ["interview", async () => (await import("@/lib/server/interview")).gradeInterviewSession],
   ["submission", async () => (await import("@/lib/server/grade-submission")).submissionGradingHandler],
+  // Gold-set calibration (docs/09 §8): grades gold_samples.text_content with the current rubric.
+  ["gold", async () => (await import("@/lib/server/calibration")).goldGradingHandler],
 ]);
 
 export function registerGradingHandler(type: SubjectType, handler: GradingHandler): void {

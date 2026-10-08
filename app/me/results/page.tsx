@@ -140,6 +140,11 @@ export default async function ResultsPage({ searchParams }: { searchParams: Prom
           </ul>
         )}
       </section>
+
+      <p className="muted">
+        Optional: <Link href="/me/demographics" className="underline">help us check our assessments are fair</Link> (kept apart from
+        your results and never used to assess you).
+      </p>
     </div>
   );
 }

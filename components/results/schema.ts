@@ -27,6 +27,19 @@ export const QuizResultRow = z.object({
   topic_scores: z.record(z.string(), z.object({ correct: num, total: num })).nullable(),
 });
 
+export const WorkResultRow = z.object({
+  stage_key: z.string(),
+  app_stage: z.string(),
+  title: z.string(),
+  open_until: z.string().nullable(),
+  started_at: z.string().nullable(),
+  deadline_at: z.string().nullable(),
+  submitted_at: z.string().nullable(),
+  score: num.nullable(),
+  grading_status: z.string().nullable(),
+  criteria: z.array(InterviewCriterion).nullable().transform((v) => v ?? []),
+});
+
 export const DecisionRow = z.object({
   stage: z.string(),
   decision: z.string(),
@@ -44,6 +57,7 @@ export const ApplicationResult = z.object({
   created_at: z.string(),
   interview: InterviewResult.nullable(),
   quiz: QuizResultRow.nullable(),
+  work: z.array(WorkResultRow).nullable().optional().transform((v) => v ?? []),
   decisions: z.array(DecisionRow).nullable().transform((v) => v ?? []),
 });
 
@@ -52,3 +66,4 @@ export const MyResults = z.array(ApplicationResult);
 export type ApplicationResult = z.output<typeof ApplicationResult>;
 export type InterviewResult = z.output<typeof InterviewResult>;
 export type QuizResultRow = z.output<typeof QuizResultRow>;
+export type WorkResultRow = z.output<typeof WorkResultRow>;

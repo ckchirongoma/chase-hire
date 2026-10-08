@@ -79,6 +79,11 @@ export default async function RolePage({
             {["in_progress", "advanced"].includes(application.status) && application.stage === "quiz" && (
               <Link href={`/apply/${role.slug}/quiz`} className="btn">Next: role quiz (12 minutes)</Link>
             )}
+            {["in_progress", "advanced"].includes(application.status) && (application.stage === "work_1" || application.stage === "work_2") && (
+              <Link href={`/apply/${role.slug}/work/${application.stage}`} className="btn">
+                Next: work assessment {application.stage === "work_1" ? "1" : "2"}
+              </Link>
+            )}
             <Link href="/me/results" className="btn-secondary">See my results</Link>
           </>
         ) : !user ? (

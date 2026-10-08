@@ -48,3 +48,6 @@ supabase/.branches
 # playwright
 /test-results
 /playwright-report
+
+# generated synthetic datasets (regenerate with scripts/synth)
+scripts/synth/out/

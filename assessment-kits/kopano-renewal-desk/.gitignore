@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# env files: never commit secrets (copy .env.example to .env.local)
+.env*
+!.env.example
+
+# supabase local state
+supabase/.temp/
+supabase/.branches/
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+coverage/
+.vercel

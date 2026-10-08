@@ -8,7 +8,6 @@ import { z } from "zod";
 const publicSchema = z.object({
   NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: z.string().min(1),
-  NEXT_PUBLIC_SITE_URL: z.string().url().default("http://localhost:3000"),
 });
 
 const serverSchema = z.object({
@@ -25,7 +24,7 @@ const serverSchema = z.object({
   /** Writes the AI interview's follow-up questions (falls back to the persona model). */
   OPENROUTER_MODEL_INTERVIEWER: z.string().min(1).optional(),
   /** Speech-to-text for spoken interview answers. */
-  OPENROUTER_MODEL_TRANSCRIBE: z.string().min(1).default("openai/whisper-1"),
+  OPENROUTER_MODEL_TRANSCRIBE: z.string().min(1).default("openai/gpt-transcribe"),
   CRON_SECRET: z.string().min(16).optional(),
 });
 
@@ -36,7 +35,6 @@ export function publicEnv(): PublicEnv {
   return publicSchema.parse({
     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
     NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
-    NEXT_PUBLIC_SITE_URL: process.env.NEXT_PUBLIC_SITE_URL || undefined,
   });
 }
 

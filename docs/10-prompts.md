@@ -78,7 +78,7 @@ The output is checked in code (`lib/interview/followup.ts`): 15–350 characters
 
 ## transcription (spoken interview answers)
 
-Not a prompt: OpenRouter `POST /audio/transcriptions` with `{model, input_audio: {data, format}}`, model `OPENROUTER_MODEL_TRANSCRIBE` (default `openai/whisper-1`), sent with `X-Prompt-Version: transcription`. The transcript is sanitised like any other candidate text before the classifier, the follow-up writer or the grader sees it. The model, duration and any error are stored in `meta.transcription` on the answer.
+Not a prompt: OpenRouter `POST /audio/transcriptions` with `{model, input_audio: {data, format}}`, model `OPENROUTER_MODEL_TRANSCRIBE` (default `openai/gpt-transcribe`), sent with `X-Prompt-Version: transcription`. The transcript is sanitised like any other candidate text before the classifier, the follow-up writer or the grader sees it. The model, duration and any error are stored in `meta.transcription` on the answer.
 
 ## interview-grader.v2
 

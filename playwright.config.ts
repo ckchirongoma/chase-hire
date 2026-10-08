@@ -9,7 +9,6 @@ const local = {
   NEXT_PUBLIC_SUPABASE_URL: sb.url,
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb.publishable,
   SUPABASE_SECRET_KEY: sb.secret,
-  NEXT_PUBLIC_SITE_URL: "http://localhost:3000",
   OPENROUTER_API_KEY: "stub",
   OPENROUTER_BASE_URL: "http://127.0.0.1:4010",
   OPENROUTER_MODEL_CV_PARSE: "stub/cv-parse",

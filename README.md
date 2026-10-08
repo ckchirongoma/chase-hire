@@ -40,7 +40,6 @@ A lock is never a rejection.
    | Variable | Notes |
    |---|---|
    | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Public |
-   | `NEXT_PUBLIC_SITE_URL` | e.g. `https://hire.example.co.za` |
    | `SUPABASE_SECRET_KEY` | **Server only.** Never prefix with `NEXT_PUBLIC_` |
    | `OPENROUTER_API_KEY` | **Server only** |
    | `OPENROUTER_MODEL_CV_PARSE`, `OPENROUTER_MODEL_CV_VISION` | CV parsing (vision for scanned PDFs) |

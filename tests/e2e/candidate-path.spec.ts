@@ -175,6 +175,21 @@ test("candidate signs up, uploads a CV, gets a star rating and applies; admin se
   await adminPage.getByText(/^Transcript \(/).first().click();
   await expect(adminPage.locator("audio").first()).toBeAttached(); // each spoken answer can be played back
 
+  // Pipeline: candidate 1 finished the quiz and waits for review. Batch advance needs a selection,
+  // one reason and the typed count; the card then moves to work assessment 1.
+  await adminPage.goto("/admin/pipeline");
+  const quizCol = adminPage.getByTestId("column-quiz");
+  const card1 = quizCol.getByTestId("pipeline-card").filter({ hasText: email1 });
+  await expect(card1).toBeVisible();
+  await card1.getByRole("checkbox").check();
+  await quizCol.getByRole("button", { name: /Advance 1 candidate/ }).click();
+  const confirmBox = quizCol.getByTestId("confirm-quiz");
+  await confirmBox.locator("textarea[name=reason]").fill("Quiz and interview complete; strong SQL evidence in the transcript.");
+  await confirmBox.getByLabel("Number of candidates to confirm").fill("1");
+  await confirmBox.getByRole("button", { name: "Confirm batch advance" }).click();
+  await expect(adminPage.getByText("Advanced 1 candidate.")).toBeVisible();
+  await expect(adminPage.getByTestId("column-work_1").getByTestId("pipeline-card").filter({ hasText: email1 })).toBeVisible();
+
   await adminPage.goto("/admin/dedupe");
   await expect(adminPage.getByText("exact_file").first()).toBeVisible();
   await expect(adminPage.getByText("semantic_high").first()).toBeVisible();

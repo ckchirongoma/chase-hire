@@ -1,0 +1,16 @@
+import { defineConfig } from "vitest/config";
+import path from "node:path";
+
+export default defineConfig({
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "."),
+      "server-only": path.resolve(import.meta.dirname, "tests/helpers/empty.ts"),
+    },
+  },
+  test: {
+    environment: "node",
+    include: ["lib/**/*.test.ts", "tests/unit/**/*.test.ts"],
+    exclude: ["node_modules/**", "assessment-kits/**"],
+  },
+});

@@ -15,6 +15,11 @@ export default async function RolesPage() {
   return (
     <div className="space-y-4">
       <h1 className="h1">Open roles</h1>
+      <p className="max-w-3xl text-slate-700">
+        We hire in pairs. The business analyst finds what&apos;s really wrong, decides what to build and builds the first
+        version. The software engineer takes that first version and makes it survive production. Read the one that sounds
+        like you, all the way to the end: it tells you who the job is for, and who it isn&apos;t for.
+      </p>
       {(roles ?? []).map((r) => (
         <Link key={r.slug} href={`/roles/${r.slug}`} className="card block hover:border-slate-400">
           <h2 className="h2">{r.title}</h2>
@@ -22,6 +27,7 @@ export default async function RolesPage() {
           <p className="mt-2 text-sm font-medium">
             {rands(r.salary_min)}–{rands(r.salary_max)} a month + year-end profit share · {r.location_note}
           </p>
+          <p className="mt-2 text-sm underline">Read the full role</p>
         </Link>
       ))}
       {!roles?.length && <p className="muted">No open roles right now.</p>}

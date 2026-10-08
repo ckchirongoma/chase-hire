@@ -10,7 +10,9 @@ import { utcDay } from "@/lib/stats/retention";
  * Compliance reporting for /admin/compliance (docs/09 §9, docs/12). Every function takes the
  * admin's own client: RLS and the admin-only security-definer functions decide what comes back.
  * Demographics never leave the database as rows; only adverse_impact_report() and
- * demographics_coverage() aggregate them, with groups under 30 suppressed.
+ * demographics_coverage() aggregate them, with counts from 1 to 29 suppressed. Nothing here
+ * returns a hashed id: the archive is matched to a person only through lookupArchive (an e-mail
+ * HMAC the server computes, lib/server/retention.ts).
  */
 
 export const REPORT_STAGES = ["interview", "quiz", "work_1", "work_2", "grading", "shortlist", "live", "offer"] as const;
@@ -66,7 +68,8 @@ export type ImpactReport = {
   /**
    * Groups with at least 30 decided applications, with rates, impact ratios and flags. Smaller
    * groups are never returned, named or counted, and nothing is returned at all when a shown
-   * group's complement in the cohort is under 30 (see adverse_impact_report in migration 0018).
+   * group's complement in the cohort is under 30, or when the people outside the shown groups
+   * number 1 to 29 (see adverse_impact_report in migration 0018).
    */
   rows: FourFifthsRow[];
   reference: { group: string; rate: number } | null;
@@ -137,36 +140,39 @@ export async function reliability(supabase: SupabaseClient): Promise<Reliability
     });
 }
 
+const count0 = z.coerce.number().nullable();
 const CoverageRow = z.object({
   candidates: z.coerce.number(),
-  respondents: z.coerce.number(),
+  respondents: count0,
   dimension: z.enum(DIMENSIONS),
-  disclosed: z.coerce.number(),
-  prefer_not: z.coerce.number(),
-  not_answered: z.coerce.number(),
+  disclosed: count0,
+  prefer_not: count0,
+  not_answered: count0,
 });
 
 export type Coverage = {
   candidates: number;
-  respondents: number;
-  dimensions: { dimension: Dimension; disclosed: number; preferNot: number; notAnswered: number }[];
+  /** null when 1 to 29 people answered (never shown: the consent promises totals of 30+ only). */
+  respondents: number | null;
+  /** Each count is null when the dimension's split has a count from 1 to 29 (all three then). */
+  dimensions: { dimension: Dimension; disclosed: number | null; preferNot: number | null; notAnswered: number | null }[];
 };
 
-/** How many candidates filled in the optional form (aggregates only). */
+/** How many candidates filled in the optional form (aggregates only, small counts suppressed). */
 export async function demographicsCoverage(supabase: SupabaseClient): Promise<Coverage> {
   const { data, error } = await supabase.rpc("demographics_coverage");
   if (error) throw new Error(`demographics_coverage: ${error.message}`);
   const rows = z.array(CoverageRow).parse(data ?? []);
   return {
     candidates: rows[0]?.candidates ?? 0,
-    respondents: rows[0]?.respondents ?? 0,
+    respondents: rows.length ? rows[0].respondents : 0,
     dimensions: rows.map((r) => ({ dimension: r.dimension, disclosed: r.disclosed, preferNot: r.prefer_not, notAnswered: r.not_answered })),
   };
 }
 
 export type QueueEntry = { userId: string; name: string; purgeAfter: string; reason: string; basisAt: string | null };
-export type PurgeLogEntry = { id: string; hash: string; purgedAt: string; scope: string; detail: Record<string, unknown> };
-export type InProgressPurge = { userId: string; hash: string; startedAt: string; attempts: number; lastError: string | null; step: string };
+export type PurgeLogEntry = { id: string; purgedAt: string; scope: string; detail: Record<string, unknown> };
+export type InProgressPurge = { startedAt: string; attempts: number; lastError: string | null; step: string };
 
 export type RetentionOverview = {
   today: string;
@@ -174,11 +180,21 @@ export type RetentionOverview = {
   dueNow: number;
   dueIn30Days: number;
   talentPool: number;
+  /** The earliest purge date still waiting (the backlog's age); null when nobody is due. */
+  oldestDue: string | null;
   next: QueueEntry[];
   log: PurgeLogEntry[];
   inProgress: InProgressPurge[];
   openReviewRequests: number;
 };
+
+const InProgressRow = z.object({
+  started_at: z.string(),
+  attempts: z.coerce.number(),
+  last_error: z.string().nullable(),
+  auth_deleted: z.boolean(),
+  storage_done: z.boolean(),
+});
 
 async function count(q: PromiseLike<{ count: number | null; error: { message: string } | null }>): Promise<number> {
   const { count: n, error } = await q;
@@ -192,17 +208,20 @@ export async function retentionOverview(supabase: SupabaseClient, opts: { now?: 
   const today = utcDay(now);
   const in30 = utcDay(new Date(now.getTime() + 30 * 86_400_000));
   const head = { count: "exact" as const, head: true };
-  const [queued, dueNow, dueIn30Days, talentPool, openReviewRequests, nextRes, logRes, progRes] = await Promise.all([
+  const [queued, dueNow, dueIn30Days, talentPool, openReviewRequests, nextRes, logRes, oldestRes, progRes] = await Promise.all([
     count(supabase.from("retention_queue").select("user_id", head)),
     count(supabase.from("retention_queue").select("user_id", head).lte("purge_after", today)),
     count(supabase.from("retention_queue").select("user_id", head).lte("purge_after", in30)),
     count(supabase.from("retention_queue").select("user_id", head).like("reason", "Talent pool%")),
     count(supabase.from("review_requests").select("id", head).eq("status", "open")),
     supabase.from("retention_queue").select("user_id, purge_after, reason, basis_at").order("purge_after").order("user_id").limit(opts.limit ?? 100),
-    supabase.from("purge_log").select("id, user_id_hash, purged_at, scope, detail").order("purged_at", { ascending: false }).limit(50),
-    supabase.from("retention_purges").select("user_id, user_id_hash, started_at, attempts, last_error, storage_done_at, auth_deleted_at").order("started_at"),
+    supabase.from("purge_log").select("id, purged_at, scope, detail").order("purged_at", { ascending: false }).limit(50),
+    supabase.from("retention_queue").select("purge_after").lte("purge_after", today).order("purge_after").limit(1),
+    // Admin-only (a candidate gets an error: treated as nothing in progress for them).
+    supabase.rpc("retention_in_progress"),
   ]);
-  for (const r of [nextRes, logRes, progRes]) if (r.error) throw new Error(r.error.message);
+  for (const r of [nextRes, logRes, oldestRes]) if (r.error) throw new Error(r.error.message);
+  const progress = progRes.error ? [] : z.array(InProgressRow).parse(progRes.data ?? []);
   const next = (nextRes.data ?? []) as { user_id: string; purge_after: string; reason: string; basis_at: string | null }[];
   const names = await profileNames(supabase, next.map((r) => r.user_id));
   return {
@@ -211,29 +230,28 @@ export async function retentionOverview(supabase: SupabaseClient, opts: { now?: 
     dueNow,
     dueIn30Days,
     talentPool,
+    oldestDue: ((oldestRes.data ?? [])[0]?.purge_after as string | undefined) ?? null,
     openReviewRequests,
     next: next.map((r) => ({ userId: r.user_id, name: names.get(r.user_id) ?? r.user_id.slice(0, 8), purgeAfter: r.purge_after, reason: r.reason, basisAt: r.basis_at })),
     log: (logRes.data ?? []).map((r) => ({
       id: r.id as string,
-      hash: r.user_id_hash as string,
       purgedAt: r.purged_at as string,
       scope: r.scope as string,
       detail: (r.detail ?? {}) as Record<string, unknown>,
     })),
-    inProgress: (progRes.data ?? []).map((r) => ({
-      userId: r.user_id as string,
-      hash: r.user_id_hash as string,
-      startedAt: r.started_at as string,
-      attempts: r.attempts as number,
-      lastError: (r.last_error as string | null) ?? null,
-      step: r.auth_deleted_at
-        ? r.storage_done_at
+    inProgress: progress.map((r) => ({
+      startedAt: r.started_at,
+      attempts: r.attempts,
+      lastError: r.last_error,
+      step: r.auth_deleted
+        ? r.storage_done
           ? "account and files deleted; checking and writing the log"
           : "account deleted; deleting files"
         : "decisions archived; account still to delete",
     })),
   };
 }
+
 
 const StaleRow = z.object({
   application_id: z.string(),
@@ -243,7 +261,6 @@ const StaleRow = z.object({
   status: z.string(),
   last_activity: z.string(),
   round_closed_at: z.string().nullable(),
-  retention_from: z.string(),
 });
 
 export type StaleApplication = {
@@ -255,14 +272,12 @@ export type StaleApplication = {
   status: string;
   lastActivity: string;
   roundClosedAt: string | null;
-  /** When retention treats it as ended (the 6/12-month clock starts then). */
-  retentionFrom: string;
 };
 
 /**
  * Applications still in play with no activity for `months` (or on a role whose round has
- * closed): an admin should close them with a decision. Retention doesn't wait for that: an
- * application idle for 6 months counts as lapsed, and one on a closed round as ended.
+ * closed). Retention never ends them by itself: the person stays off the queue until an admin
+ * closes the application with a written reason (a decision, or "close as lapsed" here).
  */
 export async function staleApplications(supabase: SupabaseClient, months = 3): Promise<StaleApplication[]> {
   const { data, error } = await supabase.rpc("retention_stale_applications", { p_months: months });
@@ -278,7 +293,6 @@ export async function staleApplications(supabase: SupabaseClient, months = 3): P
     status: r.status,
     lastActivity: r.last_activity,
     roundClosedAt: r.round_closed_at,
-    retentionFrom: r.retention_from,
   }));
 }
 

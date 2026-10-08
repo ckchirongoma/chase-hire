@@ -13,6 +13,7 @@ export const DECISION_LABEL: Record<string, string> = {
   advance: "Advanced",
   reject: "Not progressing",
   hold: "Held for review",
+  lapse: "Closed (no activity)",
 };
 
 export const REVIEW_STAGE_LABEL: Record<string, string> = {

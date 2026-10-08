@@ -14,7 +14,8 @@ export function AdverseImpactTable({ reports }: { reports: ImpactReport[] }) {
     return (
       <p className="muted">
         Nothing to show for this cohort: no stage has a group with {MIN_GROUP_SIZE} or more decided applications whose
-        complement is also {MIN_GROUP_SIZE} or more. Smaller groups are never shown, named or counted.
+        complement is also {MIN_GROUP_SIZE} or more (and with no small remainder of 1 to {MIN_GROUP_SIZE - 1} people outside
+        the shown groups). Smaller groups are never shown, named or counted.
       </p>
     );
   }
@@ -65,7 +66,7 @@ export function AdverseImpactTable({ reports }: { reports: ImpactReport[] }) {
                   </table>
                   <p className="muted mt-1 text-xs">
                     Groups with fewer than {MIN_GROUP_SIZE} decided applications are not listed, named or counted, so these rows
-                    need not add up to everyone decided.
+                    need not add up to everyone decided (when they don&apos;t, the people left out number {MIN_GROUP_SIZE} or more).
                   </p>
                 </details>
               </td>
@@ -108,7 +109,23 @@ export function ReliabilityTable({ rows }: { rows: ReliabilityRow[] }) {
   );
 }
 
+const small = `fewer than ${MIN_GROUP_SIZE}`;
+const shown = (n: number | null) => (n === null ? <span className="muted">not shown</span> : n);
+
+/**
+ * How many candidates filled in the optional form. Counts from 1 to 29 are never shown (the
+ * consent promises totals for groups of 30 or more only), so a change right after one person
+ * visits can't reveal their answer.
+ */
 export function CoverageTable({ coverage }: { coverage: Coverage }) {
+  if (coverage.respondents === null) {
+    return (
+      <p className="text-sm" data-testid="demographics-coverage">
+        {small} of {coverage.candidates} candidates filled in the optional form. Totals appear once {MIN_GROUP_SIZE} or more
+        have answered.
+      </p>
+    );
+  }
   const share = coverage.candidates ? `${((coverage.respondents / coverage.candidates) * 100).toFixed(0)}%` : "—";
   return (
     <div className="space-y-2" data-testid="demographics-coverage">
@@ -116,21 +133,27 @@ export function CoverageTable({ coverage }: { coverage: Coverage }) {
         {coverage.respondents} of {coverage.candidates} candidates ({share}) filled in the optional form.
       </p>
       {!!coverage.respondents && (
-        <table className="table">
-          <thead>
-            <tr><th>Question</th><th>Answered</th><th>Prefer not to say</th><th>Left blank</th></tr>
-          </thead>
-          <tbody>
-            {coverage.dimensions.map((d) => (
-              <tr key={d.dimension}>
-                <td>{DIMENSION_LABEL[d.dimension]}</td>
-                <td>{d.disclosed}</td>
-                <td>{d.preferNot}</td>
-                <td>{d.notAnswered}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <>
+          <table className="table">
+            <thead>
+              <tr><th>Question</th><th>Answered</th><th>Prefer not to say</th><th>Left blank</th></tr>
+            </thead>
+            <tbody>
+              {coverage.dimensions.map((d) => (
+                <tr key={d.dimension}>
+                  <td>{DIMENSION_LABEL[d.dimension]}</td>
+                  <td>{shown(d.disclosed)}</td>
+                  <td>{shown(d.preferNot)}</td>
+                  <td>{shown(d.notAnswered)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="muted text-xs">
+            &ldquo;Not shown&rdquo;: one of that question&apos;s three counts is {small}, so none of the three is shown (any two
+            would give away the third).
+          </p>
+        </>
       )}
     </div>
   );

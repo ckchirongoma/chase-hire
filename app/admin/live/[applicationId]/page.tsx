@@ -69,6 +69,11 @@ export default async function LiveCandidatePage({
             Candidate page (evidence and decision)
           </Link>
         </p>
+        {!seen.allSubmitted && (
+          <p className="muted text-xs" data-testid="candidate-page-caution">
+            Score blind: until you have submitted every part here, don&apos;t read live or final scores elsewhere (they may include other panellists&apos; cards).
+          </p>
+        )}
       </div>
       {error && <p className="error">{error}</p>}
       {ok && <p className="notice">{ok}</p>}

@@ -41,7 +41,7 @@ function changedSince(run: CalibrationRunRow, current: { version: number; model:
  * report with the go-live status per criterion, and the drift check.
  */
 export default async function CalibrationPage({ searchParams }: { searchParams: Promise<{ rubric?: string; ok?: string; error?: string }> }) {
-  const { supabase } = await requireAdmin();
+  const { supabase, user } = await requireAdmin();
   const { rubric: requested, ok, error } = await searchParams;
   const service = createAdminClient();
   await syncCalibrationRuns(service);
@@ -54,7 +54,7 @@ export default async function CalibrationPage({ searchParams }: { searchParams: 
     currentRubric(service, key),
     supabase.from("calibration_runs").select(RUN_COLS).eq("rubric_key", key).order("ran_at", { ascending: false }).limit(10),
     supabase.from("gold_samples").select(GOLD_COLS).eq("rubric_key", key).order("created_at"),
-    driftReport(service, key),
+    driftReport(service, key, user.id),
   ]);
   const runs = (runRows ?? []) as CalibrationRunRow[];
   const gold = (goldRows ?? []) as GoldSampleRow[];
@@ -99,7 +99,9 @@ export default async function CalibrationPage({ searchParams }: { searchParams: 
           <CalibrationReport run={latestDone} changed={changedSince(latestDone, current)} />
         ) : (
           <p className="muted" data-testid="no-calibration">
-            No finished calibration run yet. Until there is one, grades are not flagged by calibration (every criterion is graded as today).
+            Not calibrated: no finished calibration run yet. Until the first one, this rubric is in pre-go-live mode: grades are not flagged by calibration and AI
+            scores count as advisory scores, as before. The first finished run switches on the go-live rule for good (live, review, or human-scored only per
+            criterion), and any later rubric, prompt or model change flags every grade &quot;calibration: stale&quot; until the gold set is re-run.
           </p>
         )}
       </section>

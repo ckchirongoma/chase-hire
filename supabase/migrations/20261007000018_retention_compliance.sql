@@ -3,13 +3,17 @@
 --
 -- Retention rules (lib/consent/notice.ts, docs/12 §1 "Retention automation"; details at
 -- retention_schedule below):
---   * not appointed: purged 6 months after the application ended for retention (it closed, its
---     role's hiring round closed, or it was abandoned: no activity for 6 months), or 6 months
---     after the last activity of someone who never applied;
+--   * not appointed: purged 6 months after every application of theirs has closed (rejected,
+--     withdrawn, lapsed or at stage closed; or when the role's hiring round closed, if that was
+--     later), or 6 months after the last activity of someone who never applied;
 --   * talent-pool opt-in (the latest consents row decides): 12 months instead;
 --   * never queued: admins, former staff named on decisions/scorecards etc., anyone with an
---     application still in play, appointed candidates (advanced out of the offer stage: employee
---     records, outside this purge) and anyone with an open review request.
+--     application still in play (however long it has been idle, and whether or not its role is
+--     still active: only an admin closes an application, with a written reason), appointed
+--     candidates (advanced out of the offer stage: employee records, outside this purge) and
+--     anyone with an open review request.
+-- Idle applications are listed for the admin (retention_stale_applications), who closes them
+-- with a written-reason 'lapse' decision (admin_lapse_applications); the clock starts then.
 -- A purge is reversible until the auth user is deleted, re-checks the rules before that, and
 -- blocks re-opening the person's applications while it runs. lib/stats/retention.ts mirrors the
 -- date rules for unit tests.
@@ -53,8 +57,9 @@ alter table public.applications enable trigger applications_updated_at;
 
 -- ───────────────────────── Hiring rounds ─────────────────────────
 -- A role's hiring round closes when an admin makes the role inactive (/admin/roles) and re-opens
--- if the role is made active again. Applications left in play when the round closed reach the
--- retention clock from then (see retention_schedule): nobody has to reject every straggler.
+-- if the role is made active again. A closed application's clock starts when its round closed if
+-- that was later than the application's own close (the notice: "6 months after the round
+-- closes"). Closing a round never ends an application still in play: an admin closes those.
 alter table public.roles add column if not exists round_closed_at timestamptz;
 
 create or replace function public.role_round_closed_at()
@@ -147,18 +152,16 @@ grant execute on function public.retention_staff_ids() to service_role;
 -- ───────────────────────── Retention schedule ─────────────────────────
 alter table public.retention_queue add column if not exists basis_at timestamptz;
 
--- Who is due for purging and when, computed live (read-only). Per application, the clock starts
--- when it ended for retention:
---   * closed (rejected, withdrawn, lapsed, or at stage closed): when it closed, or when the
---     role's round closed if that was later (the notice: "6 months after the round closes");
---   * still in play on a role whose round has closed: the later of the round's close and the
---     application's last activity;
---   * still in play on an open round with no activity for 6 months: abandoned, so it ends 6
---     months after the last activity (it is listed on /admin/compliance well before that);
---   * otherwise it is in play and the person is not queued.
--- The person's clock is the latest of those ends and their own last activity; the purge is 6
--- months later, 12 with the talent-pool opt-in on their latest consent. Never queued: admins,
--- former staff (above), appointed candidates and anyone with an open review request.
+-- Who is due for purging and when, computed live (read-only). A person is queued only when
+-- every application of theirs is closed (rejected, withdrawn, lapsed, or at stage closed); one
+-- application still in play (any stage, any status, however idle, on an active or inactive
+-- role) keeps them off the queue. Only an admin closes an application, with a written reason
+-- (admin_decide, or admin_lapse_applications for idle ones): the purge never takes someone out
+-- of the pipeline by itself. Per closed application, the clock starts when it closed, or when
+-- the role's round closed if that was later (the notice: "6 months after the round closes").
+-- The person's clock is the latest of those and their own last activity; the purge is 6 months
+-- later, 12 with the talent-pool opt-in on their latest consent. Never queued: admins, former
+-- staff (above), appointed candidates and anyone with an open review request.
 -- lib/stats/retention.ts mirrors these rules for unit tests.
 create or replace function public.retention_schedule(p_user_ids uuid[] default null)
 returns table (user_id uuid, purge_after date, reason text, basis text, basis_at timestamptz, talent_pool boolean)
@@ -183,25 +186,15 @@ as $$
     select a.user_id,
       (a.status in ('rejected', 'withdrawn', 'lapsed') or a.stage = 'closed') as is_closed,
       coalesce(a.closed_at, (select max(d.decided_at) from public.decisions d where d.application_id = a.id), a.updated_at) as closed_at,
-      r.round_closed_at,
-      public.application_last_activity(a.id) as active_at
+      r.round_closed_at
     from public.applications a
     join people p on p.id = a.user_id
     left join public.roles r on r.id = a.role_id
   ), ends as (
+    -- ended_at is null for an application in play: the person is not queued (in_play below).
     select a.user_id,
-      case
-        when a.is_closed then greatest(a.closed_at, a.round_closed_at)
-        when a.round_closed_at is not null then greatest(a.round_closed_at, a.active_at)
-        when (a.active_at at time zone 'UTC') + interval '6 months' <= (now() at time zone 'UTC')
-          then ((a.active_at at time zone 'UTC') + interval '6 months') at time zone 'UTC'
-      end as ended_at,
-      case
-        when a.is_closed and a.round_closed_at > a.closed_at then 'round_closed'
-        when a.is_closed then 'application_closed'
-        when a.round_closed_at is not null then 'round_closed'
-        else 'inactive'
-      end as basis
+      case when a.is_closed then greatest(a.closed_at, a.round_closed_at) end as ended_at,
+      case when a.is_closed and a.round_closed_at > a.closed_at then 'round_closed' else 'application_closed' end as basis
     from apps a
   ), per_person as (
     select e.user_id,
@@ -233,7 +226,6 @@ as $$
            || case coalesce(f.basis, 'no_application')
                 when 'application_closed' then 'the application closed'
                 when 'round_closed' then 'the role''s hiring round closed'
-                when 'inactive' then 'the application lapsed (no activity for 6 months)'
                 else 'the last activity (never applied)'
               end,
          coalesce(f.basis, 'no_application'),
@@ -276,11 +268,14 @@ $$;
 revoke execute on function public.refresh_retention_queue() from public, anon, authenticated;
 grant execute on function public.refresh_retention_queue() to service_role;
 
--- Applications still in play with no activity for p_months (or on a closed round), for the
--- admin to close with a decision before retention treats them as lapsed. Admin-only.
-create or replace function public.retention_stale_applications(p_months int default 3)
+-- Applications still in play with no activity for p_months, or on a role whose round has
+-- closed: the admin's to-do list on /admin/compliance. Retention never ends them by itself (the
+-- person stays off the queue); an admin closes each with a written reason (advance, reject, or
+-- 'lapse' below), and the clock starts then. Admin-only.
+drop function if exists public.retention_stale_applications(int);
+create function public.retention_stale_applications(p_months int default 3)
 returns table (application_id uuid, user_id uuid, role_slug text, stage text, status text,
-               last_activity timestamptz, round_closed_at timestamptz, retention_from timestamptz)
+               last_activity timestamptz, round_closed_at timestamptz)
 language plpgsql
 stable
 security definer
@@ -291,9 +286,7 @@ begin
     raise exception 'admin_only' using errcode = '42501';
   end if;
   return query
-  select a.id, a.user_id, r.slug, a.stage, a.status, x.at, r.round_closed_at,
-         case when r.round_closed_at is not null then greatest(r.round_closed_at, x.at)
-              else ((x.at at time zone 'UTC') + interval '6 months') at time zone 'UTC' end
+  select a.id, a.user_id, r.slug, a.stage, a.status, x.at, r.round_closed_at
   from public.applications a
   left join public.roles r on r.id = a.role_id
   cross join lateral (select public.application_last_activity(a.id) as at) x
@@ -306,6 +299,60 @@ end;
 $$;
 revoke execute on function public.retention_stale_applications(int) from public, anon;
 grant execute on function public.retention_stale_applications(int) to authenticated;
+
+-- ───────────────────────── Closing idle applications (admin, written reason) ─────────────────────────
+-- A 'lapse' decision closes an application nobody is pursuing any more (the candidate stopped
+-- responding, or the round closed with them mid-pipeline). It is an admin action with a written
+-- reason like every other decision (hard rule 3, POPIA s71): it is not a judgement on merit, so
+-- the adverse-impact report leaves it out like a hold. The application gets status 'lapsed'
+-- (closed_at is stamped by the trigger above), which starts the retention clock. An admin can
+-- re-open it later with a hold (admin_decide). The decision row is visible to the candidate on
+-- their results page like any other.
+alter table public.decisions drop constraint if exists decisions_decision_check;
+alter table public.decisions add constraint decisions_decision_check
+  check (decision in ('advance', 'reject', 'hold', 'lapse'));
+
+create or replace function public.admin_lapse_applications(p_application_ids uuid[], p_reason text)
+returns int
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  app public.applications%rowtype;
+  app_id uuid;
+  n int := 0;
+begin
+  if not public.is_admin() then
+    raise exception 'admin_only' using errcode = '42501';
+  end if;
+  if p_reason is null or length(btrim(p_reason)) < 20 then
+    raise exception 'reason_too_short' using errcode = 'P0001';
+  end if;
+  if p_application_ids is null or cardinality(p_application_ids) = 0 then
+    raise exception 'no_applications' using errcode = 'P0001';
+  end if;
+  if cardinality(p_application_ids) > 200 then
+    raise exception 'too_many_applications' using errcode = 'P0001';
+  end if;
+  foreach app_id in array (select array_agg(distinct x order by x) from unnest(p_application_ids) x) loop
+    select * into app from public.applications where id = app_id for update;
+    if not found then
+      raise exception 'application_not_found' using errcode = 'P0002';
+    end if;
+    if app.status in ('rejected', 'withdrawn', 'lapsed') or app.stage = 'closed' then
+      raise exception 'application_not_in_play: %', app_id using errcode = 'P0001';
+    end if;
+    insert into public.decisions (application_id, stage, decision, reason, scores_snapshot, decided_by)
+    values (app.id, app.stage, 'lapse', btrim(p_reason), public.application_scores(app.id), auth.uid());
+    update public.applications set status = 'lapsed' where id = app.id;
+    n := n + 1;
+  end loop;
+  return n;
+end;
+$$;
+revoke execute on function public.admin_lapse_applications(uuid[], text) from public, anon;
+grant execute on function public.admin_lapse_applications(uuid[], text) to authenticated;
 
 -- How many former staff (not admins any more) the purge leaves out. Admin-only.
 create or replace function public.retention_former_staff_count()
@@ -391,11 +438,51 @@ create table if not exists public.retention_purges (
 );
 alter table public.retention_purges add column if not exists archive_ref uuid not null default gen_random_uuid();
 alter table public.retention_purges add column if not exists decision_archive_ids uuid[] not null default '{}';
+-- HMAC of the normalised e-mail (server-only pepper): the key a disputant can supply later.
+alter table public.retention_purges add column if not exists subject_hmac text;
+-- Set just before the server suspends the account; a cancelled purge lifts the suspension
+-- before its state row goes, so a failed lift is retried rather than forgotten.
+alter table public.retention_purges add column if not exists banned_at timestamptz;
 create unique index if not exists retention_purges_archive_ref_idx on public.retention_purges (archive_ref);
 alter table public.retention_purges enable row level security;
+-- Service role only: the row holds the raw user id next to its hash, which would let an admin
+-- link a name to the hashed archive. Admins see progress through retention_in_progress().
 drop policy if exists retention_purges_admin_select on public.retention_purges;
-create policy retention_purges_admin_select on public.retention_purges for select to authenticated using (public.is_admin());
-grant select on public.retention_purges to authenticated;
+revoke all on public.retention_purges from anon, authenticated;
+
+-- Purges in progress for /admin/compliance, without any id or hash. Admin-only.
+create or replace function public.retention_in_progress()
+returns table (started_at timestamptz, attempts int, last_error text, auth_deleted boolean, storage_done boolean)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  if not public.is_admin() then
+    raise exception 'admin_only' using errcode = '42501';
+  end if;
+  return query
+  select p.started_at, p.attempts, p.last_error, p.auth_deleted_at is not null, p.storage_done_at is not null
+  from public.retention_purges p
+  order by p.started_at;
+end;
+$$;
+revoke execute on function public.retention_in_progress() from public, anon;
+grant execute on function public.retention_in_progress() to authenticated;
+
+-- The archive and the purge log are matched to a person only through the server (an e-mail
+-- HMAC computed with the server-only pepper, retention_archive_lookup below). Admins read the
+-- log's dates, scope and counts and the archived decisions, never the hashed keys, so a name on
+-- the queue can't be lined up with a hashed archive entry.
+alter table public.decision_archive add column if not exists subject_hmac text;
+alter table public.purge_log add column if not exists subject_hmac text;
+create index if not exists decision_archive_subject_idx on public.decision_archive (subject_hmac);
+create index if not exists purge_log_subject_idx on public.purge_log (subject_hmac);
+revoke select on public.decision_archive from anon, authenticated;
+grant select (id, role_slug, stage, decision, reason, decided_at, archived_at) on public.decision_archive to authenticated;
+revoke select on public.purge_log from anon, authenticated;
+grant select (id, purged_at, scope, detail) on public.purge_log to authenticated;
 
 -- While a purge is in progress nobody can re-open, start or dispute an application of that
 -- person (the purge was due; it either finishes or, if something else made them ineligible, is
@@ -497,6 +584,8 @@ grant execute on function public.retention_recheck(uuid, date) to service_role;
 -- Undoes a purge that hasn't deleted the auth user yet (the person is no longer due): removes
 -- the archived decisions and held answers it wrote, logs the cancellation under the hashed id
 -- and drops the state row. Nothing irreversible has happened before the auth user's deletion.
+-- The server calls it only after lifting the account suspension (retention_begin_purge and
+-- retention_prepare_auth_delete report 'cancel' and leave the row), so a failed lift is retried.
 create or replace function public.retention_cancel(p_user_id uuid, p_reason text)
 returns void
 language plpgsql
@@ -515,8 +604,8 @@ begin
   end if;
   delete from public.decision_archive where id = any (st.decision_archive_ids);
   delete from public.retention_archive_pending where purge_ref = st.archive_ref;
-  insert into public.purge_log (user_id_hash, scope, detail)
-  values (st.user_id_hash, 'cancelled', jsonb_build_object(
+  insert into public.purge_log (user_id_hash, subject_hmac, scope, detail)
+  values (st.user_id_hash, st.subject_hmac, 'cancelled', jsonb_build_object(
     'reason', p_reason, 'started_at', st.started_at, 'purge_after', st.purge_after, 'attempts', st.attempts));
   delete from public.retention_purges where user_id = p_user_id;
 end;
@@ -524,11 +613,31 @@ $$;
 revoke execute on function public.retention_cancel(uuid, text) from public, anon, authenticated;
 grant execute on function public.retention_cancel(uuid, text) to service_role;
 
+-- Decision reasons are copied into the 3-year archive with e-mail addresses and phone numbers
+-- blanked (the reasons should be about the evidence; this catches the obvious slips).
+create or replace function public.retention_scrub_reason(p_reason text)
+returns text
+language sql
+immutable
+set search_path = ''
+as $$
+  select left(
+    regexp_replace(
+      regexp_replace(coalesce(p_reason, ''), '[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}', '[e-mail removed]', 'g'),
+      '\+?[0-9][0-9 ()-]{7,}[0-9]', '[number removed]', 'g'),
+    2000);
+$$;
+revoke execute on function public.retention_scrub_reason(text) from public, anon, authenticated;
+grant execute on function public.retention_scrub_reason(text) to service_role;
+
 -- Step 1 of a purge, in one transaction: re-check the rules, archive the decision log (hashed
--- id) and hold the anonymised item responses, and record the purge. Reversible until the auth
--- user is deleted. Resuming re-checks the rules first and cancels the purge if they no longer
--- apply. Returns {status: started|resumed|cancelled|not_due|not_eligible, ...state}.
-create or replace function public.retention_begin_purge(p_user_id uuid, p_hash text, p_today date)
+-- id, plus the e-mail HMAC a disputant can be matched by) and hold the anonymised item
+-- responses, and record the purge. Reversible until the auth user is deleted. Resuming re-checks
+-- the rules first; if they no longer apply it returns 'cancel' and leaves the row, so the server
+-- can lift the suspension before calling retention_cancel. Returns
+-- {status: started|resumed|cancel|not_due|not_eligible, ...state}.
+drop function if exists public.retention_begin_purge(uuid, text, date);
+create or replace function public.retention_begin_purge(p_user_id uuid, p_hash text, p_today date, p_subject_hmac text default null)
 returns jsonb
 language plpgsql
 security definer
@@ -548,6 +657,9 @@ begin
   if p_hash is null or p_hash !~ '^[0-9a-f]{64}$' then
     raise exception 'invalid_hash' using errcode = 'P0001';
   end if;
+  if p_subject_hmac is not null and p_subject_hmac !~ '^[0-9a-f]{64}$' then
+    raise exception 'invalid_subject_hmac' using errcode = 'P0001';
+  end if;
   perform pg_advisory_xact_lock(hashtextextended('retention:' || p_user_id::text, 0));
 
   select * into st from public.retention_purges where user_id = p_user_id;
@@ -555,8 +667,7 @@ begin
     if st.auth_deleted_at is null and exists (select 1 from auth.users u where u.id = p_user_id) then
       why := public.retention_recheck(p_user_id, p_today);
       if why is not null then
-        perform public.retention_cancel(p_user_id, why);
-        return jsonb_build_object('status', 'cancelled', 'user_id', p_user_id, 'reason', why);
+        return jsonb_build_object('status', 'cancel', 'user_id', p_user_id, 'reason', why, 'banned_at', st.banned_at);
       end if;
     end if;
     return to_jsonb(st) || jsonb_build_object('status', 'resumed');
@@ -571,8 +682,8 @@ begin
   end if;
 
   with ins as (
-    insert into public.decision_archive (user_id_hash, role_slug, stage, decision, reason, decided_at)
-    select p_hash, r.slug, d.stage, d.decision, d.reason, d.decided_at
+    insert into public.decision_archive (user_id_hash, subject_hmac, role_slug, stage, decision, reason, decided_at)
+    select p_hash, p_subject_hmac, r.slug, d.stage, d.decision, public.retention_scrub_reason(d.reason), d.decided_at
     from public.decisions d
     join public.applications a on a.id = d.application_id
     left join public.roles r on r.id = a.role_id
@@ -614,8 +725,8 @@ begin
   select coalesce(array_agg(x.id), '{}') into v_sessions from public.interview_sessions x where x.user_id = p_user_id;
 
   insert into public.retention_purges
-    (user_id, user_id_hash, purge_after, reason, submission_ids, interview_ids, counts, archive_ref, decision_archive_ids)
-  values (p_user_id, p_hash, s.purge_after, s.reason, v_subs, v_sessions, jsonb_build_object(
+    (user_id, user_id_hash, subject_hmac, purge_after, reason, submission_ids, interview_ids, counts, archive_ref, decision_archive_ids)
+  values (p_user_id, p_hash, p_subject_hmac, s.purge_after, s.reason, v_subs, v_sessions, jsonb_build_object(
     'decisions_archived', cardinality(v_dec),
     'reasoning_responses_archived', n_rea,
     'quiz_responses_archived', n_quiz), v_ref, v_dec)
@@ -623,13 +734,14 @@ begin
   return to_jsonb(st) || jsonb_build_object('status', 'started');
 end;
 $$;
-revoke execute on function public.retention_begin_purge(uuid, text, date) from public, anon, authenticated;
-grant execute on function public.retention_begin_purge(uuid, text, date) to service_role;
+revoke execute on function public.retention_begin_purge(uuid, text, date, text) from public, anon, authenticated;
+grant execute on function public.retention_begin_purge(uuid, text, date, text) to service_role;
 
 -- Just before the auth user is deleted (the server has banned the account by then): re-check
--- the rules (cancel if they no longer apply) and refresh the submission and interview ids from
--- the live tables, so work created since step 1 is covered by the storage and grade clean-up.
--- Returns {status: ready|cancelled, submission_ids, interview_ids}.
+-- the rules and refresh the submission and interview ids from the live tables, so work created
+-- since step 1 is covered by the storage and grade clean-up. If the rules no longer apply it
+-- returns 'cancel' and leaves the row (the server lifts the suspension, then retention_cancel).
+-- Returns {status: ready|cancel, submission_ids, interview_ids}.
 create or replace function public.retention_prepare_auth_delete(p_user_id uuid, p_today date)
 returns jsonb
 language plpgsql
@@ -650,8 +762,7 @@ begin
   if exists (select 1 from auth.users u where u.id = p_user_id) then
     why := public.retention_recheck(p_user_id, p_today);
     if why is not null then
-      perform public.retention_cancel(p_user_id, why);
-      return jsonb_build_object('status', 'cancelled', 'reason', why);
+      return jsonb_build_object('status', 'cancel', 'reason', why, 'banned_at', st.banned_at);
     end if;
   end if;
   select coalesce(array_agg(distinct t.x), '{}') into v_subs
@@ -667,7 +778,8 @@ $$;
 revoke execute on function public.retention_prepare_auth_delete(uuid, date) from public, anon, authenticated;
 grant execute on function public.retention_prepare_auth_delete(uuid, date) to service_role;
 
--- Progress notes from the server (storage cleared, auth user deleted, an error to retry).
+-- Progress notes from the server (account suspended, storage cleared, auth user deleted, an
+-- error to retry).
 create or replace function public.retention_note_progress(p_user_id uuid, p_step text, p_counts jsonb default '{}', p_error text default null)
 returns void
 language plpgsql
@@ -675,11 +787,12 @@ security definer
 set search_path = ''
 as $$
 begin
-  if p_step not in ('storage', 'auth', 'error') then
+  if p_step not in ('ban', 'storage', 'auth', 'error') then
     raise exception 'invalid_step' using errcode = 'P0001';
   end if;
   update public.retention_purges
   set counts = counts || coalesce(p_counts, '{}'),
+      banned_at = case when p_step = 'ban' then coalesce(banned_at, now()) else banned_at end,
       storage_done_at = case when p_step = 'storage' then now() else storage_done_at end,
       auth_deleted_at = case when p_step = 'auth' then coalesce(auth_deleted_at, now()) else auth_deleted_at end,
       attempts = attempts + case when p_step = 'error' then 1 else 0 end,
@@ -809,8 +922,8 @@ begin
     audit_note := 'auth audit log not cleared: ' || sqlerrm;
   end;
 
-  insert into public.purge_log (user_id_hash, scope, detail)
-  values (st.user_id_hash, 'candidate', st.counts || coalesce(p_detail, '{}') || jsonb_build_object(
+  insert into public.purge_log (user_id_hash, subject_hmac, scope, detail)
+  values (st.user_id_hash, st.subject_hmac, 'candidate', st.counts || coalesce(p_detail, '{}') || jsonb_build_object(
     'grades_deleted', coalesce((st.counts ->> 'grades_deleted')::int, 0) + n_grades,
     'grade_summaries_deleted', coalesce((st.counts ->> 'grade_summaries_deleted')::int, 0) + n_sum,
     'grading_jobs_deleted', coalesce((st.counts ->> 'grading_jobs_deleted')::int, 0) + n_jobs,
@@ -830,9 +943,101 @@ $$;
 revoke execute on function public.retention_finish_purge(uuid, jsonb) from public, anon, authenticated;
 grant execute on function public.retention_finish_purge(uuid, jsonb) to service_role;
 
+-- A dispute after the purge: the server computes the e-mail HMAC (server-only pepper) for the
+-- address the person gives, and this returns what was kept for it. Admin-only; nothing here
+-- returns a hash or an id.
+create or replace function public.retention_archive_lookup(p_subject_hmac text)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  if not public.is_admin() then
+    raise exception 'admin_only' using errcode = '42501';
+  end if;
+  if p_subject_hmac is null or p_subject_hmac !~ '^[0-9a-f]{64}$' then
+    raise exception 'invalid_subject_hmac' using errcode = 'P0001';
+  end if;
+  return jsonb_build_object(
+    'purges', coalesce((
+      select jsonb_agg(jsonb_build_object('purged_at', l.purged_at, 'scope', l.scope) order by l.purged_at)
+      from public.purge_log l where l.subject_hmac = p_subject_hmac), '[]'::jsonb),
+    'decisions', coalesce((
+      select jsonb_agg(jsonb_build_object('role_slug', d.role_slug, 'stage', d.stage, 'decision', d.decision,
+                                          'reason', d.reason, 'decided_at', d.decided_at) order by d.decided_at)
+      from public.decision_archive d where d.subject_hmac = p_subject_hmac), '[]'::jsonb));
+end;
+$$;
+revoke execute on function public.retention_archive_lookup(text) from public, anon;
+grant execute on function public.retention_archive_lookup(text) to authenticated;
+
+-- docs/12: selection decision records are kept for about 3 years in case of disputes. After
+-- that the archived decisions go and the purge log loses the e-mail key (its dates and counts
+-- stay as the record that the purge happened). Returns the number of decisions removed.
+create or replace function public.retention_expire_archive()
+returns int
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  n int;
+begin
+  delete from public.decision_archive where archived_at < now() - interval '3 years';
+  get diagnostics n = row_count;
+  update public.purge_log set subject_hmac = null
+  where subject_hmac is not null and purged_at < now() - interval '3 years';
+  return n;
+end;
+$$;
+revoke execute on function public.retention_expire_archive() from public, anon, authenticated;
+grant execute on function public.retention_expire_archive() to service_role;
+
+-- Uploads that arrive after a purge finished (a request already past its auth check when the
+-- account went): first path segments in the buckets keyed by user id that name no account and
+-- no purge in progress, newest first, from the last 30 days. The server keeps only those whose
+-- hashed id is in purge_log (a finished purge) and deletes them; anything else is left alone.
+create or replace function public.retention_orphan_prefixes(p_limit int default 200)
+returns table (bucket_id text, prefix text, objects bigint)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select o.bucket_id, split_part(o.name, '/', 1), count(*)
+  from storage.objects o
+  where o.bucket_id in ('cvs', 'submissions', 'interview-audio')
+    and o.created_at > now() - interval '30 days'
+    and split_part(o.name, '/', 1) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    and not exists (select 1 from auth.users u where u.id::text = split_part(o.name, '/', 1))
+    and not exists (select 1 from public.retention_purges p where p.user_id::text = split_part(o.name, '/', 1))
+  group by o.bucket_id, split_part(o.name, '/', 1)
+  order by max(o.created_at) desc
+  limit greatest(least(coalesce(p_limit, 200), 1000), 1);
+$$;
+revoke execute on function public.retention_orphan_prefixes(int) from public, anon, authenticated;
+grant execute on function public.retention_orphan_prefixes(int) to service_role;
+
+-- Candidates upload work files into submissions/{user_id}/… only while they have an account
+-- with a consent on file (as for CVs, migration 0003): once a purge has deleted the account, a
+-- still-valid access token can't add files under the purged id.
+drop policy if exists submissions_owner_upload on storage.objects;
+create policy submissions_owner_upload on storage.objects
+  for insert to authenticated
+  with check (
+    bucket_id = 'submissions'
+    and (storage.foldername(name))[1] = auth.uid()::text
+    and exists (select 1 from public.consents c where c.user_id = auth.uid())
+  );
+
 -- ───────────────────────── Adverse impact (docs/09 §9) ─────────────────────────
--- Replaces the Wave 4 draft: counts only applications DECIDED at the stage (the latest
--- advance/reject there; holds and undecided applications are left out) and excludes admins.
+-- Replaces the Wave 4 draft: counts only applications DECIDED at the stage and excludes admins.
+-- The outcome is the latest decision recorded at the stage: a reject counts as not advanced; an
+-- advance counts only if the application has since left the stage (an advance that released a
+-- hold before the candidate had done the stage keeps them there: still undecided); a hold (for
+-- example re-opening a rejection) or a lapse leaves the application out, as does no decision.
 -- Admins can't read demographics rows; this aggregate is the only way the data leaves the
 -- table, and it is built so that it can't single anyone out (special personal information,
 -- POPIA s26; the separate consent promises "only totals for groups of 30 or more"):
@@ -841,9 +1046,10 @@ grant execute on function public.retention_finish_purge(uuid, jsonb) to service_
 --   2. a group under the floor is never named or counted, not even as "hidden": its name or
 --      size, together with a narrow cohort, would point at the people in it;
 --   3. complementary suppression: if any returned group's complement (everyone decided in the
---      cohort minus that group) is under the floor, including zero, nothing is returned for
---      that stage and dimension, because an admin who knows the cohort's size from the pipeline
---      could otherwise work out the few people outside the group;
+--      cohort minus that group) is under the floor, including zero, or if the people outside
+--      all returned groups together number 1 to 29, nothing is returned for that stage and
+--      dimension, because an admin who knows the cohort's size and advances from the pipeline
+--      could otherwise work out the few people outside the shown groups;
 --   4. cohorts are whole calendar months of application (UTC) and/or a role (a hiring round),
 --      never free date ranges, so two windows a day apart can't be subtracted.
 -- Residual risk, accepted and documented on /admin/compliance: nested cohorts (one month vs all
@@ -883,16 +1089,23 @@ begin
     raise exception 'invalid_stage' using errcode = 'P0001';
   end if;
   return query execute format($f$
-    with outcome as (
-      select distinct on (a.id) a.id, a.user_id, d.decision
+    with latest as (
+      select distinct on (a.id) a.id, a.user_id, a.stage as app_stage, d.decision
       from public.applications a
-      join public.decisions d on d.application_id = a.id and d.stage = $1 and d.decision in ('advance', 'reject')
+      join public.decisions d on d.application_id = a.id and d.stage = $1
       left join public.roles r on r.id = a.role_id
       where ($3::timestamptz is null or a.created_at >= $3)
         and ($4::timestamptz is null or a.created_at < $4)
         and ($5::text is null or r.slug = $5)
         and not exists (select 1 from public.admins ad where ad.user_id = a.user_id)
-      order by a.id, d.decided_at desc
+      order by a.id, d.decided_at desc, d.id desc
+    ), outcome as (
+      select l.id, l.user_id, l.decision
+      from latest l
+      where l.decision = 'reject'
+         or (l.decision = 'advance'
+             and coalesce(array_position(array['interview', 'quiz', 'work_1', 'work_2', 'grading', 'shortlist', 'live', 'offer', 'closed'], l.app_stage), 0)
+               > array_position(array['interview', 'quiz', 'work_1', 'work_2', 'grading', 'shortlist', 'live', 'offer', 'closed'], $1))
     ), g as (
       select coalesce(dm.%1$I, 'not_disclosed') as grp,
              count(*)::bigint as n,
@@ -908,6 +1121,9 @@ begin
     select s.grp, s.n, s.adv, round(s.adv::numeric / s.n, 3)
     from shown s
     where not exists (select 1 from shown x cross join total t where t.n - x.n < $2)
+      and not exists (
+        select 1 from total t
+        where t.n - (select coalesce(sum(y.n), 0) from shown y) between 1 and $2 - 1)
     order by s.grp
   $f$, p_dimension) using p_stage, min_n, v_from, v_to, p_role_slug;
 end;
@@ -915,7 +1131,11 @@ $$;
 revoke execute on function public.adverse_impact_report(text, text, int, date, text) from public, anon;
 grant execute on function public.adverse_impact_report(text, text, int, date, text) to authenticated;
 
--- How many candidates disclosed each dimension (never per-person, never per category).
+-- How many candidates disclosed each dimension (never per-person, never per category). The
+-- consent text promises totals only for groups of 30 or more, so a count from 1 to 29 is never
+-- returned (null): respondents under 30 hide everything below them, and a dimension whose
+-- answered / prefer-not / left-blank split has any count from 1 to 29 is returned as nulls
+-- (all three, so the hidden one can't be worked out from the others).
 create or replace function public.demographics_coverage()
 returns table (candidates bigint, respondents bigint, dimension text, disclosed bigint, prefer_not bigint, not_answered bigint)
 language plpgsql
@@ -938,17 +1158,30 @@ begin
     select x.dim, x.v
     from resp r
     cross join lateral (values ('population_group', r.population_group), ('gender', r.gender), ('disability', r.disability)) x(dim, v)
+  ), raw as (
+    select dims.dim,
+           (select count(*) from resp)::bigint as resp_n,
+           count(vals.v) filter (where vals.v <> 'prefer_not')::bigint as disclosed,
+           count(vals.v) filter (where vals.v = 'prefer_not')::bigint as prefer_not,
+           ((select count(*) from resp) - count(vals.v))::bigint as not_answered
+    from (values ('population_group'), ('gender'), ('disability')) dims(dim)
+    left join vals on vals.dim = dims.dim
+    group by dims.dim
+  ), safe as (
+    select r.*,
+           r.resp_n = 0 or r.resp_n >= 30 as resp_ok,
+           (r.disclosed = 0 or r.disclosed >= 30) and (r.prefer_not = 0 or r.prefer_not >= 30)
+             and (r.not_answered = 0 or r.not_answered >= 30) as split_ok
+    from raw r
   )
   select (select count(*) from base)::bigint,
-         (select count(*) from resp)::bigint,
-         dims.dim,
-         count(vals.v) filter (where vals.v <> 'prefer_not')::bigint,
-         count(vals.v) filter (where vals.v = 'prefer_not')::bigint,
-         ((select count(*) from resp) - count(vals.v))::bigint
-  from (values ('population_group'), ('gender'), ('disability')) dims(dim)
-  left join vals on vals.dim = dims.dim
-  group by dims.dim
-  order by dims.dim;
+         case when s.resp_ok then s.resp_n end,
+         s.dim,
+         case when s.resp_ok and s.split_ok then s.disclosed end,
+         case when s.resp_ok and s.split_ok then s.prefer_not end,
+         case when s.resp_ok and s.split_ok then s.not_answered end
+  from safe s
+  order by s.dim;
 end;
 $$;
 revoke execute on function public.demographics_coverage() from public, anon;

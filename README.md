@@ -51,6 +51,7 @@ A lock is never a rejection.
    | `OPENROUTER_MODEL_TRANSCRIBE` | Speech-to-text, default `openai/whisper-1` |
    | `TYPESAFE_API_KEY`, `JEV_MODEL` | JEV (optional; every JEV decision has a deterministic fallback). Default model `jev-1.13.0` |
    | `CRON_SECRET` | 16+ characters; Vercel Cron sends it as a bearer token |
+   | `RETENTION_PEPPER` | **Server only**, 16+ characters, never change it once set. Peppers the hashed ids in the decision archive; without it the retention purge pauses |
    | `GITHUB_ACTIONS_TOKEN`, `GITHUB_ACTIONS_REPO` (+ optional `GITHUB_ACTIONS_REF`, `GITHUB_ACTIONS_WORKFLOW`) | SWE Test 1 repo checks: lets the admin panel dispatch `.github/workflows/verify-swe1.yml`. That workflow needs the GitHub repo secrets `SUPABASE_URL` and `SUPABASE_SECRET_KEY`, used only in its trusted report job; candidate code runs in a job with no secrets and no permissions |
 
    Changing a grader's model, prompt or rubric means re-running the calibration gold set

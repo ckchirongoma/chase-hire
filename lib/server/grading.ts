@@ -21,7 +21,7 @@ import {
   type SubjectType,
 } from "@/lib/grading";
 import { refreshQuietly, refreshScoresForSubject } from "@/lib/server/scores";
-import { calibrationReviewReason } from "@/lib/calibration/status";
+import { gradeCalibration } from "@/lib/calibration/status";
 
 /**
  * Shared LLM grading core (docs/09 §7), reused by every AI-graded stage:
@@ -208,12 +208,16 @@ export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterio
     reasons.push(...(f.reviewReasons ?? []));
   }
   reasons.push(...(input.reviewReasons ?? []));
-  // Calibration go-live rule (docs/09 §8.3): a criterion the latest finished gold-set run marked
-  // 'review' or 'human_only' always goes to a person. Gold samples are what calibration measures,
-  // so they are graded as they are. With no finished run, nothing changes.
+  // Calibration go-live rule (docs/09 §8.3, lib/calibration/status): a criterion the latest
+  // finished gold-set run marked 'review' goes to a person; 'human_only' goes to a person AND its AI
+  // score does not count (kept as evidence, final_score waits for a human); a run made with another
+  // rubric version, model or prompt is stale and flags every criterion. Gold samples are what
+  // calibration measures, so they are graded as they are. With no finished run, nothing changes.
+  let aiFinal = true;
   if (input.subjectType !== "gold") {
-    const calibration = await calibrationReviewReason(admin, input.rubricId, criterionKey);
-    if (calibration) reasons.push(calibration);
+    const calibration = await gradeCalibration(admin, { rubricId: input.rubricId, criterionKey, model: input.model, promptVersion: input.promptVersion });
+    if (calibration.reason) reasons.push(calibration.reason);
+    aiFinal = calibration.aiFinal;
   }
   if (reasons.length) summary = { ...summary, needsHumanReview: true, reviewReason: reasons.join("; ") };
   if (input.feedbackFilter) summary = { ...summary, feedback: input.feedbackFilter(summary.feedback) };
@@ -229,6 +233,7 @@ export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterio
     needs_human_review: summary.needsHumanReview,
     review_reason: summary.reviewReason,
     feedback: summary.feedback,
+    ai_final: aiFinal,
   });
 
   return {
@@ -288,12 +293,19 @@ type SummaryFields = {
   needs_human_review: boolean;
   review_reason: string | null;
   feedback: string | null;
+  /**
+   * false: the AI median is evidence only (calibration 'human_only'), final_score waits for a
+   * human score. Omitted: an existing row keeps its value (e.g. a red-flag cap re-upserting a leaf
+   * that gradeCriterion stored), a new row counts the AI score.
+   */
+  ai_final?: boolean;
 };
 
 /**
  * Upserts a grade summary. Human fields (human_score/reason/by/at) are never written here,
- * final_score stays the human score when one exists, and a criterion a human has already
- * scored is not flagged for review again (the new review_reason is kept for the record).
+ * final_score stays the human score when one exists (else the median, unless the criterion is
+ * human-scored only), and a criterion a human has already scored is not flagged for review again
+ * (the new review_reason is kept for the record).
  */
 export async function upsertSummary(
   admin: SupabaseClient,
@@ -302,7 +314,7 @@ export async function upsertSummary(
   for (let attempt = 0; attempt < 2; attempt++) {
     const { data: existing, error } = await admin
       .from("grade_summaries")
-      .select("id, human_score")
+      .select("id, human_score, ai_final")
       .eq("subject_type", fields.subject_type)
       .eq("subject_id", fields.subject_id)
       .eq("criterion_key", fields.criterion_key)
@@ -310,9 +322,10 @@ export async function upsertSummary(
     if (error) throw new GradingError(`could not read grade summary: ${error.message}`);
 
     const humanScore = existing?.human_score != null ? Number(existing.human_score) : null;
-    const finalScore = humanScore ?? fields.median_score;
-    const needsHumanReview = humanScore === null && fields.needs_human_review;
-    const row = { ...fields, final_score: finalScore, needs_human_review: needsHumanReview };
+    const aiFinal = fields.ai_final ?? (existing ? existing.ai_final !== false : true);
+    const finalScore = humanScore ?? (aiFinal ? fields.median_score : null);
+    const needsHumanReview = humanScore === null && (fields.needs_human_review || !aiFinal);
+    const row = { ...fields, ai_final: aiFinal, final_score: finalScore, needs_human_review: needsHumanReview };
 
     if (existing) {
       const { error: upErr } = await admin.from("grade_summaries").update(row).eq("id", existing.id);

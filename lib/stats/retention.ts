@@ -3,20 +3,20 @@
  * the schedule (public.retention_schedule, migration 20261007000018); this mirrors its rules so
  * they are unit-tested, and the integration test checks the two agree.
  *
- * - Each application ends for retention when it closed (rejected, withdrawn, lapsed or at stage
- *   closed), or when its role's hiring round closed if later; one left in play on a closed round
- *   ends at the later of the round's close and its last activity; one left in play on an open
- *   round with no activity for 6 months is abandoned and ends 6 months after that activity.
- * - Not appointed: purge 6 months after the latest of those ends and the person's own last
- *   activity (or after the last activity of someone who never applied).
+ * - A person is queued only once every application of theirs is closed (rejected, withdrawn,
+ *   lapsed or at stage closed). One application still in play keeps them off the queue, however
+ *   long it has been idle and whether or not its role is still active: only an admin closes an
+ *   application, with a written reason (an idle one with a "lapse" decision).
+ * - Each closed application's clock starts when it closed, or when its role's hiring round
+ *   closed if that was later.
+ * - Not appointed: purge 6 months after the latest of those and the person's own last activity
+ *   (or after the last activity of someone who never applied).
  * - Talent-pool opt-in on the latest consent: 12 months instead.
  * - Month arithmetic is calendar months in UTC, clamped to the month's last day like Postgres
  *   (31 Aug + 6 months = 28/29 Feb).
  */
 
 export const RETENTION_MONTHS = { standard: 6, talentPool: 12 } as const;
-/** An application in play with no activity for this long counts as abandoned (lapsed) for retention. */
-export const STALE_MONTHS = 6;
 
 export function retentionMonths(talentPool: boolean): number {
   return talentPool ? RETENTION_MONTHS.talentPool : RETENTION_MONTHS.standard;
@@ -61,7 +61,7 @@ export function isDue(purgeAfterDate: string, now: Date = new Date()): boolean {
   return purgeAfterDate <= utcDay(now);
 }
 
-export type RetentionBasis = "application_closed" | "round_closed" | "inactive" | "no_application";
+export type RetentionBasis = "application_closed" | "round_closed" | "no_application";
 
 export type ApplicationFacts = {
   /** Rejected, withdrawn or lapsed, or at stage closed. */
@@ -70,24 +70,19 @@ export type ApplicationFacts = {
   closedAt: Date | string | null;
   /** When the role's hiring round closed (the role was made inactive); null while it is open. */
   roundClosedAt: Date | string | null;
-  /** The latest activity on the application, by the candidate or an admin. */
+  /** The latest activity on the application (used when an old closed row has no close time). */
   activeAt: Date | string;
 };
 
 const toDate = (x: Date | string) => (typeof x === "string" ? new Date(x) : x);
 const later = (a: Date, b: Date | null) => (b && b > a ? b : a);
 
-/** When an application ended for retention, or null while it is still in play. */
-export function applicationEnd(a: ApplicationFacts, now: Date = new Date()): { at: Date; basis: Exclude<RetentionBasis, "no_application"> } | null {
+/** When a closed application's retention clock starts; null while it is still in play (never queued). */
+export function applicationEnd(a: ApplicationFacts): { at: Date; basis: Exclude<RetentionBasis, "no_application"> } | null {
+  if (!a.closed) return null;
   const round = a.roundClosedAt === null ? null : toDate(a.roundClosedAt);
-  const active = toDate(a.activeAt);
-  if (a.closed) {
-    const closed = a.closedAt === null ? active : toDate(a.closedAt);
-    return round && round > closed ? { at: round, basis: "round_closed" } : { at: closed, basis: "application_closed" };
-  }
-  if (round) return { at: later(round, active), basis: "round_closed" };
-  const lapsed = addMonthsUtcTs(active, STALE_MONTHS);
-  return lapsed <= now ? { at: lapsed, basis: "inactive" } : null;
+  const closed = a.closedAt === null ? toDate(a.activeAt) : toDate(a.closedAt);
+  return round && round > closed ? { at: round, basis: "round_closed" } : { at: closed, basis: "application_closed" };
 }
 
 export type RetentionFacts = {
@@ -105,14 +100,11 @@ export type RetentionFacts = {
 };
 
 /** The schedule for one person, or null when they are never queued (or not yet: in play). */
-export function retentionEntry(
-  f: RetentionFacts,
-  now: Date = new Date(),
-): { purgeAfter: string; basisAt: string; basis: RetentionBasis } | null {
+export function retentionEntry(f: RetentionFacts): { purgeAfter: string; basisAt: string; basis: RetentionBasis } | null {
   if (f.admin || f.formerStaff || f.appointed || f.openReviewRequest) return null;
   let end: { at: Date; basis: RetentionBasis } | null = null;
   for (const a of f.applications) {
-    const e = applicationEnd(a, now);
+    const e = applicationEnd(a);
     if (!e) return null; // still in play
     if (!end || e.at > end.at) end = e;
   }
@@ -126,9 +118,11 @@ export function retentionEntry(
 }
 
 /**
- * Who a purge run takes, in order: purges that stopped halfway (fewest failed attempts first)
- * may use at most half the run, so a few stuck ones can never starve the people newly due; any
- * room the newly due don't need goes back to the unfinished ones.
+ * The order a purge run works through people. Runs are bounded by time (the deadline), so the
+ * order matters: purges that stopped halfway (fewest failed attempts first) alternate with the
+ * people newly due, so unfinished ones can never take more than about half of a run while
+ * others wait, and every run makes progress on both; whatever one side doesn't need goes to the
+ * other. `limit` caps the list (a safety bound; the deadline normally ends a run first).
  */
 export function purgeBatch(
   resuming: readonly { userId: string; attempts: number; startedAt: string }[],
@@ -138,10 +132,13 @@ export function purgeBatch(
   const n = Math.max(0, Math.floor(limit));
   const stuck = [...resuming].sort((a, b) => a.attempts - b.attempts || a.startedAt.localeCompare(b.startedAt)).map((r) => r.userId);
   const resumingIds = new Set(stuck);
-  const fresh = due.filter((id) => !resumingIds.has(id));
-  const quota = Math.min(stuck.length, Math.max(n > 0 ? 1 : 0, Math.floor(n / 2)));
-  const first = stuck.slice(0, quota);
-  const news = fresh.slice(0, n - first.length);
-  const rest = stuck.slice(quota, quota + (n - first.length - news.length));
-  return [...first, ...news, ...rest];
+  const fresh = [...new Set(due)].filter((id) => !resumingIds.has(id));
+  const out: string[] = [];
+  let i = 0;
+  let j = 0;
+  while (out.length < n && (i < stuck.length || j < fresh.length)) {
+    if (i < stuck.length) out.push(stuck[i++]);
+    if (out.length < n && j < fresh.length) out.push(fresh[j++]);
+  }
+  return out;
 }

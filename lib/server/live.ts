@@ -2,7 +2,8 @@ import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { inChunks } from "@/lib/server/query";
 import { assemblePanel, bankQuestions, normaliseConcerns, type BankQuestion, type Concern } from "@/lib/live/panel";
-import { kindsForRole, type LiveQuestion, type ScoredKind, type ScorecardKind } from "@/lib/live/scorecard";
+import { kindsForRole, viewerLiveScores, type LiveQuestion, type ScoredKind, type ScorecardKind, type ViewerLiveScores } from "@/lib/live/scorecard";
+import type { Weighted } from "@/lib/scoring/composite";
 import { assembleLiveForm, seedForApplication, stemKey } from "@/lib/live/retest";
 import type { AssembledItem } from "@/lib/reasoning/blueprint";
 
@@ -116,6 +117,29 @@ export async function visibleScorecards(supabase: SupabaseClient, applicationId:
   return ((data ?? []) as Scorecard[])
     .filter((c) => c.rater === viewerId || c.submitted_at !== null)
     .map((c) => ({ ...c, total: c.total === null ? null : Number(c.total) }));
+}
+
+/**
+ * Live and final scores as one panellist may see them, for many applications at once (docs/09 §5:
+ * independent raters). Reads the cards through the VIEWER'S OWN client (RLS: their own cards, plus
+ * the other panellists' submitted cards for a part once they have submitted theirs), chunked, and
+ * applies viewerLiveScores: a part shows only after the viewer submitted it, the final only after
+ * they submitted every part. For any page that shows live or final scores to an admin (candidate
+ * page, pipeline board): never show computeScores(service).live / .final or applications.final_score
+ * while the viewer hasn't submitted every part.
+ */
+export async function viewerLiveGate(
+  viewerClient: SupabaseClient,
+  viewerId: string,
+  apps: readonly { applicationId: string; roleSlug: string; preLive: Weighted | null }[],
+): Promise<Map<string, ViewerLiveScores>> {
+  const cards = await inChunks<{ application_id: string; kind: string; rater: string; total: number | null; submitted_at: string | null }>(
+    apps.map((a) => a.applicationId),
+    (c) => viewerClient.from("live_scorecards").select("application_id, kind, rater, total, submitted_at").in("application_id", c),
+  );
+  const byApp = new Map<string, typeof cards>();
+  for (const c of cards) byApp.set(c.application_id, [...(byApp.get(c.application_id) ?? []), { ...c, total: c.total === null ? null : Number(c.total) }]);
+  return new Map(apps.map((a) => [a.applicationId, viewerLiveScores(a.roleSlug, byApp.get(a.applicationId) ?? [], viewerId, a.preLive)]));
 }
 
 export type RecordedRetest = {

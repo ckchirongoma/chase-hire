@@ -3,6 +3,7 @@ import { requireAdmin } from "@/lib/server/auth";
 import { computeScores, type AppScore } from "@/lib/server/scores";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { inChunks } from "@/lib/server/query";
+import { viewerLiveGate } from "@/lib/server/live";
 import { STAGE_LABEL } from "@/lib/format";
 import PipelineColumn, { type CardData } from "./column";
 import { BATCH_ELIGIBLE_STATUSES } from "./eligibility";
@@ -22,13 +23,19 @@ export default async function PipelinePage({
 }: {
   searchParams: Promise<{ role?: string; blind?: string; closed?: string; ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
+  const { supabase, user } = await requireAdmin();
   const { role, blind, closed, ok, error } = await searchParams;
   const admin = createAdminClient();
   let scores = await computeScores(admin);
   if (role) scores = scores.filter((s) => s.roleSlug === role);
   if (!closed) scores = scores.filter((s) => !CLOSED_STATUSES.includes(s.status) && s.stage !== "closed");
 
+  // Final scores only as this panellist may see them (independent live scoring, docs/09 §5).
+  const liveGate = await viewerLiveGate(
+    supabase,
+    user.id,
+    scores.filter((s) => s.final !== null).map((s) => ({ applicationId: s.applicationId, roleSlug: s.roleSlug, preLive: s.preLive })),
+  );
   const userIds = [...new Set(scores.map((s) => s.userId))];
   const profiles = await inChunks<{ user_id: string; full_name: string | null; email: string | null }>(userIds, (c) =>
     admin.from("profiles").select("user_id, full_name, email").in("user_id", c),
@@ -56,7 +63,7 @@ export default async function PipelinePage({
     status: s.status,
     composite: s.preLive.score,
     coverage: s.preLive.coverage,
-    final: s.final,
+    final: liveGate.get(s.applicationId)?.final ?? null,
     execComms: s.execComms.score,
     eligible: BATCH_ELIGIBLE_STATUSES.includes(s.status),
     flags: [

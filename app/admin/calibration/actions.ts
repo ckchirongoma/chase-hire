@@ -5,11 +5,11 @@ import { z } from "zod";
 import { requireAdmin } from "@/lib/server/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { RubricRow } from "@/lib/grading/schema";
-import { calibrationLeaves, HumanScores, humanScoresFromForm, readHumanScores } from "@/lib/calibration/criteria";
+import { calibrationLeaves, humanScoresFromForm } from "@/lib/calibration/criteria";
 import { readDocument } from "@/lib/work/documents";
 import { EXT_MIME, TEXT_EXTS, type FileExt } from "@/lib/work/stages";
 import { storableText } from "@/lib/work/text";
-import { cancelCalibrationRun, CalibrationError, finishRunIfComplete, processCalibrationRun, startCalibrationRun } from "@/lib/server/calibration";
+import { cancelCalibrationRun, CalibrationError, currentRubric, finishRunIfComplete, isDriftPick, processCalibrationRun, startCalibrationRun } from "@/lib/server/calibration";
 
 /**
  * Gold-set management and calibration runs (docs/09 §8). Gold samples are written through the
@@ -82,7 +82,7 @@ export async function addGoldSample(formData: FormData) {
 
   const { data, error } = await supabase
     .from("gold_samples")
-    .insert({ rubric_key, label, text_content: text, file_path: filePath, created_by: user.id, human_scores: {} })
+    .insert({ rubric_key, label, text_content: text, file_path: filePath, created_by: user.id })
     .select("id")
     .single();
   if (error || !data) goRubric(rubric_key, { error: error?.message ?? "Could not save the gold sample." });
@@ -108,9 +108,18 @@ export async function updateGoldSample(formData: FormData) {
 }
 
 /**
- * One human rater's 1–5 scores per calibrated criterion (blank = not scored yet). Each rater saves
- * only their own column, so the two scores stay independent.
+ * One human rater's 1–5 scores per calibrated criterion (blank = not scored yet), docs/09 §8.1:
+ * two people score each gold sample independently. The database (save_gold_human_scores) writes
+ * only the caller's column: the first save claims the column for that admin, a column another
+ * admin owns is refused, one admin can't own both, and concurrent saves can't overwrite each other.
  */
+const GOLD_RATER_ERRORS: Record<string, string> = {
+  gold_column_taken: "Another admin is scoring that column. Two different people score each gold sample: use the other column, or ask them.",
+  gold_one_column_per_rater: "You already score the other column of this gold sample. The second score must come from a different person.",
+  gold_scores_invalid: "Scores must be whole numbers from 1 to 5.",
+  gold_not_found: "Gold sample not found.",
+};
+
 export async function saveHumanScores(formData: FormData) {
   const { supabase } = await requireAdmin();
   const id = String(formData.get("gold_id") ?? "");
@@ -119,7 +128,7 @@ export async function saveHumanScores(formData: FormData) {
   const raterField = formData.get("rater");
   if (raterField !== "1" && raterField !== "2") go(back, { error: "Choose rater 1 or rater 2." });
   const rater: 1 | 2 = raterField === "2" ? 2 : 1;
-  const { data: gold, error } = await supabase.from("gold_samples").select("id, rubric_key, human_scores").eq("id", id).maybeSingle();
+  const { data: gold, error } = await supabase.from("gold_samples").select("id, rubric_key").eq("id", id).maybeSingle();
   if (error) go(back, { error: error.message });
   if (!gold) go("/admin/calibration", { error: "Gold sample not found." });
   const rubric = await activeRubric(supabase, gold!.rubric_key as string);
@@ -128,20 +137,13 @@ export async function saveHumanScores(formData: FormData) {
   const fields = Object.fromEntries([...formData.entries()].filter(([k]) => k.startsWith(`h${rater}:`)));
   const { scores, invalid } = humanScoresFromForm(fields, keys);
   if (invalid.length) go(back, { error: `Scores must be whole numbers from 1 to 5 (${invalid.join(", ")}).` }, `rater=${rater}`);
-  // Only this rater's slot changes; the other rater's scores and keys of older rubric versions are kept.
-  const current = readHumanScores(gold!.human_scores);
-  const next: Record<string, [number | null, number | null]> = { ...current };
-  for (const k of keys) {
-    const mine = scores[k]?.[rater - 1] ?? null;
-    const pair: [number | null, number | null] = [...(current[k] ?? [null, null])] as [number | null, number | null];
-    pair[rater - 1] = mine;
-    if (pair[0] === null && pair[1] === null) delete next[k];
-    else next[k] = pair;
+  // Every current leaf is sent: a blank clears that criterion in this rater's column only.
+  const column = Object.fromEntries(keys.map((k) => [k, scores[k]?.[rater - 1] ?? null]));
+  const { error: rpcErr } = await supabase.rpc("save_gold_human_scores", { p_gold_id: id, p_rater: rater, p_scores: column });
+  if (rpcErr) {
+    const code = Object.keys(GOLD_RATER_ERRORS).find((c) => rpcErr.message.includes(c));
+    go(back, { error: code ? GOLD_RATER_ERRORS[code] : rpcErr.message }, `rater=${rater}`);
   }
-  const merged = HumanScores.safeParse(next);
-  if (!merged.success) go(back, { error: "Invalid scores." });
-  const { error: upErr } = await supabase.from("gold_samples").update({ human_scores: merged.data }).eq("id", id);
-  if (upErr) go(back, { error: upErr.message });
   go(back, { ok: `Rater ${rater}'s scores saved.` }, `rater=${rater}`);
 }
 
@@ -222,4 +224,56 @@ export async function cancelCalibration(formData: FormData) {
   if (!parsed.success) go("/admin/calibration", { error: "Unknown run." });
   await cancelCalibrationRun(createAdminClient(), parsed.data!.run_id, user.id);
   goRubric(parsed.data!.rubric_key, { ok: "Run cancelled. The previous finished run's statuses still apply." });
+}
+
+// ───────────────────────── Drift re-scores ─────────────────────────
+
+const DriftForm = z.object({ submission_id: z.uuid(), rubric_key: RubricKey });
+
+/**
+ * One admin's drift re-scores for a picked submission (docs/09 §8.4): 1–5 per calibrated
+ * criterion, blank removes yours. Kept in drift_rescores (RLS: your own rows only), apart from the
+ * review overrides on grade_summaries, so they never change the candidate's score.
+ */
+export async function saveDriftRescores(formData: FormData) {
+  const { supabase, user } = await requireAdmin();
+  const parsed = DriftForm.safeParse({ submission_id: formData.get("submission_id"), rubric_key: formData.get("rubric_key") });
+  if (!parsed.success) go("/admin/calibration", { error: "Unknown drift pick." });
+  const { submission_id: id, rubric_key: key } = parsed.data!;
+  const back = `/admin/calibration/drift/${id}`;
+  const service = createAdminClient();
+  if (!(await isDriftPick(service, key, id))) go("/admin/calibration", { error: "That submission is not a drift pick for this rubric." }, `rubric=${key}`);
+  let keys: string[] = [];
+  try {
+    keys = calibrationLeaves((await currentRubric(service, key)).criteria).map((l) => l.key);
+  } catch {
+    go(back, { error: "The rubric is not active." }, `rubric=${key}`);
+  }
+  const invalid: string[] = [];
+  const wanted = new Map<string, number | null>();
+  for (const k of keys) {
+    const raw = formData.get(`d:${k}`);
+    if (raw === null || raw === "") wanted.set(k, null);
+    else if (/^[1-5]$/.test(String(raw))) wanted.set(k, Number(raw));
+    else invalid.push(k);
+  }
+  if (invalid.length) go(back, { error: `Scores must be whole numbers from 1 to 5 (${invalid.join(", ")}).` }, `rubric=${key}`);
+
+  const { data: mine, error } = await supabase.from("drift_rescores").select("id, criterion_key").eq("submission_id", id).eq("rater", user.id);
+  if (error) go(back, { error: error.message }, `rubric=${key}`);
+  const existing = new Map((mine ?? []).map((r) => [r.criterion_key as string, r.id as string]));
+  for (const [k, v] of wanted) {
+    const rowId = existing.get(k);
+    const res =
+      v === null
+        ? rowId
+          ? await supabase.from("drift_rescores").delete().eq("id", rowId)
+          : null
+        : rowId
+          ? await supabase.from("drift_rescores").update({ score: v }).eq("id", rowId)
+          : await supabase.from("drift_rescores").insert({ rubric_key: key, submission_id: id, criterion_key: k, score: v });
+    if (res?.error) go(back, { error: res.error.message }, `rubric=${key}`);
+  }
+  const n = [...wanted.values()].filter((v) => v !== null).length;
+  go(back, { ok: `Drift re-scores saved (${n} of ${keys.length} criteria). They don't change the candidate's score.` }, `rubric=${key}`);
 }

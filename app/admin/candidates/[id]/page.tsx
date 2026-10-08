@@ -9,6 +9,7 @@ import WorkPanel from "@/components/admin/work-panel";
 import WorkGrades from "@/components/admin/work-grades";
 import SessionControls from "@/components/admin/session-controls";
 import { computeScores, refreshQuietly, refreshScores } from "@/lib/server/scores";
+import { viewerLiveGate } from "@/lib/server/live";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 export const dynamic = "force-dynamic";
@@ -60,7 +61,7 @@ export default async function CandidateDetail({
   params: Promise<{ id: string }>;
   searchParams: Promise<{ error?: string; ok?: string }>;
 }) {
-  const { supabase } = await requireAdmin();
+  const { supabase, user } = await requireAdmin();
   const { id } = await params;
   const { error, ok } = await searchParams;
   if (!z.uuid().safeParse(id).success) notFound();
@@ -85,6 +86,12 @@ export default async function CandidateDetail({
 
   const scoreList = applications.data?.length ? await computeScores(createAdminClient(), { applicationIds: applications.data.map((a) => a.id) }) : [];
   const scoreOf = new Map(scoreList.map((x) => [x.applicationId, x]));
+  // Live and final scores only as this panellist may see them (independent scoring, docs/09 §5).
+  const liveGate = await viewerLiveGate(
+    supabase,
+    user.id,
+    scoreList.map((x) => ({ applicationId: x.applicationId, roleSlug: x.roleSlug, preLive: x.preLive })),
+  );
 
   const cv = cvs.data?.[0];
   const { data: signed } = cv ? await supabase.storage.from("cvs").createSignedUrl(cv.storage_path, 300) : { data: null };
@@ -108,7 +115,7 @@ export default async function CandidateDetail({
 
       <section className="card space-y-3">
         <h2 className="h2">Applications and decisions</h2>
-        <p className="muted">Scores are advisory. Every advance or reject needs a reason of at least 20 characters that references the criteria (e.g. &quot;Below hurdle on reasoning (2★), but CV shows 4 years of directly relevant SQL work&quot;). The candidate can see your reason.</p>
+        <p className="muted">Reasons are kept for 3 years in the decision archive after the candidate&apos;s data is purged: write about the evidence, not the person. Scores are advisory. Every advance or reject needs a reason of at least 20 characters that references the criteria (e.g. &quot;Below hurdle on reasoning (2★), but CV shows 4 years of directly relevant SQL work&quot;). The candidate can see your reason.</p>
         {applications.data?.map((a) => {
           const decisions = (a.decisions as unknown as { decision: string; reason: string; decided_at: string; stage: string }[]) ?? [];
           return (
@@ -124,8 +131,17 @@ export default async function CandidateDetail({
                   <p className="muted" data-testid="composite">
                     Composite (pre-live) <strong>{sc.preLive.score ?? "—"}</strong>
                     {sc.preLive.score !== null && sc.preLive.coverage < 1 && <> ({Math.round(sc.preLive.coverage * 100)}% of stages; missing {sc.preLive.missing.join(", ")})</>}
-                    {sc.final !== null && <> · final <strong>{sc.final}</strong></>}
-                    {sc.live.score !== null && <> · live {sc.live.score}</>}
+                    {(() => {
+                      const g = liveGate.get(a.id);
+                      if (!g) return null;
+                      return (
+                        <>
+                          {g.final !== null && <> · final <strong>{g.final}</strong></>}
+                          {g.live.score !== null && <> · live {g.live.score}</>}
+                          {g.hidden.length > 0 && <> · live scores you haven&apos;t submitted yourself stay hidden</>}
+                        </>
+                      );
+                    })()}
                     {sc.execComms.score !== null && <> · exec comms {sc.execComms.score} (n={sc.execComms.n})</>}
                   </p>
                 );

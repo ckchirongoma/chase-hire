@@ -29,8 +29,9 @@ import {
 import { BundleAAnswerKey, fillFigures } from "@/lib/synth/answer-key";
 import { calibrationLeaves, readHumanScores, type CalibrationLeaf } from "@/lib/calibration/criteria";
 import { criterionStats, runPassed, type CriterionStats } from "@/lib/calibration/stats";
-import { driftAgreement, driftPicks } from "@/lib/calibration/drift";
+import { driftAgreement, nextDriftBlock } from "@/lib/calibration/drift";
 import { all, inChunks } from "@/lib/server/query";
+import { refreshQuietly, refreshScores } from "@/lib/server/scores";
 import { enqueueGrading, gradeCriterion, GradingError, MAX_JOB_ATTEMPTS, runGradingJob, type GradingHandler } from "@/lib/server/grading";
 import { SUBMISSION_PROMPT_VERSION, SUBMISSION_LLM_CONCURRENCY } from "@/lib/server/grade-submission";
 
@@ -48,8 +49,10 @@ import { SUBMISSION_PROMPT_VERSION, SUBMISSION_LLM_CONCURRENCY } from "@/lib/ser
  *   quadratic weighted kappa between the AI final score and the mean of the two human raters
  *   (and human-vs-human ICC for reference), and a go-live status: live (ICC ≥ .75), review
  *   (.60–.75, mandatory human review) or human_only (< .60). The grading core applies the latest
- *   finished run's statuses to real grades (lib/calibration/status).
- * - Drift check: 3 random submissions per 25 graded, for a person to re-score.
+ *   finished run's statuses to new grades (lib/calibration/status), and finishing a run applies
+ *   them to the grades already stored (apply_calibration_statuses, migration 0019).
+ * - Drift check: 3 random submissions per 25 graded, frozen per block (drift_blocks), re-scored by
+ *   a person into drift_rescores, which never change a candidate's score.
  *
  * Everything takes the service-role client; callers check that the user is an admin first.
  */
@@ -93,10 +96,12 @@ export type GoldSampleRow = {
   file_path: string | null;
   text_content: string;
   human_scores: unknown;
+  /** {"1": admin id, "2": admin id}: who owns each human score column. */
+  human_raters: unknown;
   created_by: string | null;
   created_at: string;
 };
-export const GOLD_COLS = "id, rubric_key, label, file_path, text_content, human_scores, created_by, created_at";
+export const GOLD_COLS = "id, rubric_key, label, file_path, text_content, human_scores, human_raters, created_by, created_at";
 
 export type CalibrationRunRow = {
   id: string;
@@ -519,6 +524,7 @@ export async function finishRunIfComplete(admin: SupabaseClient, runId: string, 
       .eq("status", "running")
       .select(RUN_COLS)
       .maybeSingle<CalibrationRunRow>();
+    if (data && p.pending) await dropPendingGoldJobs(admin, run);
     return data ?? (await loadRun(admin, runId))!;
   }
   const perCriterion = await computeRunStats(admin, run, p.doneIds);
@@ -530,7 +536,38 @@ export async function finishRunIfComplete(admin: SupabaseClient, runId: string, 
     .eq("status", "running")
     .select(RUN_COLS)
     .maybeSingle<CalibrationRunRow>();
+  if (data) {
+    if (p.pending) await dropPendingGoldJobs(admin, run);
+    await applyRunStatuses(admin, data.id);
+  }
   return data ?? (await loadRun(admin, runId))!;
+}
+
+/**
+ * Applies a finished run's go-live statuses to the real grades already stored (docs/09 §8.3):
+ * 'review' and 'human_only' flag them, 'human_only' also takes the AI score out of final_score
+ * until a person scores it, 'live' lets it count again. Then refreshes the composites of the
+ * applications whose stage scores changed.
+ */
+export async function applyRunStatuses(admin: SupabaseClient, runId: string): Promise<string[]> {
+  const { data, error } = await admin.rpc("apply_calibration_statuses", { p_run_id: runId });
+  if (error) throw new CalibrationError(`could not apply the calibration statuses: ${error.message}`);
+  const ids = [...new Set(((data ?? []) as unknown[]).map((x) => (typeof x === "string" ? x : String((x as Record<string, unknown>)?.apply_calibration_statuses ?? ""))).filter(Boolean))];
+  if (ids.length) await refreshQuietly(refreshScores(admin, ids));
+  return ids;
+}
+
+/**
+ * A closed run's gold jobs that have not started (queued, or failed with retries left) are
+ * removed, so the grading worker doesn't spend LLM calls on results nobody uses. A job that is
+ * running finishes; its handler finds no running run and stops there.
+ */
+async function dropPendingGoldJobs(admin: SupabaseClient, run: Pick<CalibrationRunRow, "gold_sample_ids">): Promise<void> {
+  for (let i = 0; i < run.gold_sample_ids.length; i += 100) {
+    const chunk = run.gold_sample_ids.slice(i, i + 100);
+    const { error } = await admin.from("grading_jobs").delete().eq("subject_type", "gold").in("subject_id", chunk).in("status", ["queued", "failed"]);
+    if (error) console.warn("could not drop pending gold jobs", error.message);
+  }
 }
 
 /** Per calibrated criterion: AI final (this run's grading) vs the two humans. */
@@ -576,61 +613,131 @@ export async function syncCalibrationRuns(admin: SupabaseClient): Promise<void> 
 }
 
 export async function cancelCalibrationRun(admin: SupabaseClient, runId: string, by: string): Promise<void> {
-  const { error } = await admin
+  const { data, error } = await admin
     .from("calibration_runs")
     .update({ status: "failed", error: `cancelled by an admin (${by.slice(0, 8)})`, finished_at: new Date().toISOString() })
     .eq("id", runId)
-    .eq("status", "running");
+    .eq("status", "running")
+    .select("gold_sample_ids");
   if (error) throw new CalibrationError(error.message);
+  for (const r of data ?? []) await dropPendingGoldJobs(admin, r as Pick<CalibrationRunRow, "gold_sample_ids">);
 }
 
 // ───────────────────────── Drift check ─────────────────────────
 
+export interface DriftPick {
+  submissionId: string;
+  /** Null when the submission no longer exists (retention purge). */
+  userId: string | null;
+  createdAt: string | null;
+  /** Criteria the viewer has re-scored for this pick, and criteria anyone has. */
+  rescoredByMe: number;
+  rescored: number;
+}
+
 export interface DriftReport {
   rubricKey: string;
   graded: number;
+  /** Graded submissions not yet in a frozen block (the next block freezes at 25). */
+  waiting: number;
   blocks: {
     block: number;
-    picks: { submissionId: string; userId: string; createdAt: string; rescored: number; criteria: number }[];
+    frozenAt: string;
+    picks: DriftPick[];
     agreement: { n: number; within1: number | null; mad: number | null };
   }[];
 }
 
-/** For a rubric: graded submissions in blocks of 25, three stable random picks each, and how far a person's re-scores agree. */
-export async function driftReport(admin: SupabaseClient, rubricKey: string): Promise<DriftReport> {
+export type DriftBlockRow = { block: number; submission_ids: string[]; pick_ids: string[]; created_at: string };
+
+async function frozenBlocks(admin: SupabaseClient, rubricKey: string): Promise<DriftBlockRow[]> {
+  const { data, error } = await admin.from("drift_blocks").select("block, submission_ids, pick_ids, created_at").eq("rubric_key", rubricKey).order("block");
+  if (error) throw new CalibrationError(error.message);
+  return (data ?? []) as DriftBlockRow[];
+}
+
+/**
+ * Freezes every complete block of 25 graded submissions (oldest first) not yet in a block, one at a
+ * time, and returns all the rubric's blocks. A concurrent page load that froze a block first wins,
+ * and nothing frozen ever changes: a re-grade, a purge or a late grade only affects later blocks.
+ */
+export async function freezeDriftBlocks(admin: SupabaseClient, rubricKey: string, graded: readonly { id: string }[]): Promise<DriftBlockRow[]> {
+  let blocks = await frozenBlocks(admin, rubricKey);
+  for (let guard = 0; guard < 1000; guard++) {
+    const frozen = new Set(blocks.flatMap((b) => b.submission_ids));
+    const number = (blocks.at(-1)?.block ?? 0) + 1;
+    const next = nextDriftBlock(graded.filter((x) => !frozen.has(x.id)), rubricKey, number);
+    if (!next) break;
+    const { error } = await admin
+      .from("drift_blocks")
+      .upsert({ rubric_key: rubricKey, block: number, submission_ids: next.submissionIds, pick_ids: next.pickIds }, { onConflict: "rubric_key,block", ignoreDuplicates: true });
+    if (error) throw new CalibrationError(error.message);
+    blocks = await frozenBlocks(admin, rubricKey);
+  }
+  return blocks;
+}
+
+/**
+ * Drift check for a rubric (docs/09 §8.4). Graded submissions are frozen into blocks of 25 as they
+ * fill (drift_blocks: the block's submissions and its 3 seeded picks never change afterwards), and
+ * agreement is computed from drift re-scores only (drift_rescores: a person's 1–5 per criterion vs
+ * the AI median), which never change a candidate's score. Service-role client after an admin check.
+ */
+export async function driftReport(admin: SupabaseClient, rubricKey: string, viewerId?: string): Promise<DriftReport> {
   const { data: stages, error } = await admin.from("work_stages").select("key").eq("rubric_key", rubricKey);
   if (error) throw new CalibrationError(error.message);
   const stageKeys = (stages ?? []).map((s) => s.key as string);
-  if (!stageKeys.length) return { rubricKey, graded: 0, blocks: [] };
-  const subs = await all<{ id: string; user_id: string; created_at: string }>((f, t) =>
-    admin
-      .from("submissions")
-      .select("id, user_id, created_at")
-      .in("stage_key", stageKeys)
-      .in("grading_status", ["done", "needs_review"])
-      .order("created_at")
-      .order("id")
-      .range(f, t),
-  );
-  const blocks = driftPicks(subs, rubricKey);
-  const pickIds = blocks.flatMap((b) => b.picks.map((p) => p.id));
-  const rows = await inChunks<{ subject_id: string; criterion_key: string; median_score: number | null; human_score: number | null }>(pickIds, (c) =>
-    admin.from("grade_summaries").select("subject_id, criterion_key, median_score, human_score").eq("subject_type", "submission").in("subject_id", c),
-  );
-  const bySub = new Map<string, typeof rows>();
-  for (const r of rows) bySub.set(r.subject_id, [...(bySub.get(r.subject_id) ?? []), r]);
+  const subs = stageKeys.length
+    ? await all<{ id: string }>((f, t) =>
+        admin.from("submissions").select("id").in("stage_key", stageKeys).in("grading_status", ["done", "needs_review"]).order("created_at").order("id").range(f, t),
+      )
+    : [];
+  const blocks = await freezeDriftBlocks(admin, rubricKey, subs);
+  const frozen = new Set(blocks.flatMap((b) => b.submission_ids));
+
+  const pickIds = [...new Set(blocks.flatMap((b) => b.pick_ids))];
+  const [info, rescores, medians] = await Promise.all([
+    inChunks<{ id: string; user_id: string; created_at: string }>(pickIds, (c) => admin.from("submissions").select("id, user_id, created_at").in("id", c)),
+    inChunks<{ submission_id: string; criterion_key: string; score: number; rater: string }>(pickIds, (c) =>
+      admin.from("drift_rescores").select("submission_id, criterion_key, score, rater").eq("rubric_key", rubricKey).in("submission_id", c),
+    ),
+    inChunks<{ subject_id: string; criterion_key: string; median_score: number | null }>(pickIds, (c) =>
+      admin.from("grade_summaries").select("subject_id, criterion_key, median_score").eq("subject_type", "submission").in("subject_id", c),
+    ),
+  ]);
+  const sub = new Map(info.map((x) => [x.id, x]));
+  const ai = new Map(medians.filter((m) => m.median_score !== null).map((m) => [`${m.subject_id}|${m.criterion_key}`, Number(m.median_score)]));
+  const bySub = new Map<string, typeof rescores>();
+  for (const r of rescores) bySub.set(r.submission_id, [...(bySub.get(r.submission_id) ?? []), r]);
+
   return {
     rubricKey,
     graded: subs.length,
+    waiting: subs.filter((x) => !frozen.has(x.id)).length,
     blocks: blocks.map((b) => {
       const pairs: { ai: number; human: number }[] = [];
-      const picks = b.picks.map((p) => {
-        const rs = bySub.get(p.id) ?? [];
-        const rescored = rs.filter((r) => r.human_score !== null && r.median_score !== null);
-        pairs.push(...rescored.map((r) => ({ ai: Number(r.median_score), human: Number(r.human_score) })));
-        return { submissionId: p.id, userId: p.user_id, createdAt: p.created_at, rescored: rescored.length, criteria: rs.length };
+      const picks = b.pick_ids.map((id): DriftPick => {
+        const rs = bySub.get(id) ?? [];
+        for (const r of rs) {
+          const a = ai.get(`${id}|${r.criterion_key}`);
+          if (a !== undefined) pairs.push({ ai: a, human: Number(r.score) });
+        }
+        return {
+          submissionId: id,
+          userId: sub.get(id)?.user_id ?? null,
+          createdAt: sub.get(id)?.created_at ?? null,
+          rescoredByMe: viewerId ? new Set(rs.filter((r) => r.rater === viewerId).map((r) => r.criterion_key)).size : 0,
+          rescored: new Set(rs.map((r) => r.criterion_key)).size,
+        };
       });
-      return { block: b.block, picks, agreement: driftAgreement(pairs) };
+      return { block: b.block, frozenAt: b.created_at, picks, agreement: driftAgreement(pairs) };
     }),
   };
+}
+
+/** Whether a submission is a drift pick for a rubric (only picks are re-scored for drift). */
+export async function isDriftPick(admin: SupabaseClient, rubricKey: string, submissionId: string): Promise<boolean> {
+  const { data, error } = await admin.from("drift_blocks").select("block").eq("rubric_key", rubricKey).contains("pick_ids", [submissionId]).limit(1);
+  if (error) throw new CalibrationError(error.message);
+  return Boolean(data?.length);
 }

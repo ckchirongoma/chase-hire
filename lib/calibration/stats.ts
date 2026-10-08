@@ -132,6 +132,7 @@ export interface GoldPair {
 
 export interface CriterionStats {
   icc: number | null;
+  /** Mean of QWK(AI, human 1) and QWK(AI, human 2). */
   qwk: number | null;
   /** Gold samples with an AI score and both human scores. */
   n: number;
@@ -149,8 +150,13 @@ export interface CriterionStats {
 const round3 = (x: number | null) => (x === null ? null : Math.round(x * 1000) / 1000);
 const isScore = (v: unknown): v is number => finite(v) && v >= 1 && v <= 5;
 const mean = (xs: readonly number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+/** Mean of the defined values (null when none is defined). */
+const meanOf = (xs: readonly (number | null)[]) => mean(xs.filter((x): x is number => x !== null));
 
-/** ICC(2,1) and QWK between the AI final score and the mean of the two humans, plus human-vs-human ICC. */
+/**
+ * ICC(2,1) between the AI final score and the mean of the two humans; QWK as the mean of the AI's
+ * kappa against each human (integer scores, no rounding of half points); human-vs-human ICC.
+ */
 export function criterionStats(pairs: readonly GoldPair[]): CriterionStats {
   const used = pairs
     .filter((p) => isScore(p.ai) && isScore(p.human[0]) && isScore(p.human[1]))
@@ -158,7 +164,9 @@ export function criterionStats(pairs: readonly GoldPair[]): CriterionStats {
   const n = used.length;
   const humanMean = used.map((p) => (p.human[0] + p.human[1]) / 2);
   const icc = round3(icc21(used.map((p, i) => [p.ai, humanMean[i]])));
-  const qwk = round3(n >= 2 ? quadraticWeightedKappa(used.map((p) => p.ai), humanMean) : null);
+  // QWK needs integer categories, and the two humans' mean can be x.5 (rounding it would bias the
+  // kappa), so it is the mean of the AI's kappa against each human rater.
+  const qwk = round3(n >= 2 ? meanOf([quadraticWeightedKappa(used.map((p) => p.ai), used.map((p) => p.human[0])), quadraticWeightedKappa(used.map((p) => p.ai), used.map((p) => p.human[1]))]) : null);
   const humanIcc = round3(icc21(used.map((p) => [p.human[0], p.human[1]])));
   const notes: string[] = [];
   const skipped = pairs.length - n;

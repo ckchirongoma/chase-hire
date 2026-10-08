@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   RETENTION_MONTHS,
-  STALE_MONTHS,
   addMonthsUtc,
   addMonthsUtcTs,
   applicationEnd,
@@ -23,7 +22,6 @@ const base: RetentionFacts = {
   lastActivity: "2026-01-10T08:00:00Z",
   talentPool: false,
 };
-const NOW = new Date("2026-10-08T12:00:00Z");
 const closedApp = (closedAt: string, extra: Partial<ApplicationFacts> = {}): ApplicationFacts => ({
   closed: true,
   closedAt,
@@ -71,7 +69,7 @@ describe("retention periods (notice: 6 months, 12 for the talent pool)", () => {
 
 describe("who is queued", () => {
   it("counts 6 months from when the application closed", () => {
-    expect(retentionEntry({ ...base, applications: [closedApp("2026-02-01T09:00:00Z")] }, NOW)).toEqual({
+    expect(retentionEntry({ ...base, applications: [closedApp("2026-02-01T09:00:00Z")] })).toEqual({
       purgeAfter: "2026-08-01",
       basisAt: "2026-02-01T09:00:00.000Z",
       basis: "application_closed",
@@ -79,59 +77,73 @@ describe("who is queued", () => {
   });
 
   it("uses 12 months for a talent-pool opt-in", () => {
-    expect(retentionEntry({ ...base, applications: [closedApp("2026-02-01T09:00:00Z")], talentPool: true }, NOW)?.purgeAfter).toBe("2027-02-01");
+    expect(retentionEntry({ ...base, applications: [closedApp("2026-02-01T09:00:00Z")], talentPool: true })?.purgeAfter).toBe("2027-02-01");
   });
 
   it("restarts the clock if there was activity after the close (e.g. a new CV)", () => {
     expect(
-      retentionEntry({ ...base, applications: [closedApp("2026-02-01T09:00:00Z")], lastActivity: "2026-04-20T09:00:00Z" }, NOW)?.purgeAfter,
+      retentionEntry({ ...base, applications: [closedApp("2026-02-01T09:00:00Z")], lastActivity: "2026-04-20T09:00:00Z" })?.purgeAfter,
     ).toBe("2026-10-20");
   });
 
   it("counts from the last activity for someone who never applied", () => {
-    expect(retentionEntry(base, NOW)).toMatchObject({ purgeAfter: "2026-07-10", basis: "no_application" });
+    expect(retentionEntry(base)).toMatchObject({ purgeAfter: "2026-07-10", basis: "no_application" });
   });
 
   it("never queues admins, former staff, open applications, appointed candidates or open review requests", () => {
-    expect(retentionEntry({ ...base, admin: true }, NOW)).toBeNull();
-    expect(retentionEntry({ ...base, formerStaff: true }, NOW)).toBeNull();
-    expect(retentionEntry({ ...base, applications: [closedApp("2025-01-01T00:00:00Z"), openApp("2026-09-01T00:00:00Z")] }, NOW)).toBeNull();
-    expect(retentionEntry({ ...base, appointed: true }, NOW)).toBeNull();
-    expect(retentionEntry({ ...base, openReviewRequest: true }, NOW)).toBeNull();
+    expect(retentionEntry({ ...base, admin: true })).toBeNull();
+    expect(retentionEntry({ ...base, formerStaff: true })).toBeNull();
+    expect(retentionEntry({ ...base, applications: [closedApp("2025-01-01T00:00:00Z"), openApp("2026-09-01T00:00:00Z")] })).toBeNull();
+    expect(retentionEntry({ ...base, appointed: true })).toBeNull();
+    expect(retentionEntry({ ...base, openReviewRequest: true })).toBeNull();
   });
 
   it("uses the latest of several applications", () => {
-    const e = retentionEntry({ ...base, applications: [closedApp("2026-03-01T00:00:00Z"), closedApp("2026-01-01T00:00:00Z")] }, NOW);
+    const e = retentionEntry({ ...base, applications: [closedApp("2026-03-01T00:00:00Z"), closedApp("2026-01-01T00:00:00Z")] });
     expect(e).toMatchObject({ purgeAfter: "2026-09-01", basis: "application_closed" });
   });
 });
 
 describe("when an application ends for retention (notice: 6 months after the round closes)", () => {
   it("a closed application ends when it closed, or when its round closed if later", () => {
-    expect(applicationEnd(closedApp("2026-02-01T09:00:00Z"), NOW)).toEqual({ at: new Date("2026-02-01T09:00:00Z"), basis: "application_closed" });
-    expect(applicationEnd(closedApp("2026-02-01T09:00:00Z", { roundClosedAt: "2026-03-15T00:00:00Z" }), NOW)).toEqual({
+    expect(applicationEnd(closedApp("2026-02-01T09:00:00Z"))).toEqual({ at: new Date("2026-02-01T09:00:00Z"), basis: "application_closed" });
+    expect(applicationEnd(closedApp("2026-02-01T09:00:00Z", { roundClosedAt: "2026-03-15T00:00:00Z" }))).toEqual({
       at: new Date("2026-03-15T00:00:00Z"),
       basis: "round_closed",
     });
     // A round that closed before the rejection doesn't move the clock back.
-    expect(applicationEnd(closedApp("2026-02-01T09:00:00Z", { roundClosedAt: "2026-01-15T00:00:00Z" }), NOW)?.basis).toBe("application_closed");
+    expect(applicationEnd(closedApp("2026-02-01T09:00:00Z", { roundClosedAt: "2026-01-15T00:00:00Z" }))?.basis).toBe("application_closed");
   });
 
-  it("an application left in play on a closed round ends at the later of the close and its last activity", () => {
-    expect(applicationEnd(openApp("2026-01-10T00:00:00Z", { roundClosedAt: "2026-02-01T00:00:00Z" }), NOW)).toEqual({
-      at: new Date("2026-02-01T00:00:00Z"),
-      basis: "round_closed",
+  it("an application still in play never starts the clock, however idle and whatever its round", () => {
+    // Idle for years on an open round.
+    expect(applicationEnd(openApp("2023-09-01T00:00:00Z"))).toBeNull();
+    // Mid-pipeline (e.g. an accepted offer never advanced to closed) when the role was made inactive.
+    expect(applicationEnd(openApp("2026-01-10T00:00:00Z", { roundClosedAt: "2026-02-01T00:00:00Z" }))).toBeNull();
+    const idle = retentionEntry({ ...base, lastActivity: "2023-09-01T00:00:00Z", applications: [openApp("2023-09-01T00:00:00Z")] });
+    expect(idle).toBeNull();
+    const roundClosed = retentionEntry({
+      ...base,
+      lastActivity: "2025-01-01T00:00:00Z",
+      applications: [closedApp("2025-01-01T00:00:00Z"), openApp("2025-02-01T00:00:00Z", { roundClosedAt: "2025-03-01T00:00:00Z" })],
     });
-    expect(applicationEnd(openApp("2026-05-10T00:00:00Z", { roundClosedAt: "2026-02-01T00:00:00Z" }), NOW)?.at).toEqual(new Date("2026-05-10T00:00:00Z"));
+    expect(roundClosed).toBeNull();
   });
 
-  it("an application in play on an open round lapses after 6 months without activity", () => {
-    expect(STALE_MONTHS).toBe(6);
-    expect(applicationEnd(openApp("2026-05-01T00:00:00Z"), NOW)).toBeNull(); // 5 months idle: still in play
-    expect(applicationEnd(openApp("2026-04-08T12:00:00Z"), NOW)).toEqual({ at: new Date("2026-10-08T12:00:00Z"), basis: "inactive" });
-    // An abandoned application three years old: purged 6 months after it lapsed.
-    const old = retentionEntry({ ...base, lastActivity: "2023-09-01T00:00:00Z", applications: [openApp("2023-09-01T00:00:00Z")] }, NOW);
-    expect(old).toEqual({ purgeAfter: "2024-09-01", basisAt: "2024-03-01T00:00:00.000Z", basis: "inactive" });
+  it("an idle application an admin closed as lapsed counts from the lapse", () => {
+    const lapsed = closedApp("2026-03-20T10:00:00Z", { activeAt: "2025-11-02T00:00:00Z" });
+    expect(retentionEntry({ ...base, lastActivity: "2025-11-02T00:00:00Z", applications: [lapsed] })).toEqual({
+      purgeAfter: "2026-09-20",
+      basisAt: "2026-03-20T10:00:00.000Z",
+      basis: "application_closed",
+    });
+  });
+
+  it("an old closed row without a close time falls back to its last activity", () => {
+    expect(applicationEnd({ closed: true, closedAt: null, roundClosedAt: null, activeAt: "2026-01-05T00:00:00Z" })).toEqual({
+      at: new Date("2026-01-05T00:00:00Z"),
+      basis: "application_closed",
+    });
   });
 
   it("adds months to timestamps keeping the time of day, clamped like Postgres", () => {
@@ -139,33 +151,39 @@ describe("when an application ends for retention (notice: 6 months after the rou
   });
 });
 
-describe("purge batches (resumed purges can't starve new ones)", () => {
+describe("purge batches (time-bounded runs: resumed purges can't starve new ones)", () => {
   const stuck = (n: number) =>
     Array.from({ length: n }, (_, i) => ({ userId: `s${i}`, attempts: 3, startedAt: `2026-01-${String(i + 1).padStart(2, "0")}T00:00:00Z` }));
   const due = (n: number) => Array.from({ length: n }, (_, i) => `d${i}`);
 
-  it("gives unfinished purges at most half the run when people are newly due", () => {
-    const batch = purgeBatch(stuck(30), due(30), 25);
-    expect(batch).toHaveLength(25);
-    expect(batch.filter((id) => id.startsWith("s"))).toHaveLength(12);
-    expect(batch.filter((id) => id.startsWith("d"))).toHaveLength(13);
+  it("alternates unfinished purges with the newly due, so a run cut short by its deadline has done both", () => {
+    const batch = purgeBatch(stuck(30), due(30), 1000);
+    expect(batch).toHaveLength(60);
+    expect(batch.slice(0, 6)).toEqual(["s0", "d0", "s1", "d1", "s2", "d2"]);
+    // Wherever the deadline stops the run, unfinished purges have had at most half (rounded up).
+    for (let k = 1; k <= batch.length; k++) {
+      expect(batch.slice(0, k).filter((id) => id.startsWith("s")).length).toBeLessThanOrEqual(Math.ceil(k / 2));
+    }
   });
 
-  it("lets unfinished purges use the room the newly due don't need, fewest failures first", () => {
+  it("a large backlog is not held back by a small count: the deadline decides", () => {
+    expect(purgeBatch([], due(400), 1000)).toHaveLength(400);
+  });
+
+  it("orders unfinished purges by fewest failures and gives either side the room the other doesn't need", () => {
     const resuming = [
       { userId: "a", attempts: 5, startedAt: "2026-01-01T00:00:00Z" },
       { userId: "b", attempts: 0, startedAt: "2026-02-01T00:00:00Z" },
       { userId: "c", attempts: 1, startedAt: "2026-01-15T00:00:00Z" },
     ];
-    expect(purgeBatch(resuming, ["d0"], 25)).toEqual(["b", "c", "a", "d0"]);
-    expect(purgeBatch(resuming, due(3), 4)).toEqual(["b", "c", "d0", "d1"]);
-    expect(purgeBatch(resuming, ["d0"], 4)).toEqual(["b", "c", "d0", "a"]);
+    expect(purgeBatch(resuming, ["d0"], 25)).toEqual(["b", "d0", "c", "a"]);
+    expect(purgeBatch(resuming, due(3), 4)).toEqual(["b", "d0", "c", "d1"]);
     expect(purgeBatch(resuming, [], 2)).toEqual(["b", "c"]);
     expect(purgeBatch([], due(3), 2)).toEqual(["d0", "d1"]);
     expect(purgeBatch(resuming, due(3), 0)).toEqual([]);
   });
 
   it("never lists someone twice", () => {
-    expect(purgeBatch([{ userId: "x", attempts: 0, startedAt: "2026-01-01T00:00:00Z" }], ["x", "y"], 5)).toEqual(["x", "y"]);
+    expect(purgeBatch([{ userId: "x", attempts: 0, startedAt: "2026-01-01T00:00:00Z" }], ["x", "y", "y"], 5)).toEqual(["x", "y"]);
   });
 });

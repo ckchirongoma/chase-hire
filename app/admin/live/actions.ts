@@ -5,8 +5,8 @@ import { requireAdmin } from "@/lib/server/auth";
 import { refreshQuietly, refreshScores } from "@/lib/server/scores";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { cleanScores, formatNotes, isScoredKind, kindsForRole, scorecardTotal, type ScoredKind } from "@/lib/live/scorecard";
-import { deltaNeedsDiscussion, LIVE_ITEM_COUNT, liveDelta, livePercentile } from "@/lib/live/retest";
-import { LIVE_STAGES, loadApplication, onlineReasoning, questionsFor, recordedRetest } from "@/lib/server/live";
+import { deltaNeedsDiscussion, LIVE_ITEM_COUNT } from "@/lib/live/retest";
+import { LIVE_STAGES, loadApplication, questionsFor, recordedRetest } from "@/lib/server/live";
 
 /**
  * Live-stage writes (docs/09 §2 and §5). Scorecards are written through the admin's own client,
@@ -16,6 +16,17 @@ import { LIVE_STAGES, loadApplication, onlineReasoning, questionsFor, recordedRe
  */
 
 const FINAL = "This scorecard is submitted and final. It can't be edited.";
+
+/** Plain-language messages for the scorecard guard's errors (migration 0019). */
+function guardMessage(m: string): string {
+  if (/scorecard_already_submitted/.test(m)) return FINAL;
+  if (/application_not_at_live_stage/.test(m)) return "This application is not at the shortlist or live stage.";
+  if (/scorecard_questions_mismatch/.test(m)) return "The questions on this card changed (the bank or the candidate's verification concerns): reload the page and score again.";
+  if (/scorecard_scores_missing/.test(m)) return "Score every question before submitting.";
+  if (/scorecard_scores_invalid/.test(m)) return "Scores must be whole numbers from 1 to 5, for this card's questions only.";
+  if (/scorecard_kind_not_for_role|scorecard_kind_unsupported/.test(m)) return "This application's role has no such scorecard.";
+  return m;
+}
 
 const go = (path: string, params: Record<string, string>, hash = ""): never => {
   const q = new URLSearchParams(params);
@@ -55,8 +66,11 @@ export async function saveScorecard(formData: FormData) {
   if (intent === "submit" && missing.length) go(back, { error: `Score every question before submitting (missing: ${missing.join(", ")}).` }, kind);
 
   const notes = formatNotes(Object.fromEntries(keys.map((k) => [k, field(`note:${k}`).slice(0, 4000)])), field("notes").slice(0, 8000), keys);
+  // The database recomputes the total on submit (migration 0019) and checks the scores against
+  // the card's questions; the value here is what the page shows until then.
   const row = {
     scores,
+    question_keys: keys,
     total: scorecardTotal(scores, keys),
     notes,
     submitted_at: intent === "submit" ? new Date().toISOString() : null,
@@ -75,10 +89,7 @@ export async function saveScorecard(formData: FormData) {
   const write = mine
     ? await supabase.from("live_scorecards").update(row).eq("id", mine.id).select("id")
     : await supabase.from("live_scorecards").insert({ application_id: appId, kind, ...row }).select("id");
-  if (write.error) {
-    const m = write.error.message;
-    go(back, { error: /scorecard_already_submitted/.test(m) ? FINAL : /scorecard_scores_(invalid|missing)/.test(m) ? "Scores must be whole numbers from 1 to 5, at least one." : m }, kind);
-  }
+  if (write.error) go(back, { error: guardMessage(write.error.message) }, kind);
   if (!write.data?.length) go(back, { error: "The scorecard was not saved." }, kind);
 
   if (intent === "submit") {
@@ -110,57 +121,59 @@ const Retest = z.object({
 
 /**
  * Records the paper retest: raw 0–12 → live percentile (live norm) → live_delta = online − live.
- * One retest per candidate, stored as a final reasoning_retest scorecard and on
- * applications.live_delta. A delta above 25 logs a live_delta signal FOR DISCUSSION. Not part of
- * any composite (docs/09 §2).
+ * One retest per candidate, stored as a final reasoning_retest scorecard; the database derives the
+ * percentiles and the delta from the raw score and sets applications.live_delta (migration 0019).
+ * A delta above 25 logs a live_delta signal FOR DISCUSSION. Not part of any composite (docs/09 §2).
  */
 export async function recordRetest(formData: FormData) {
   const { supabase } = await requireAdmin();
   const appIdRaw = String(formData.get("application_id") ?? "");
-  const parsed = Retest.safeParse({ application_id: appIdRaw, raw: String(formData.get("raw") ?? ""), seed: String(formData.get("seed") ?? "") });
+  const seedRaw = String(formData.get("seed") ?? "");
+  const parsed = Retest.safeParse({ application_id: appIdRaw, raw: String(formData.get("raw") ?? ""), seed: seedRaw });
   const back = z.uuid().safeParse(appIdRaw).success ? `/admin/live/${appIdRaw}/retest` : "/admin/live";
-  if (!parsed.success) go(back, { error: parsed.error.issues[0].message });
+  // Errors go back to the SAME printed form (its seed), so the recorded seed matches the paper.
+  const keep: Record<string, string> = /^\d{1,10}$/.test(seedRaw) ? { seed: seedRaw } : {};
+  const fail = (error: string): never => go(back, { error, ...keep });
+  if (!parsed.success) fail(parsed.error.issues[0].message);
   const { application_id: appId, raw, seed } = parsed.data!;
 
   const app = await loadApplication(supabase, appId);
   if (!app) go("/admin/live", { error: "Application not found." });
-  if (!(LIVE_STAGES as readonly string[]).includes(app!.stage)) go(back, { error: "This application is not at the shortlist or live stage." });
+  if (!(LIVE_STAGES as readonly string[]).includes(app!.stage)) fail("This application is not at the shortlist or live stage.");
 
   // One retest per candidate (DB guard): the first recorded count is the result, so live_delta
   // and its signal can't be silently replaced by a second entry.
   const service = createAdminClient();
-  if (await recordedRetest(service, appId)) go(back, { error: RETEST_FINAL });
+  if (await recordedRetest(service, appId)) fail(RETEST_FINAL);
 
-  const online = await onlineReasoning(supabase, app!.user_id);
-  const live = livePercentile(raw);
-  const delta = liveDelta(online?.percentile, live.percentile);
-  const row = {
-    scores: { raw, seed, norm_version: live.normVersion, online_percentile: online?.percentile ?? null, live_percentile: live.percentile, delta },
-    total: live.percentile,
-    notes: null,
-    submitted_at: new Date().toISOString(),
-  };
-  const write = await supabase.from("live_scorecards").insert({ application_id: appId, kind: "reasoning_retest", ...row }).select("id");
-  if (write.error) go(back, { error: /retest_already_recorded|scorecard_already_submitted|duplicate key/.test(write.error.message) ? RETEST_FINAL : write.error.message });
+  const write = await supabase
+    .from("live_scorecards")
+    .insert({ application_id: appId, kind: "reasoning_retest", scores: { raw, seed }, notes: null, submitted_at: new Date().toISOString() })
+    .select("id");
+  if (write.error) {
+    const m = write.error.message;
+    fail(/retest_already_recorded|scorecard_already_submitted|duplicate key/.test(m) ? RETEST_FINAL : /application_not_at_live_stage/.test(m) ? "This application is not at the shortlist or live stage." : m);
+  }
+  // What the database recorded (percentiles and delta derived from the raw score).
+  const recorded = await recordedRetest(service, appId);
+  if (!recorded || recorded.livePercentile === null) fail("The retest was not recorded.");
+  const { livePercentile: live, onlinePercentile: online, delta, normVersion } = recorded!;
 
-  // applications has no admin UPDATE policy: the service role writes live_delta after the admin check.
-  const { error: upErr } = await service.from("applications").update({ live_delta: delta }).eq("id", appId);
-  if (upErr) go(back, { error: `Retest saved, but live_delta could not be stored: ${upErr.message}` });
   if (deltaNeedsDiscussion(delta)) {
     const { error: sigErr } = await service.from("signals").insert({
       user_id: app!.user_id,
       context: "live_retest",
       kind: "live_delta",
-      payload: { application_id: appId, online_percentile: online?.percentile ?? null, live_percentile: live.percentile, delta, raw, seed, norm_version: live.normVersion },
+      payload: { application_id: appId, online_percentile: online, live_percentile: live, delta, raw, seed, norm_version: normVersion },
     });
     if (sigErr) console.warn("could not log live_delta signal", sigErr.message);
   }
 
   const summary =
     delta === null
-      ? `Retest recorded: ${raw}/${LIVE_ITEM_COUNT}, live percentile ${live.percentile}. No online attempt to compare with.`
-      : `Retest recorded: ${raw}/${LIVE_ITEM_COUNT}, live percentile ${live.percentile}, delta ${delta}.${deltaNeedsDiscussion(delta) ? " Flagged for discussion in the room (not a rejection)." : ""}`;
-  go(back, { ok: summary });
+      ? `Retest recorded: ${raw}/${LIVE_ITEM_COUNT}, live percentile ${live}. No online attempt to compare with.`
+      : `Retest recorded: ${raw}/${LIVE_ITEM_COUNT}, live percentile ${live}, delta ${delta}.${deltaNeedsDiscussion(delta) ? " Flagged for discussion in the room (not a rejection)." : ""}`;
+  go(back, { ok: summary, seed: String(seed) });
 }
 
 // ───────────────────────── Bank ─────────────────────────

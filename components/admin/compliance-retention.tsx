@@ -3,9 +3,10 @@ import { fmtDate, STAGE_LABEL, STATUS_LABEL } from "@/lib/format";
 import type { InProgressPurge, PurgeLogEntry, QueueEntry, StaleApplication } from "@/lib/server/compliance";
 import type { PlannedPurge } from "@/lib/server/retention";
 
-/** Display pieces for the retention section of /admin/compliance (server components). */
-
-const short = (hash: string) => `${hash.slice(0, 12)}…`;
+/**
+ * Display pieces for the retention section of /admin/compliance (server components). Nothing
+ * here shows a hashed id: a purged person is matched only through the e-mail lookup.
+ */
 
 const COUNT_LABEL: Record<string, string> = {
   decisions_archived: "decisions archived",
@@ -77,20 +78,19 @@ export function InProgressTable({ rows }: { rows: InProgressPurge[] }) {
     <div className="space-y-2">
       <h3 className="font-semibold">Purges in progress ({rows.length})</h3>
       <p className="muted">
-        These stopped halfway (for example a storage error) and are picked up again on the next run (up to half of each run, so
-        they never hold up people newly due). Until the account is deleted, every run re-checks the rules first and undoes the
-        purge if the person is no longer due; meanwhile their applications can&apos;t be re-opened. Files are deleted again on
-        every run, so a late upload is caught. An error naming a table means a row keyed by the person survived the cascade:
-        fix the cause, then run the purge again.
+        These stopped halfway (for example a storage error) and are picked up again on the next run, taking turns with the
+        people newly due so they never hold them up. Until the account is deleted, every run re-checks the rules first and,
+        if the person is no longer due, lifts the account suspension and undoes the purge; meanwhile their applications
+        can&apos;t be re-opened. Files are deleted again on every run, so a late upload is caught. An error naming a table means
+        a row keyed by the person survived the cascade: fix the cause, then run the purge again.
       </p>
       <table className="table" data-testid="purges-in-progress">
         <thead>
-          <tr><th>Hashed id</th><th>Started</th><th>Step</th><th>Attempts</th><th>Last error</th></tr>
+          <tr><th>Started</th><th>Step</th><th>Attempts</th><th>Last error</th></tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.userId}>
-              <td className="font-mono text-xs">{short(r.hash)}</td>
+          {rows.map((r, i) => (
+            <tr key={`${r.startedAt}-${i}`}>
               <td>{fmtDate(r.startedAt)}</td>
               <td>{r.step}</td>
               <td>{r.attempts}</td>
@@ -108,7 +108,7 @@ export function PurgeLogTable({ rows }: { rows: PurgeLogEntry[] }) {
   return (
     <table className="table" data-testid="purge-log">
       <thead>
-        <tr><th>Purged</th><th>Hashed id</th><th>Scope</th><th>What went</th><th>By</th></tr>
+        <tr><th>When</th><th>Scope</th><th>What went</th><th>By</th></tr>
       </thead>
       <tbody>
         {rows.map((r) => {
@@ -121,7 +121,6 @@ export function PurgeLogTable({ rows }: { rows: PurgeLogEntry[] }) {
             return (
               <tr key={r.id}>
                 <td>{fmtDate(r.purgedAt)}</td>
-                <td className="font-mono text-xs">{short(r.hash)}</td>
                 <td>cancelled</td>
                 <td className="muted">
                   No longer due ({String(d.reason ?? "")}): the archived decisions and held answers were removed; nothing was
@@ -131,10 +130,19 @@ export function PurgeLogTable({ rows }: { rows: PurgeLogEntry[] }) {
               </tr>
             );
           }
+          if (r.scope === "late_upload") {
+            return (
+              <tr key={r.id}>
+                <td>{fmtDate(r.purgedAt)}</td>
+                <td>late upload</td>
+                <td>Files that arrived after an earlier purge finished: {storageSummary(d.storage_objects_deleted)}</td>
+                <td>{by}</td>
+              </tr>
+            );
+          }
           return (
             <tr key={r.id}>
               <td>{fmtDate(r.purgedAt)}</td>
-              <td className="font-mono text-xs">{short(r.hash)}</td>
               <td>{r.scope}</td>
               <td>
                 {[...counts, `files: ${storageSummary(d.storage_objects_deleted)}`].join("; ")}
@@ -149,24 +157,46 @@ export function PurgeLogTable({ rows }: { rows: PurgeLogEntry[] }) {
   );
 }
 
-export function StaleApplicationsTable({ rows }: { rows: StaleApplication[] }) {
+/**
+ * Idle applications still in play, with a form to close the ticked ones as lapsed (one written
+ * reason for the batch; each application gets its own decision row, which the candidate sees).
+ */
+export function StaleApplicationsTable({ rows, action }: { rows: StaleApplication[]; action: (formData: FormData) => Promise<void> }) {
   if (!rows.length) return <p className="muted">None: every application in play has had activity in the last 3 months.</p>;
   return (
-    <table className="table" data-testid="stale-applications">
-      <thead>
-        <tr><th>Candidate</th><th>Role</th><th>Stage</th><th>Last activity</th><th>Counts as ended for retention</th></tr>
-      </thead>
-      <tbody>
-        {rows.map((r) => (
-          <tr key={r.applicationId}>
-            <td><Link href={`/admin/candidates/${r.userId}`} className="underline">{r.name}</Link></td>
-            <td>{r.role ?? "—"}{r.roundClosedAt && <div className="muted">round closed {fmtDate(r.roundClosedAt)}</div>}</td>
-            <td>{STAGE_LABEL[r.stage] ?? r.stage} · {STATUS_LABEL[r.status] ?? r.status}</td>
-            <td>{fmtDate(r.lastActivity)}</td>
-            <td>{fmtDate(r.retentionFrom)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <form action={action} className="space-y-3">
+      <table className="table" data-testid="stale-applications">
+        <thead>
+          <tr><th>Close</th><th>Candidate</th><th>Role</th><th>Stage</th><th>Last activity</th></tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.applicationId}>
+              <td><input type="checkbox" name="application_id" value={r.applicationId} aria-label={`Close ${r.name}'s application`} /></td>
+              <td><Link href={`/admin/candidates/${r.userId}`} className="underline">{r.name}</Link></td>
+              <td>{r.role ?? "—"}{r.roundClosedAt && <div className="muted">round closed {fmtDate(r.roundClosedAt)}</div>}</td>
+              <td>{STAGE_LABEL[r.stage] ?? r.stage} · {STATUS_LABEL[r.status] ?? r.status}</td>
+              <td>{fmtDate(r.lastActivity)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex flex-wrap items-end gap-3 text-sm">
+        <label className="min-w-[20rem] flex-1">
+          <span className="label">Reason (at least 20 characters; the candidate sees it with the decision)</span>
+          <input
+            name="reason"
+            required
+            minLength={20}
+            className="input w-full"
+            placeholder="e.g. No response to the quiz invitation or our two follow-ups since June."
+          />
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" name="ack" required /> Close the ticked applications as lapsed
+        </label>
+        <button className="btn-secondary">Close as lapsed</button>
+      </div>
+    </form>
   );
 }

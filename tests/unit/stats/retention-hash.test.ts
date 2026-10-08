@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hashUserId, retentionPepper } from "@/lib/server/retention";
+import { hashUserId, hmacEmail, normaliseEmail, retentionPepper } from "@/lib/server/retention";
 
 const ID = "6f1c2b9e-1d2a-4c55-9a3e-0b7f2a1c9d10";
 
@@ -38,5 +38,18 @@ describe("hashed ids for the decision archive and purge log (docs/12)", () => {
     vi.stubEnv("NODE_ENV", "development");
     vi.stubEnv("VITEST", "");
     expect(() => retentionPepper()).toThrow(/RETENTION_PEPPER/);
+  });
+
+  it("keys the archive by an HMAC of the normalised e-mail, which a disputant can give later", () => {
+    const pepper = "a-long-server-only-pepper";
+    expect(normaliseEmail("  Thandi.Nkosi@Example.CO.ZA ")).toBe("thandi.nkosi@example.co.za");
+    const key = hmacEmail("thandi.nkosi@example.co.za", pepper);
+    expect(key).toBe(createHmac("sha256", pepper).update("thandi.nkosi@example.co.za").digest("hex"));
+    expect(key).toMatch(/^[0-9a-f]{64}$/);
+    // Case and surrounding spaces don't matter; the pepper does, and it isn't a plain hash.
+    expect(hmacEmail(" THANDI.NKOSI@example.co.za", pepper)).toBe(key);
+    expect(hmacEmail("thandi.nkosi@example.co.za", `${pepper}x`)).not.toBe(key);
+    expect(key).not.toBe(createHash("sha256").update("thandi.nkosi@example.co.za").digest("hex"));
+    expect(hmacEmail("other@example.co.za", pepper)).not.toBe(key);
   });
 });

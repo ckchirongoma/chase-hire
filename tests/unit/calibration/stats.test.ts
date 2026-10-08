@@ -155,6 +155,19 @@ describe("criterionStats", () => {
     expect(s.mean_human).toBe(3.4);
   });
 
+  it("QWK is the mean of the AI's kappa against each human: half-point human means are not rounded", () => {
+    const h = [1, 2, 3, 4, 5, 1, 2, 3, 4, 5];
+    const up = h.map((x) => Math.min(5, x + 1));
+    const down = h.map((x) => Math.max(1, x - 1));
+    // The AI agrees with one human in both cases, and is one point from the other: above, or below.
+    const above = criterionStats(pairs(h, h, up));
+    const below = criterionStats(pairs(h, down, h));
+    expect(above.qwk).toBe(below.qwk);
+    const expected = (quadraticWeightedKappa(h, h)! + quadraticWeightedKappa(h, up)!) / 2;
+    expect(above.qwk).toBe(Math.round(expected * 1000) / 1000);
+    expect(above.qwk!).toBeLessThan(1);
+  });
+
   it("leaves out samples without an AI score or without both human scores, and says so", () => {
     const ai: (number | null)[] = [...HUMAN];
     ai[0] = null;

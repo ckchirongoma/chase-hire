@@ -36,7 +36,8 @@ export default function CalibrationReport({ run, changed }: { run: CalibrationRu
       </p>
       {changed.length > 0 && (
         <p className="notice">
-          Changed since this run: {changed.join("; ")}. Re-run the gold set before relying on these statuses (CLAUDE.md: any rubric, prompt or model change).
+          Changed since this run: {changed.join("; ")}. These statuses no longer measure the current grader: every new grade is flagged &quot;calibration: stale&quot;
+          for a person (human-only criteria stay human-only) until you re-run the gold set (CLAUDE.md: any rubric, prompt or model change).
         </p>
       )}
       {run.error && <p className="muted">Note: {run.error}</p>}
@@ -47,7 +48,7 @@ export default function CalibrationReport({ run, changed }: { run: CalibrationRu
               <th>Criterion</th>
               <th title="Gold samples with an AI score and both human scores">n</th>
               <th title="ICC(2,1), absolute agreement: AI final vs mean human">ICC</th>
-              <th title="Quadratic weighted kappa on the 1–5 scale (scores rounded)">QWK</th>
+              <th title="Quadratic weighted kappa on the 1–5 scale: mean of AI vs rater 1 and AI vs rater 2">QWK</th>
               <th title="Human rater 1 vs rater 2, ICC(2,1)">Human ICC</th>
               <th>Mean AI / human</th>
               <th>Go-live status</th>
@@ -102,7 +103,9 @@ export default function CalibrationReport({ run, changed }: { run: CalibrationRu
       </div>
       <p className="muted text-xs">
         Go-live rule (docs/09 §8): ICC ≥ {ICC_LIVE} live; {ICC_REVIEW}–{ICC_LIVE} live with mandatory human review (every grade of that criterion is flagged
-        &quot;calibration: review&quot;); below {ICC_REVIEW}, or fewer than {MIN_GOLD} usable gold samples, human-scored only (flagged &quot;calibration: human_only&quot;).
+        &quot;calibration: review&quot;); below {ICC_REVIEW}, or fewer than {MIN_GOLD} usable gold samples, human-scored only (flagged &quot;calibration: human_only&quot;;
+        the AI score is kept as evidence but doesn&apos;t count until a person scores the criterion). Finishing a run applies these statuses to the grades already
+        stored for candidates still in play.
         Agreement bands: below .50 poor, .50–.75 moderate, .75–.90 good.
       </p>
     </div>

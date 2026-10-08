@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GET as sweep } from "@/app/api/cron/sweep/route";
-import { hashUserId, listObjects, purgeDue, refreshRetentionQueue, retentionPepper } from "@/lib/server/retention";
+import { hashUserId, hmacEmail, listObjects, purgeDue, refreshRetentionQueue, retentionPepper } from "@/lib/server/retention";
 import { purgeAfter, utcDay } from "@/lib/stats/retention";
 import { anon, consent, fakeFinishedAttempt, fakeParsedCv, makeAdmin, newUser as newUserRaw, psql, service } from "../helpers/local";
 
@@ -14,12 +14,26 @@ async function newUser(tag: string) {
   created.push(u.id);
   return u;
 }
+/** Roles this file creates (inactive test roles), removed afterwards. */
+const createdRoles: string[] = [];
 afterAll(() => {
-  if (!created.length) return;
-  const ids = created.map((id) => `'${id}'`).join(",");
-  // Candidates first: an admin can't go while their decisions (on those candidates) exist.
-  psql(`delete from auth.users u where u.id in (${ids}) and not exists (select 1 from public.admins a where a.user_id = u.id);
-        delete from auth.users where id in (${ids});`);
+  // This run's accounts, plus any an earlier run of this file left behind.
+  const leftovers = psql(`select id from auth.users where email ~ '^(ret-[a-z0-9-]+|retention-admin)\\.[0-9]+\\.[0-9]+@example\\.co\\.za$'`)
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+  const all = [...new Set([...created, ...leftovers])];
+  if (all.length) {
+    const ids = all.map((id) => `'${id}'`).join(",");
+    // Decisions first (staff accounts here are named on other test candidates' decisions, a
+    // reference without ON DELETE), then the applications, then candidates, then admins.
+    psql(`delete from public.decisions where decided_by in (${ids}) or application_id in (select id from public.applications where user_id in (${ids}));
+          update public.review_requests set responded_by = null where responded_by in (${ids});
+          delete from public.applications where user_id in (${ids});
+          delete from auth.users u where u.id in (${ids}) and not exists (select 1 from public.admins a where a.user_id = u.id);
+          delete from auth.users where id in (${ids});`);
+  }
+  if (createdRoles.length) psql(`delete from public.roles where id in (${createdRoles.map((id) => `'${id}'`).join(",")});`);
 });
 const SWE = "software-engineer";
 
@@ -296,6 +310,89 @@ describe("retention queue rules (docs/12, notice: 6 months, 12 for the talent po
   });
 });
 
+describe("applications in play are never queued (hard rule 3: only an admin closes one, with a reason)", () => {
+  it("keeps idle and closed-round applications off the queue; an admin lapse with a written reason starts the clock", async () => {
+    // A role whose hiring round closed 7 months ago (made inactive), with someone mid-pipeline:
+    // offer accepted but never advanced to appointed.
+    const slug = `ret-role-${randomUUID().slice(0, 8)}`;
+    const { data: role, error: roleErr } = await admin
+      .from("roles")
+      .insert({ slug, title: "Retention test role", summary: "Test only.", salary_min: 1, salary_max: 1, active: false })
+      .select("id")
+      .single();
+    if (roleErr) throw roleErr;
+    createdRoles.push(role.id as string);
+    seed(`update public.roles set round_closed_at = now() - interval '7 months' where id = '${role.id}';`);
+
+    const offer = await newUser("ret-offer");
+    await consent(offer.client);
+    await fakeParsedCv(offer.id);
+    await fakeFinishedAttempt(offer.id, 4);
+    const offerApp = randomUUID();
+    seed(`
+      insert into public.applications (id, user_id, role_id, stage, status) values ('${offerApp}', '${offer.id}', '${role.id}', 'offer', 'advanced');
+      insert into public.decisions (application_id, stage, decision, reason, decided_by, decided_at)
+        values ('${offerApp}', 'live', 'advance', 'Test setup: strong live panel on all four criteria.', '${boss.id}', now() - interval '8 months');`);
+    backdate(offer.id, 9);
+
+    // Shortlisted on an open role, then nothing for 13 months.
+    const idle = await applicant("ret-idle");
+    seed(`
+      update public.applications set stage = 'shortlist', status = 'advanced' where id = '${idle.appId}';
+      insert into public.decisions (application_id, stage, decision, reason, decided_by, decided_at)
+        values ('${idle.appId}', 'work_2', 'advance', 'Test setup: SWE Test 2 memo met the bar on costing.', '${boss.id}', now() - interval '13 months');`);
+    backdate(idle.id, 14);
+
+    await refreshRetentionQueue(admin);
+    expect(await queueRow(offer.id)).toBeNull();
+    expect(await queueRow(idle.id)).toBeNull();
+    const { data: sched } = await admin.rpc("retention_schedule", { p_user_ids: [offer.id, idle.id] });
+    expect(sched).toEqual([]);
+    // Even far in the future, a purge refuses them, and a run leaves both applications alone.
+    const { data: refused } = await admin.rpc("retention_begin_purge", { p_user_id: offer.id, p_hash: hashUserId(offer.id), p_today: "2100-01-01" });
+    expect(refused).toMatchObject({ status: "not_eligible" });
+    const run = await purgeDue(admin, { userIds: [offer.id, idle.id], now: new Date("2100-01-01T00:00:00Z") });
+    expect(run.outcomes).toEqual([]);
+    expect(one(`select count(*) from public.applications where id in ('${offerApp}', '${idle.appId}')`)).toBe("2");
+    expect(one(`select count(*) from public.retention_purges where user_id in ('${offer.id}', '${idle.id}')`)).toBe("0");
+
+    // Both are on the admin's to-do list.
+    const { data: stale, error: staleErr } = await boss.client.rpc("retention_stale_applications", { p_months: 3 });
+    expect(staleErr).toBeNull();
+    const staleIds = (stale as { application_id: string }[]).map((r) => r.application_id);
+    expect(staleIds).toEqual(expect.arrayContaining([offerApp, idle.appId]));
+    expect(Object.keys((stale as object[])[0]).sort()).toEqual(
+      ["application_id", "last_activity", "role_slug", "round_closed_at", "stage", "status", "user_id"].sort(),
+    );
+
+    // Closing as lapsed: admin only, with a written reason, only while in play.
+    const reason = "No response to our two follow-ups since the shortlist email.";
+    const { error: candErr } = await idle.client.rpc("admin_lapse_applications", { p_application_ids: [idle.appId], p_reason: reason });
+    expect(candErr?.message).toMatch(/admin_only/);
+    const { error: shortErr } = await boss.client.rpc("admin_lapse_applications", { p_application_ids: [idle.appId], p_reason: "idle" });
+    expect(shortErr?.message).toMatch(/reason_too_short/);
+    const { data: n, error: lapseErr } = await boss.client.rpc("admin_lapse_applications", { p_application_ids: [idle.appId], p_reason: reason });
+    expect(lapseErr).toBeNull();
+    expect(n).toBe(1);
+    expect(one(`select status || '|' || stage || '|' || (closed_at is not null) from public.applications where id = '${idle.appId}'`)).toBe("lapsed|shortlist|true");
+    expect(one(`select decision || '|' || stage || '|' || reason || '|' || (decided_by = '${boss.id}') from public.decisions where application_id = '${idle.appId}' order by decided_at desc limit 1`)).toBe(
+      `lapse|shortlist|${reason}|true`,
+    );
+    const { error: againErr } = await boss.client.rpc("admin_lapse_applications", { p_application_ids: [idle.appId], p_reason: reason });
+    expect(againErr?.message).toMatch(/application_not_in_play/);
+
+    // The clock starts from the lapse; the offer is still in play and still off the queue.
+    await refreshRetentionQueue(admin);
+    const lapsed = await queueRow(idle.id);
+    expect(lapsed).toMatchObject({ reason: "Not appointed: 6 months after the application closed" });
+    expect(lapsed!.purge_after).toBe(purgeAfter(closedAtOf(idle.appId), false));
+    expect(lapsed!.purge_after > utcDay()).toBe(true);
+    expect(await queueRow(offer.id)).toBeNull();
+    const { data: staleAfter } = await boss.client.rpc("retention_stale_applications", { p_months: 3 });
+    expect((staleAfter as { application_id: string }[]).map((r) => r.application_id)).not.toContain(idle.appId);
+  });
+});
+
 describe("purge (docs/12 §1 retention automation)", () => {
   it("a dry run reports who and what would go, and changes nothing", async () => {
     const u = await fullCandidate("ret-dry");
@@ -353,6 +450,16 @@ describe("purge (docs/12 §1 retention automation)", () => {
     expect(dec).toHaveLength(1);
     expect(dec![0]).toMatchObject({ role_slug: SWE, stage: "quiz", decision: "reject", reason: "Test setup: below the quiz bar on two of the topics." });
     expect(JSON.stringify(dec)).not.toContain(u.id);
+    // Also keyed by an HMAC of the e-mail address, which a disputant can give later: an admin
+    // finds the log through the lookup (case and spaces don't matter), never by a hash.
+    expect(dec![0].subject_hmac).toBe(hmacEmail(u.email));
+    const { data: found, error: lookErr } = await boss.client.rpc("retention_archive_lookup", { p_subject_hmac: hmacEmail(` ${u.email.toUpperCase()} `) });
+    expect(lookErr).toBeNull();
+    expect(found).toMatchObject({
+      purges: [{ scope: "candidate" }],
+      decisions: [{ role_slug: SWE, stage: "quiz", decision: "reject", reason: "Test setup: below the quiz bar on two of the topics." }],
+    });
+    expect(JSON.stringify(found)).not.toMatch(new RegExp(`${u.id}|${hash}`));
 
     // Item responses: 3 reasoning (unanswered counts as wrong) + 2 quiz, with a fresh attempt ref,
     // held until at least 5 finished purges can be released together.
@@ -491,16 +598,120 @@ describe("purge (docs/12 §1 retention automation)", () => {
     expect(retry.outcomes[0]).toMatchObject({ status: "purged", resumed: true });
   });
 
+  it("undoes a purge whose person is no longer due, lifting the suspension before the state row goes", async () => {
+    const u = await fullCandidate("ret-cancel");
+    const hash = hashUserId(u.id);
+    const { data: started } = await admin.rpc("retention_begin_purge", { p_user_id: u.id, p_hash: hash, p_today: utcDay(), p_subject_hmac: hmacEmail(u.email) });
+    expect(started).toMatchObject({ status: "started" });
+    // As a run does before deleting the account: note the suspension, then suspend.
+    await admin.rpc("retention_note_progress", { p_user_id: u.id, p_step: "ban" });
+    const { error: banErr } = await admin.auth.admin.updateUserById(u.id, { ban_duration: "876000h" });
+    expect(banErr).toBeNull();
+    expect(one(`select banned_at is not null from public.retention_purges where user_id = '${u.id}'`)).toBe("t");
+
+    // They become active again (a new consent today), so they are no longer due.
+    seed(`insert into public.consents (user_id, notice_version, accepted_processing, accepted_ai_assessment, accepted_offshore_processing)
+          values ('${u.id}', 'test', true, true, true);`);
+    // The database reports "cancel" but keeps the row (and the block on re-opening) until the
+    // server has lifted the suspension.
+    const { data: again } = await admin.rpc("retention_begin_purge", { p_user_id: u.id, p_hash: hash, p_today: utcDay() });
+    expect(again).toMatchObject({ status: "cancel", reason: "not_due" });
+    expect(one(`select count(*) from public.retention_purges where user_id = '${u.id}'`)).toBe("1");
+
+    const report = await purgeDue(admin, { userIds: [u.id] });
+    expect(report.outcomes).toEqual([{ userIdHash: hash, status: "skipped", reason: "cancelled (not_due)" }]);
+    expect(one(`select count(*) from public.retention_purges where user_id = '${u.id}'`)).toBe("0");
+    expect(one(`select count(*) from public.decision_archive where user_id_hash = '${hash}'`)).toBe("0");
+    expect(one(`select scope from public.purge_log where user_id_hash = '${hash}'`)).toBe("cancelled");
+    // The account is back: not banned, and they can sign in.
+    expect(one(`select coalesce(banned_until::text, 'none') from auth.users where id = '${u.id}'`)).toBe("none");
+    const { error: signInErr } = await anon().auth.signInWithPassword({ email: u.email, password: "test-password-123" });
+    expect(signInErr).toBeNull();
+    expect(storageCount([u.id, u.sub])).toBe(4);
+  });
+
+  it("refuses uploads under a purged id, and deletes files that arrived after the purge anyway", async () => {
+    const u = await applicant("ret-late");
+    // A consenting candidate can upload their work (positive control for the policy).
+    const own = await u.client.storage.from("submissions").upload(`${u.id}/before/memo.md`, Buffer.from("# memo"), { contentType: "text/markdown" });
+    expect(own.error).toBeNull();
+    rejectAt(u.appId, boss.id, 7);
+    backdate(u.id, 8);
+    const report = await purgeDue(admin, { userIds: [u.id] });
+    expect(report.outcomes[0]).toMatchObject({ status: "purged" });
+
+    // Their access token is still valid for a while, but the account and consent are gone.
+    const late = await u.client.storage.from("submissions").upload(`${u.id}/late.txt`, Buffer.from("late"), { contentType: "text/plain" });
+    expect(late.error).not.toBeNull();
+    expect(storageCount([u.id])).toBe(0);
+
+    // A server-side upload that was already past its auth check (e.g. an interview answer).
+    await upload("interview-audio", `${u.id}/s1/turn-9.webm`, "audio", "audio/webm");
+    expect(storageCount([u.id])).toBe(1);
+    const next = await purgeDue(admin, { userIds: [u.id] });
+    expect(next.outcomes).toEqual([]);
+    expect(next.lateUploads.cleared).toBeGreaterThanOrEqual(1);
+    expect(storageCount([u.id])).toBe(0);
+    const { data: log } = await admin.from("purge_log").select("scope, detail").eq("user_id_hash", hashUserId(u.id)).order("purged_at");
+    expect(log!.map((l) => l.scope)).toEqual(["candidate", "late_upload"]);
+    expect(log![1].detail).toMatchObject({ storage_objects_deleted: { "interview-audio": 1 } });
+
+    // Files under an id that was never purged (another account deleted by other means) are left alone.
+    const stranger = randomUUID();
+    await upload("cvs", `${stranger}/cv.pdf`, "%PDF-1.4", "application/pdf");
+    try {
+      await purgeDue(admin, { userIds: [stranger] });
+      expect(storageCount([stranger])).toBe(1);
+    } finally {
+      await admin.storage.from("cvs").remove([`${stranger}/cv.pdf`]);
+    }
+  });
+
+  it("keeps the queue current while purges are paused for a missing pepper", async () => {
+    const u = await applicant("ret-nopepper");
+    rejectAt(u.appId, boss.id, 2);
+    backdate(u.id, 3);
+    seed(`delete from public.retention_queue where user_id = '${u.id}';`);
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("RETENTION_PEPPER", "");
+    try {
+      await expect(purgeDue(admin, { userIds: [u.id] })).rejects.toThrow(/RETENTION_PEPPER/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect((await queueRow(u.id))?.purge_after).toBe(purgeAfter(closedAtOf(u.appId), false));
+  });
+
+  it("archives decision reasons with e-mail addresses and phone numbers blanked", () => {
+    expect(one(`select public.retention_scrub_reason('Spoke to jo.soap+x@mail.example.com and on +27 82 555 1234; quiz below the bar.')`)).toBe(
+      "Spoke to [e-mail removed] and on [number removed]; quiz below the bar.",
+    );
+    expect(one(`select public.retention_scrub_reason('Below the bar on 2 of 4 topics (score 41/100).')`)).toBe("Below the bar on 2 of 4 topics (score 41/100).");
+  });
+
   it("candidates and the public can't read the retention tables or run the purge functions", async () => {
     const cand = await newUser("ret-snoop");
     await consent(cand.client);
     const pub = anon();
-    for (const table of ["retention_queue", "purge_log", "decision_archive", "item_response_archive", "retention_purges"]) {
-      const c = await cand.client.from(table).select("*").limit(5);
-      expect(c.error).toBeNull();
+    // The columns admins may read (the hashed keys are server-only).
+    const readable: Record<string, string> = {
+      retention_queue: "*",
+      purge_log: "id, purged_at, scope, detail",
+      decision_archive: "id, role_slug, stage, decision, reason, decided_at, archived_at",
+      item_response_archive: "*",
+    };
+    for (const [table, cols] of Object.entries(readable)) {
+      const c = await cand.client.from(table).select(cols).limit(5);
+      expect(c.error, table).toBeNull();
       expect(c.data).toEqual([]);
-      const a = await pub.from(table).select("*").limit(5);
+      const a = await pub.from(table).select(cols).limit(5);
       expect(a.data ?? []).toEqual([]);
+    }
+    for (const client of [cand.client, pub, boss.client]) {
+      const r = await client.from("retention_purges").select("user_id").limit(5);
+      expect(r.data ?? []).toEqual([]);
+      expect(r.error).not.toBeNull();
     }
     for (const [fn, args] of [
       ["refresh_retention_queue", {}],
@@ -508,7 +719,13 @@ describe("purge (docs/12 §1 retention automation)", () => {
       ["retention_preview", { p_user_ids: [cand.id] }],
       ["retention_begin_purge", { p_user_id: cand.id, p_hash: "0".repeat(64), p_today: "2100-01-01" }],
       ["retention_note_progress", { p_user_id: cand.id, p_step: "auth" }],
+      ["retention_cancel", { p_user_id: cand.id, p_reason: "x" }],
       ["retention_finish_purge", { p_user_id: cand.id }],
+      ["retention_expire_archive", {}],
+      ["retention_orphan_prefixes", {}],
+      ["retention_in_progress", {}],
+      ["retention_archive_lookup", { p_subject_hmac: "0".repeat(64) }],
+      ["admin_lapse_applications", { p_application_ids: [randomUUID()], p_reason: "Not an admin, so this must fail." }],
       ["refresh_reasoning_item_stats", {}],
     ] as const) {
       const { error } = await cand.client.rpc(fn, args);
@@ -516,9 +733,16 @@ describe("purge (docs/12 §1 retention automation)", () => {
       const { error: anonErr } = await pub.rpc(fn, args);
       expect(anonErr, fn).not.toBeNull();
     }
-    // Admins see the queue and the log (read-only), and still can't run a purge step directly.
-    const { error: adminRead } = await boss.client.from("purge_log").select("id").limit(1);
+    // Admins see the queue, the log's dates and counts and the archived decisions (read-only),
+    // never the hashed keys, and still can't run a purge step directly.
+    const { error: adminRead } = await boss.client.from("purge_log").select("id, purged_at, scope, detail").limit(1);
     expect(adminRead).toBeNull();
+    for (const [table, col] of [["purge_log", "user_id_hash"], ["purge_log", "subject_hmac"], ["decision_archive", "user_id_hash"], ["decision_archive", "subject_hmac"]]) {
+      const { error } = await boss.client.from(table).select(col).limit(1);
+      expect(error, `${table}.${col}`).not.toBeNull();
+    }
+    const { error: progErr } = await boss.client.rpc("retention_in_progress");
+    expect(progErr).toBeNull();
     const { error: adminRpc } = await boss.client.rpc("retention_begin_purge", { p_user_id: cand.id, p_hash: "0".repeat(64), p_today: "2100-01-01" });
     expect(adminRpc).not.toBeNull();
   });
@@ -534,14 +758,18 @@ describe("purge (docs/12 §1 retention automation)", () => {
     let body = await run();
     expect(typeof body.itemStats).toBe("number");
     expect(typeof body.scoresUpdated).toBe("number");
-    expect(body.retention).toMatchObject({ failed: 0 });
+    expect(body.retention).toMatchObject({ failed: 0, stoppedAtDeadline: false, remaining: 0 });
     expect(body.retention.purged).toBeGreaterThanOrEqual(1);
+    expect(typeof body.retention.archiveExpired).toBe("number");
+    expect(body.retention.lateUploads).toMatchObject({ checked: expect.any(Number), cleared: expect.any(Number) });
     expect(body.errors).toEqual([]);
-    // Bounded per run: leftovers from earlier test runs may need another pass.
-    for (let i = 0; i < 4 && body.retention.remaining > 0; i++) body = await run();
     const { data: gone } = await admin.auth.admin.getUserById(u.id);
     expect(gone.user ?? null).toBeNull();
     const { data: log } = await admin.from("purge_log").select("detail").eq("user_id_hash", hashUserId(u.id)).single();
     expect(log!.detail).toMatchObject({ triggered_by: "sweep" });
-  });
+    // No fixed count per run: everyone due is purged within the run's time (leftovers from
+    // earlier test runs included), so a second run has nothing of this left.
+    body = await run();
+    expect(body.retention).toMatchObject({ failed: 0, remaining: 0, stoppedAtDeadline: false });
+  }, 280_000);
 });

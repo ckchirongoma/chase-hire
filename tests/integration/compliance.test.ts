@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({ client: null as unknown }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: async () => h.client }));
 
-import { purgeNow } from "@/app/admin/compliance/actions";
+import { lapseApplications, lookupDispute, purgeNow } from "@/app/admin/compliance/actions";
 import { recomputeItemStats } from "@/app/admin/banks/actions";
 import { deleteDemographics, saveDemographics } from "@/app/me/demographics/actions";
 import { DEMOGRAPHICS_NOTICE_VERSION } from "@/app/me/demographics/notice";
@@ -24,8 +24,11 @@ async function newUser(tag: string) {
 afterAll(() => {
   if (!created.length) return;
   const ids = created.map((id) => `'${id}'`).join(",");
-  // Candidates first: an admin can't go while their decisions (on those candidates) exist.
-  psql(`delete from auth.users u where u.id in (${ids}) and not exists (select 1 from public.admins a where a.user_id = u.id);
+  // Decisions the admin made go first (decided_by has no ON DELETE), then candidates, then admins.
+  psql(`delete from public.decisions where decided_by in (${ids}) or application_id in (select id from public.applications where user_id in (${ids}));
+        update public.review_requests set responded_by = null where responded_by in (${ids});
+        delete from public.applications where user_id in (${ids});
+        delete from auth.users u where u.id in (${ids}) and not exists (select 1 from public.admins a where a.user_id = u.id);
         delete from auth.users where id in (${ids});`);
 });
 
@@ -83,7 +86,7 @@ describe("adverse impact report (docs/09 §9)", () => {
   let roleId: string;
   let seeded: string[] = [];
 
-  // Test data only: remove the 75 seeded people (cascades their applications, decisions and
+  // Test data only: remove the 100 seeded people (cascades their applications, decisions and
   // demographics) and the role, so repeated runs don't grow the shared database.
   afterAll(() => {
     if (seeded.length) psql(`delete from auth.users where id in (${seeded.map((id) => `'${id}'`).join(",")});`);
@@ -101,45 +104,62 @@ describe("adverse impact report (docs/09 §9)", () => {
 
     // Gender at the quiz stage, decided by an admin:
     //   female 32 (24 advanced = .75), male 30 (12 advanced = .40, ratio .53: flagged),
-    //   non-binary 4 and not disclosed 6 (both under 30: never returned).
-    // Plus three female applications that must not count: two only held, one undecided.
+    //   non-binary 12 and not disclosed 20 (both under 30: never returned; together 32, so the
+    //   people outside the shown groups are not a small remainder).
+    // Population group: african for the first 40 of those 94 and white for the next 40; the last
+    //   14 didn't say: a remainder of 1 to 29, so nothing comes back for that dimension.
+    // Plus six female applications that must not count at the quiz: two only held, one
+    // undecided, one rejected and then re-opened with a hold, one whose advance released a hold
+    // before the quiz was done (so it is still at the quiz), and one closed as lapsed.
     const groups: { gender: string | null; n: number; advanced: number }[] = [
       { gender: "female", n: 32, advanced: 24 },
       { gender: "male", n: 30, advanced: 12 },
-      { gender: "non_binary", n: 4, advanced: 4 },
-      { gender: null, n: 6, advanced: 1 },
+      { gender: "non_binary", n: 12, advanced: 12 },
+      { gender: null, n: 20, advanced: 5 },
     ];
-    const total = groups.reduce((a, g) => a + g.n, 0) + 3;
+    const extras = 6;
+    const total = groups.reduce((a, g) => a + g.n, 0) + extras;
     const ids = await bulkUsers("ai", total);
     seeded = ids;
     const sql: string[] = [];
     let k = 0;
     const reason = "Test setup: decided on the quiz topic scores and the evidence.";
+    const decide = (app: string, stage: string, decision: string, ago: string) =>
+      sql.push(`insert into public.decisions (application_id, stage, decision, reason, decided_by, decided_at) values ('${app}', '${stage}', '${decision}', '${reason}', '${boss.id}', now() - interval '${ago}');`);
     for (const g of groups) {
       for (let i = 0; i < g.n; i++, k++) {
         const uid = ids[k];
         const app = randomUUID();
         const adv = i < g.advanced;
-        if (g.gender) sql.push(`insert into public.demographics (user_id, gender) values ('${uid}', '${g.gender}');`);
-        sql.push(`insert into public.applications (id, user_id, role_id, stage, status) values ('${app}', '${uid}', '${roleId}', '${adv ? "work_1" : "quiz"}', '${adv ? "advanced" : "rejected"}');`);
-        if (g.gender === "female" && i === 0) {
-          // Rejected first, then advanced on review: the latest decision counts.
-          sql.push(`insert into public.decisions (application_id, stage, decision, reason, decided_by, decided_at) values ('${app}', 'quiz', 'reject', '${reason}', '${boss.id}', now() - interval '2 hours');`);
+        const population = k < 40 ? "african" : k < 80 ? "white" : null;
+        if (g.gender || population) {
+          sql.push(`insert into public.demographics (user_id, gender, population_group) values ('${uid}', ${g.gender ? `'${g.gender}'` : "null"}, ${population ? `'${population}'` : "null"});`);
         }
-        sql.push(`insert into public.decisions (application_id, stage, decision, reason, decided_by, decided_at) values ('${app}', 'quiz', '${adv ? "advance" : "reject"}', '${reason}', '${boss.id}', now() - interval '1 hour');`);
+        sql.push(`insert into public.applications (id, user_id, role_id, stage, status) values ('${app}', '${uid}', '${roleId}', '${adv ? "work_1" : "quiz"}', '${adv ? "advanced" : "rejected"}');`);
+        // Rejected first, then advanced on review: the latest decision counts.
+        if (g.gender === "female" && i === 0) decide(app, "quiz", "reject", "2 hours");
+        decide(app, "quiz", adv ? "advance" : "reject", "1 hour");
         // An earlier stage's decision must not leak into the quiz report.
-        sql.push(`insert into public.decisions (application_id, stage, decision, reason, decided_by) values ('${app}', 'interview', 'advance', '${reason}', '${boss.id}');`);
+        decide(app, "interview", "advance", "3 hours");
       }
     }
-    for (let i = 0; i < 3; i++, k++) {
-      const uid = ids[k];
+    const extra: [string, string, [string, string][]][] = [
+      ["quiz", "awaiting_review", [["hold", "1 hour"]]],
+      ["quiz", "awaiting_review", [["hold", "1 hour"]]],
+      ["quiz", "in_progress", []],
+      ["quiz", "awaiting_review", [["reject", "2 hours"], ["hold", "1 hour"]]],
+      ["quiz", "advanced", [["hold", "2 hours"], ["advance", "1 hour"]]],
+      ["quiz", "lapsed", [["lapse", "1 hour"]]],
+    ];
+    for (const [stage, status, decisions] of extra) {
+      const uid = ids[k++];
       const app = randomUUID();
       sql.push(`insert into public.demographics (user_id, gender) values ('${uid}', 'female');`);
-      sql.push(`insert into public.applications (id, user_id, role_id, stage, status) values ('${app}', '${uid}', '${roleId}', 'quiz', 'awaiting_review');`);
-      if (i < 2) sql.push(`insert into public.decisions (application_id, stage, decision, reason, decided_by) values ('${app}', 'quiz', 'hold', '${reason}', '${boss.id}');`);
+      sql.push(`insert into public.applications (id, user_id, role_id, stage, status) values ('${app}', '${uid}', '${roleId}', '${stage}', '${status}');`);
+      for (const [decision, ago] of decisions) decide(app, "quiz", decision, ago);
     }
     seed(sql.join("\n"));
-  }, 60_000);
+  }, 90_000);
 
   it("reports decided applications per group, leaves out groups under 30 and flags the four-fifths breach", async () => {
     const r = await adverseImpact(boss.client, "quiz", "gender", { role: slug });
@@ -170,13 +190,31 @@ describe("adverse impact report (docs/09 §9)", () => {
   });
 
   it("returns nothing when a group's complement is under 30 (everyone in one group here)", async () => {
-    // Nobody in this cohort disclosed a population group or disability: "not disclosed" holds
-    // all 72, so showing it would tell an admin every person's answer.
-    for (const dimension of ["population_group", "disability"] as const) {
-      const r = await adverseImpact(boss.client, "quiz", dimension, { role: slug });
+    // Nobody in this cohort disclosed a disability: "not disclosed" holds all 94, so showing it
+    // would tell an admin every person's answer.
+    const r = await adverseImpact(boss.client, "quiz", "disability", { role: slug });
+    expect(r.rows).toEqual([]);
+    expect(r.decided).toBe(0);
+  });
+
+  it("returns nothing when the people outside the shown groups number 1 to 29", async () => {
+    // african 40 and white 40 would each pass on their own (complements of 54), but the 14 who
+    // didn't say could then be counted (and their advances worked out) from the pipeline totals.
+    expect(psql(`select count(*) from public.demographics d join public.applications a on a.user_id = d.user_id
+                 join public.roles r on r.id = a.role_id where r.slug = '${slug}' and d.population_group in ('african', 'white')`).trim()).toBe("80");
+    for (const stage of ["quiz", "interview"] as const) {
+      const r = await adverseImpact(boss.client, stage, "population_group", { role: slug });
       expect(r.rows).toEqual([]);
-      expect(r.decided).toBe(0);
     }
+  });
+
+  it("holds, lapses, undecided applications and an advance that left them at the stage are not decisions", async () => {
+    // The six extra female applications would make female 33 or more (a re-opened rejection
+    // counted as rejected, the in-place advance as advanced): the report keeps 32 / 24.
+    const r = await adverseImpact(boss.client, "quiz", "gender", { role: slug });
+    expect(r.rows.find((x) => x.group === "female")).toMatchObject({ candidates: 32, advanced: 24 });
+    expect(psql(`select count(*) from public.decisions d join public.applications a on a.id = d.application_id
+                 join public.roles r on r.id = a.role_id where r.slug = '${slug}' and d.decision = 'lapse'`).trim()).toBe("1");
   });
 
   it("filters by whole cohort months and role, and refuses free date ranges", async () => {
@@ -273,12 +311,35 @@ describe("demographics (separate consent, owner only)", () => {
 
     expect(psql(`select gender from public.demographics where user_id = '${a.id}'`).trim()).toBe("male");
 
-    // Admins get totals only.
+    // Admins get totals only, and never a count from 1 to 29 (the consent promises totals for
+    // groups of 30 or more): compared with the true counts, each is shown exactly when safe.
     const cov = await demographicsCoverage(boss.client);
+    const raw = psql(`
+      with base as (select distinct c.user_id from public.consents c where not exists (select 1 from public.admins ad where ad.user_id = c.user_id)),
+           resp as (select d.* from public.demographics d join base b on b.user_id = d.user_id)
+      select x.dim || '|' || (select count(*) from resp) || '|' || x.disclosed || '|' || x.prefer_not || '|' || x.blank
+      from (
+        select 'disability' as dim, count(*) filter (where disability <> 'prefer_not') as disclosed, count(*) filter (where disability = 'prefer_not') as prefer_not, count(*) filter (where disability is null) as blank from resp
+        union all
+        select 'gender', count(*) filter (where gender <> 'prefer_not'), count(*) filter (where gender = 'prefer_not'), count(*) filter (where gender is null) from resp
+        union all
+        select 'population_group', count(*) filter (where population_group <> 'prefer_not'), count(*) filter (where population_group = 'prefer_not'), count(*) filter (where population_group is null) from resp
+      ) x order by 1`)
+      .trim()
+      .split("\n")
+      .map((line) => line.split("|"));
+    const safe = (n: number) => n === 0 || n >= 30;
+    const respondents = Number(raw[0][1]);
     expect(cov.candidates).toBeGreaterThanOrEqual(2);
-    expect(cov.respondents).toBeGreaterThanOrEqual(1);
+    expect(cov.respondents).toBe(safe(respondents) ? respondents : null);
     expect(cov.dimensions.map((d) => d.dimension)).toEqual(["disability", "gender", "population_group"]);
     expect(Object.keys(cov.dimensions[0]).sort()).toEqual(["dimension", "disclosed", "notAnswered", "preferNot"]);
+    for (const [i, d] of cov.dimensions.entries()) {
+      const [, , disclosed, preferNot, blank] = raw[i].map(Number);
+      const ok = safe(respondents) && safe(disclosed) && safe(preferNot) && safe(blank);
+      expect([d.disclosed, d.preferNot, d.notAnswered]).toEqual(ok ? [disclosed, preferNot, blank] : [null, null, null]);
+      for (const v of [d.disclosed, d.preferNot, d.notAnswered]) if (v !== null) expect(safe(v)).toBe(true);
+    }
     const { error: candCov } = await a.client.rpc("demographics_coverage");
     expect(candCov?.message).toMatch(/admin_only/);
 
@@ -369,11 +430,61 @@ describe("admin pages and actions", () => {
     expect(param(wrong, "ok")).toBeNull();
   });
 
+  it("closing idle applications as lapsed needs an admin, a written reason and the tick box", async () => {
+    const [uid] = await bulkUsers("lapse", 1);
+    const { data: role, error: roleErr } = await admin
+      .from("roles")
+      .insert({ slug: `lapse-${randomUUID().slice(0, 8)}`, title: "Lapse test role", summary: "Test only.", salary_min: 1, salary_max: 1, active: false })
+      .select("id")
+      .single();
+    if (roleErr) throw roleErr;
+    const app = randomUUID();
+    seed(`insert into public.applications (id, user_id, role_id, stage, status) values ('${app}', '${uid}', '${role.id}', 'quiz', 'in_progress');`);
+    const reason = "No reply to three reminders since July.";
+    const lapseForm = (fields: Record<string, string>, apps: string[]) => {
+      const f = form(fields);
+      for (const id of apps) f.append("application_id", id);
+      return f;
+    };
+    try {
+      const cand = await newUser("lapse-cand");
+      h.client = cand.client;
+      expect(await outcome(lapseApplications(lapseForm({ reason, ack: "on" }, [app])))).toBe("404");
+
+      h.client = boss.client;
+      expect(param(await outcome(lapseApplications(lapseForm({ reason: "too short", ack: "on" }, [app]))), "error")).toMatch(/20 characters/);
+      expect(param(await outcome(lapseApplications(lapseForm({ reason, ack: "on" }, []))), "error")).toMatch(/Tick at least one/);
+      expect(param(await outcome(lapseApplications(lapseForm({ reason }, [app]))), "error")).toMatch(/Tick the box/);
+      expect(psql(`select status from public.applications where id = '${app}'`).trim()).toBe("in_progress");
+
+      const done = await outcome(lapseApplications(lapseForm({ reason, ack: "on" }, [app])));
+      expect(param(done, "ok")).toMatch(/Closed 1 application as lapsed/);
+      expect(psql(`select status || '|' || (closed_at is not null) from public.applications where id = '${app}'`).trim()).toBe("lapsed|true");
+      expect(psql(`select decision || '|' || reason from public.decisions where application_id = '${app}'`).trim()).toBe(`lapse|${reason}`);
+      // Already closed: the database refuses and the page says why.
+      expect(param(await outcome(lapseApplications(lapseForm({ reason, ack: "on" }, [app]))), "error")).toMatch(/application_not_in_play/);
+    } finally {
+      psql(`delete from public.decisions where application_id = '${app}'; delete from auth.users where id = '${uid}'; delete from public.roles where id = '${role.id}';`);
+    }
+  });
+
+  it("the dispute lookup is admin-only and finds nothing for an address never purged", async () => {
+    h.client = boss.client;
+    const none = await lookupDispute({ status: "idle" }, form({ email: " Never-Purged@example.co.za " }));
+    expect(none).toEqual({ status: "found", email: "Never-Purged@example.co.za", result: { purges: [], decisions: [] } });
+    expect(await lookupDispute({ status: "idle" }, form({ email: "not an address" }))).toMatchObject({ status: "error" });
+    const cand = await newUser("lookup-cand");
+    h.client = cand.client;
+    expect(await outcome(lookupDispute({ status: "idle" }, form({ email: "x@example.co.za" })))).toBe("404");
+  });
+
   it("the compliance data loads for an admin and is refused to anyone else", async () => {
     const [overview, impact] = await Promise.all([retentionOverview(boss.client), adverseImpactAll(boss.client)]);
     expect(overview.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(overview.queued).toBeGreaterThanOrEqual(overview.dueNow);
+    expect(overview.oldestDue === null || overview.oldestDue <= overview.today).toBe(true);
     expect(Array.isArray(overview.log)).toBe(true);
+    for (const entry of overview.log) expect(Object.keys(entry).sort()).toEqual(["detail", "id", "purgedAt", "scope"]);
     expect(impact).toHaveLength(8 * 3);
     for (const r of impact) for (const row of r.rows) expect(row.candidates ?? 30).toBeGreaterThanOrEqual(30);
 

@@ -1,5 +1,5 @@
 import "server-only";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { all, inChunks } from "@/lib/server/query";
@@ -9,20 +9,22 @@ import { purgeBatch, utcDay } from "@/lib/stats/retention";
  * Retention purge (docs/12 §1 "Retention automation", the notice in lib/consent/notice.ts).
  *
  * The schedule lives in the database (public.retention_schedule; see migration
- * 20261007000018 for the rules): not appointed → 6 months after the application ended (closed,
- * its round closed, or abandoned for 6 months), talent pool → 12 months, never admins or former
- * staff, never anyone with an application in play or an open review request.
- * refreshRetentionQueue() mirrors it into retention_queue nightly.
+ * 20261007000018 for the rules): not appointed → 6 months after every application of theirs
+ * closed (or its round closed, if later), talent pool → 12 months, never admins or former staff,
+ * never anyone with an application still in play (only an admin closes one, with a written
+ * reason) or an open review request. refreshRetentionQueue() mirrors it into retention_queue.
  *
  * purgeDue() purges everyone whose date has arrived, one person at a time, in this order:
  *   1. retention_begin_purge (one transaction): re-check the rules, archive the decisions to
- *      decision_archive under sha256(user_id + RETENTION_PEPPER), hold the item responses for
+ *      decision_archive under sha256(user_id + RETENTION_PEPPER) and an HMAC of the normalised
+ *      e-mail (the key a disputant can give later: lookupArchive), hold the item responses for
  *      the anonymised archive (released later in shuffled batches of 5+ people), and record the
  *      purge in retention_purges (no foreign key, so it outlives the auth user). From here the
  *      database refuses to re-open, start or dispute any of their applications. Reversible;
  *   2. suspend (ban) the account, then retention_prepare_auth_delete: re-check the rules again
- *      (cancel and undo step 1 if they no longer apply) and refresh the submission and interview
- *      ids from the live tables;
+ *      and refresh the submission and interview ids from the live tables. If the rules no longer
+ *      apply (at this step or when resuming), the suspension is lifted first and only then is
+ *      the purge undone (retention_cancel), so a failed lift is retried on the next run;
  *   3. delete the auth user (cascades every table keyed by them, dedupe flags on both sides);
  *   4. delete their storage objects in every bucket ({user_id}/… everywhere, plus
  *      snapshots/{submission_id}/…), listed with pagination and checked empty afterwards. This
@@ -30,14 +32,18 @@ import { purgeBatch, utcDay } from "@/lib/stats/retention";
  *   5. retention_finish_purge: delete their grades, verify nothing keyed by them survived (any
  *      uuid column, any storage object), write purge_log and drop the state row.
  * Every step is idempotent. A purge that stopped halfway is resumed on the next run (re-checking
- * the rules first while the account still exists); resumed purges get at most half of a run, so
- * stuck ones never starve the people newly due. A deadline stops a run from starting new purges.
+ * the rules first while the account still exists); resumed purges alternate with the people
+ * newly due, so stuck ones never starve them. Runs are bounded by time: a deadline stops a run
+ * from starting new purges, so a backlog (a bulk rejection falling due on one day) clears within
+ * a run or two instead of a fixed number a day. Each real run also drops archived decisions older
+ * than 3 years (docs/12) and deletes files uploaded under a purged id after its purge finished.
  * The service-role client is required: call only from the cron sweep or after requireAdmin().
  */
 
 const PAGE = 100;
 const REMOVE_CHUNK = 100;
-export const RETENTION_SWEEP_LIMIT = 25;
+/** A safety bound on one run; the run's deadline normally ends it first. */
+export const RETENTION_RUN_LIMIT = 1000;
 const TEST_PEPPER = "chase-hire-test-pepper-not-for-production";
 /** "Banned" for ~100 years: no sign-in or token refresh while the purge finishes. */
 const BAN_DURATION = "876000h";
@@ -62,6 +68,20 @@ export function retentionPepper(): string {
 /** sha256(user_id + pepper), hex. The same person always maps to the same hash. */
 export function hashUserId(userId: string, pepper: string = retentionPepper()): string {
   return createHash("sha256").update(userId + pepper).digest("hex");
+}
+
+/** The e-mail form the archive key is computed from: trimmed, lower case. */
+export function normaliseEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+/**
+ * HMAC-SHA256(pepper, normalised e-mail), hex: the key the decision archive and purge log can
+ * be matched by when someone disputes a decision after their purge (they know their e-mail
+ * address; nobody keeps their user id). Only the server can compute it.
+ */
+export function hmacEmail(email: string, pepper: string = retentionPepper()): string {
+  return createHmac("sha256", pepper).update(normaliseEmail(email)).digest("hex");
 }
 
 /** Mirrors the schedule into retention_queue; returns how many people are queued. */
@@ -146,7 +166,7 @@ async function clearStorage(admin: SupabaseClient, userId: string, submissionIds
 // ───────────────────────── Purge ─────────────────────────
 
 const PurgeState = z.object({
-  status: z.enum(["started", "resumed", "cancelled", "not_due", "not_eligible"]),
+  status: z.enum(["started", "resumed", "cancel", "not_due", "not_eligible"]),
   user_id: z.string(),
   reason: z.string().nullish(),
   submission_ids: z.array(z.string()).nullish(),
@@ -154,11 +174,12 @@ const PurgeState = z.object({
   auth_deleted_at: z.string().nullish(),
   counts: z.record(z.string(), z.unknown()).nullish(),
   purge_after: z.string().nullish(),
+  banned_at: z.string().nullish(),
 });
 
 const Prepared = z.discriminatedUnion("status", [
   z.object({ status: z.literal("ready"), submission_ids: z.array(z.string()), interview_ids: z.array(z.string()) }),
-  z.object({ status: z.literal("cancelled"), reason: z.string() }),
+  z.object({ status: z.literal("cancel"), reason: z.string(), banned_at: z.string().nullish() }),
 ]);
 
 const PreviewRow = z.object({
@@ -175,7 +196,7 @@ export type PurgeOptions = {
   now?: Date;
   /** Report what would be purged; change nothing. */
   dryRun?: boolean;
-  /** At most this many people per call (the sweep's bound). Default 25. */
+  /** At most this many people per call (a safety bound; the deadline normally ends a run). Default 1000. */
   limit?: number;
   /** Only these people (tests and targeted runs). */
   userIds?: readonly string[];
@@ -216,7 +237,13 @@ export type PurgeReport = {
   remaining: number;
   /** The run stopped early because the deadline came. */
   stoppedAtDeadline: boolean;
+  /** Archived decisions older than 3 years removed this run. */
+  archiveExpired: number;
+  /** Files uploaded under a purged id after the purge finished, deleted this run. */
+  lateUploads: LateUploads;
 };
+
+export type LateUploads = { checked: number; cleared: number; objects: number };
 
 type DueRow = { user_id: string; purge_after: string; reason: string };
 type Resuming = { userId: string; attempts: number; startedAt: string };
@@ -300,9 +327,30 @@ async function deleteAuthUser(admin: SupabaseClient, userId: string): Promise<vo
   throw new RetentionError(`could not delete the auth user: ${error.message}.${hint}`);
 }
 
-async function note(admin: SupabaseClient, userId: string, step: "storage" | "auth" | "error", counts: Record<string, unknown> = {}, err?: string) {
+async function note(admin: SupabaseClient, userId: string, step: "ban" | "storage" | "auth" | "error", counts: Record<string, unknown> = {}, err?: string) {
   const { error } = await admin.rpc("retention_note_progress", { p_user_id: userId, p_step: step, p_counts: counts, p_error: err ?? null });
   if (error) throw new RetentionError(`retention_note_progress: ${error.message}`);
+}
+
+/** The archive key for a person still in auth.users (null once the account is gone). */
+async function subjectHmac(admin: SupabaseClient, userId: string, pepper: string): Promise<string | null> {
+  const { data, error } = await admin.auth.admin.getUserById(userId);
+  if (error) {
+    if (notFound(error as { message: string; status?: number })) return null;
+    throw new RetentionError(`could not read the account: ${error.message}`);
+  }
+  return data.user?.email ? hmacEmail(data.user.email, pepper) : null;
+}
+
+/**
+ * The person is no longer due: lift the suspension (if this purge set one) and only then undo
+ * the purge. retention_cancel drops the state row, so lifting first means a failed lift leaves
+ * the purge in progress with the error noted, and the next run tries again.
+ */
+async function cancelPurge(admin: SupabaseClient, userId: string, reason: string, bannedAt: string | null | undefined): Promise<void> {
+  if (bannedAt) await setBan(admin, userId, false);
+  const { error } = await admin.rpc("retention_cancel", { p_user_id: userId, p_reason: reason });
+  if (error) throw new RetentionError(`retention_cancel: ${error.message}`);
 }
 
 /** Purges one person (or finishes a purge that stopped halfway). */
@@ -310,27 +358,34 @@ async function purgeOne(admin: SupabaseClient, userId: string, today: string, pe
   const userIdHash = hashUserId(userId, pepper);
   let begun = false;
   try {
-    const { data, error } = await admin.rpc("retention_begin_purge", { p_user_id: userId, p_hash: userIdHash, p_today: today });
+    const subject = await subjectHmac(admin, userId, pepper);
+    const { data, error } = await admin.rpc("retention_begin_purge", {
+      p_user_id: userId,
+      p_hash: userIdHash,
+      p_today: today,
+      p_subject_hmac: subject,
+    });
     if (error) throw new RetentionError(`retention_begin_purge: ${error.message}`);
     const state = PurgeState.parse(data);
     if (state.status === "not_due" || state.status === "not_eligible") {
       return { userIdHash, status: "skipped", reason: state.status };
     }
-    if (state.status === "cancelled") {
-      // An earlier run suspended the account; the person is no longer due, so lift it.
-      await setBan(admin, userId, false);
-      return { userIdHash, status: "skipped", reason: `cancelled (${state.reason ?? "no longer due"})` };
-    }
     begun = true;
+    if (state.status === "cancel") {
+      const why = state.reason ?? "no longer due";
+      await cancelPurge(admin, userId, why, state.banned_at);
+      return { userIdHash, status: "skipped", reason: `cancelled (${why})` };
+    }
     let submissionIds = state.submission_ids ?? [];
     if (!state.auth_deleted_at) {
+      // Noted before the ban, so a cancelled purge always knows to lift it.
+      await note(admin, userId, "ban");
       await setBan(admin, userId, true);
       const { data: prepData, error: prepErr } = await admin.rpc("retention_prepare_auth_delete", { p_user_id: userId, p_today: today });
       if (prepErr) throw new RetentionError(`retention_prepare_auth_delete: ${prepErr.message}`);
       const prep = Prepared.parse(prepData);
-      if (prep.status === "cancelled") {
-        begun = false;
-        await setBan(admin, userId, false);
+      if (prep.status === "cancel") {
+        await cancelPurge(admin, userId, prep.reason, prep.banned_at ?? new Date().toISOString());
         return { userIdHash, status: "skipped", reason: `cancelled (${prep.reason})` };
       }
       submissionIds = prep.submission_ids;
@@ -363,15 +418,85 @@ async function purgeOne(admin: SupabaseClient, userId: string, today: string, pe
   }
 }
 
+const OrphanRow = z.object({ bucket_id: z.string(), prefix: z.string(), objects: z.coerce.number() });
+
 /**
- * Purges everyone whose purge date has passed (bounded by `limit` and `deadline`), resuming
- * interrupted purges too (at most half the run while others are newly due). With dryRun,
+ * Files that arrived under a purged id after the purge finished (a request already past its
+ * auth check when the account went). Only prefixes whose hashed id is in purge_log as a finished
+ * purge are touched; their files are deleted in every bucket and the deletion is logged under
+ * the same hashed id (scope "late_upload"). Anything else without an account is left alone.
+ */
+export async function clearLateUploads(admin: SupabaseClient, pepper: string, opts: { deadline?: number } = {}): Promise<LateUploads> {
+  const { data, error } = await admin.rpc("retention_orphan_prefixes", { p_limit: 500 });
+  if (error) throw new RetentionError(`retention_orphan_prefixes: ${error.message}`);
+  const prefixes = [...new Set(z.array(OrphanRow).parse(data ?? []).map((r) => r.prefix))];
+  const result: LateUploads = { checked: prefixes.length, cleared: 0, objects: 0 };
+  if (!prefixes.length) return result;
+  const byHash = new Map(prefixes.map((prefix) => [hashUserId(prefix, pepper), prefix]));
+  const logged = await inChunks<{ user_id_hash: string; subject_hmac: string | null }>([...byHash.keys()], (c) =>
+    admin.from("purge_log").select("user_id_hash, subject_hmac").eq("scope", "candidate").in("user_id_hash", c),
+  );
+  const purged = new Map(logged.map((l) => [l.user_id_hash, l.subject_hmac]));
+  for (const [hash, prefix] of byHash) {
+    if (!purged.has(hash)) continue;
+    if (opts.deadline !== undefined && Date.now() >= opts.deadline) break;
+    const removed = await clearStorage(admin, prefix, []);
+    const n = Object.values(removed).reduce((a, b) => a + b, 0);
+    if (!n) continue;
+    const { error: logErr } = await admin.from("purge_log").insert({
+      user_id_hash: hash,
+      subject_hmac: purged.get(hash) ?? null,
+      scope: "late_upload",
+      detail: { storage_objects_deleted: removed },
+    });
+    if (logErr) throw new RetentionError(`purge_log: ${logErr.message}`);
+    result.cleared += 1;
+    result.objects += n;
+  }
+  return result;
+}
+
+/** Drops archived decisions older than 3 years (docs/12); returns how many went. */
+export async function expireArchive(admin: SupabaseClient): Promise<number> {
+  const { data, error } = await admin.rpc("retention_expire_archive");
+  if (error) throw new RetentionError(`retention_expire_archive: ${error.message}`);
+  return Number(data ?? 0);
+}
+
+const ArchiveLookup = z.object({
+  purges: z.array(z.object({ purged_at: z.string(), scope: z.string() })),
+  decisions: z.array(
+    z.object({ role_slug: z.string().nullable(), stage: z.string().nullable(), decision: z.string().nullable(), reason: z.string().nullable(), decided_at: z.string().nullable() }),
+  ),
+});
+export type ArchiveLookup = z.infer<typeof ArchiveLookup>;
+
+/** The /admin/compliance dispute lookup's form state. */
+export type LookupState =
+  | { status: "idle" }
+  | { status: "error"; message: string }
+  | { status: "found"; email: string; result: ArchiveLookup };
+
+/**
+ * What was kept after a purge for the person with this e-mail address (a dispute). Runs through
+ * the admin's own client: retention_archive_lookup is admin-only and returns no ids or hashes.
+ */
+export async function lookupArchive(supabase: SupabaseClient, email: string): Promise<ArchiveLookup> {
+  const { data, error } = await supabase.rpc("retention_archive_lookup", { p_subject_hmac: hmacEmail(email) });
+  if (error) throw new RetentionError(`retention_archive_lookup: ${error.message}`, /admin_only/.test(error.message) ? 403 : 500);
+  return ArchiveLookup.parse(data);
+}
+
+/**
+ * Purges everyone whose purge date has passed, until the run's `deadline` (and at most `limit`
+ * people), resuming interrupted purges too (alternating with the people newly due). With dryRun,
  * reports who would be purged and what would go, and writes nothing.
  */
 export async function purgeDue(admin: SupabaseClient, opts: PurgeOptions = {}): Promise<PurgeReport> {
   const now = opts.now ?? new Date();
   const today = utcDay(now);
-  const limit = Math.max(0, Math.floor(opts.limit ?? RETENTION_SWEEP_LIMIT));
+  const limit = Math.max(0, Math.floor(opts.limit ?? RETENTION_RUN_LIMIT));
+  const none: LateUploads = { checked: 0, cleared: 0, objects: 0 };
 
   if (opts.dryRun) {
     const [due, resuming] = await Promise.all([dueFromSchedule(admin, today, opts.userIds), inProgress(admin, opts.userIds)]);
@@ -387,11 +512,15 @@ export async function purgeDue(admin: SupabaseClient, opts: PurgeOptions = {}): 
       failed: 0,
       remaining: Math.max(0, due.length - planned.length),
       stoppedAtDeadline: false,
+      archiveExpired: 0,
+      lateUploads: none,
     };
   }
 
-  const pepper = retentionPepper();
+  // The queue (what /admin/compliance shows) stays current even while purges are paused for a
+  // missing pepper.
   await refreshRetentionQueue(admin);
+  const pepper = retentionPepper();
   const resuming = await inProgress(admin, opts.userIds);
   const due = (await dueFromQueue(admin, today, opts.userIds)).map((r) => r.user_id);
   const total = new Set([...resuming.map((r) => r.userId), ...due]).size;
@@ -406,6 +535,9 @@ export async function purgeDue(admin: SupabaseClient, opts: PurgeOptions = {}): 
     }
     outcomes.push(await purgeOne(admin, userId, today, pepper, opts.triggeredBy ?? "manual"));
   }
+  // Housekeeping for the whole archive, not for the people asked about.
+  const archiveExpired = opts.userIds ? 0 : await expireArchive(admin);
+  const lateUploads = stoppedAtDeadline ? none : await clearLateUploads(admin, pepper, { deadline: opts.deadline });
   return {
     dryRun: false,
     today,
@@ -417,5 +549,7 @@ export async function purgeDue(admin: SupabaseClient, opts: PurgeOptions = {}): 
     failed: outcomes.filter((o) => o.status === "failed").length,
     remaining: Math.max(0, total - outcomes.length),
     stoppedAtDeadline,
+    archiveExpired,
+    lateUploads,
   };
 }

@@ -21,7 +21,8 @@ import {
   StaleApplicationsTable,
 } from "@/components/admin/compliance-retention";
 import { AdverseImpactTable, CoverageTable, ReliabilityTable } from "@/components/admin/compliance-fairness";
-import { purgeNow } from "./actions";
+import { ArchiveLookupForm } from "@/components/admin/compliance-lookup";
+import { lapseApplications, lookupDispute, purgeNow } from "./actions";
 
 export const dynamic = "force-dynamic";
 // "Purge now" (a server action on this page) can take a while: storage and auth deletions.
@@ -71,6 +72,7 @@ export default async function CompliancePage({
     dryNames = await profileNames(supabase, dryRun.planned.map((p) => p.userId));
   }
   const filterQuery = new URLSearchParams(Object.entries(filter).filter((e): e is [string, string] => !!e[1]));
+  const backlogDays = overview.oldestDue ? Math.round((Date.parse(overview.today) - Date.parse(overview.oldestDue)) / 86_400_000) : 0;
 
   return (
     <div className="space-y-8">
@@ -97,14 +99,16 @@ export default async function CompliancePage({
         <h2 className="h2">Retention</h2>
         <p className="muted">
           As the privacy notice promises: if someone is not appointed, their information is deleted 6 months after the hiring
-          round closes for them (12 months if they opted into the talent pool on their latest consent). The clock starts when
-          their application closed, or when the role&apos;s round closed (an admin made the role inactive) if that was later. An
-          application left in play starts the clock when its role&apos;s round closes, or after 6 months without any activity
-          (it counts as lapsed; nobody is rejected for it). Someone who never applied is deleted 6 months after their last
-          activity. Admins, former staff, anyone with an application still in play or an open review request, and appointed
-          candidates are never queued. A purge keeps only a decision log under a hashed id and anonymised item answers (added
-          to the archive in shuffled batches of at least 5 people); it deletes the CV, recordings, submissions, snapshots and
-          the account. The nightly sweep purges up to 25 people a run.
+          round closes for them (12 months if they opted into the talent pool on their latest consent). The clock starts once
+          every application of theirs has closed (rejected, withdrawn, closed as lapsed, or at the closed stage), or when the
+          role&apos;s round closed (an admin made the role inactive) if that was later. Someone who never applied is deleted 6
+          months after their last activity. Nobody with an application still in play is ever queued, however long it has been
+          idle and whether or not its role is still active: only an admin closes an application, with a written reason (see
+          the idle applications below). Admins, former staff, anyone with an open review request, and appointed candidates are
+          never queued either. A purge keeps only a decision log (for 3 years, in case of disputes) and anonymised item
+          answers (added to the archive in shuffled batches of at least 5 people); it deletes the CV, recordings, submissions,
+          snapshots and the account. The nightly sweep purges everyone due until its time runs out (about 4 minutes a night),
+          so a backlog clears within a night or two.
         </p>
         {pepperProblem && <p className="error">{pepperProblem}</p>}
         <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
@@ -113,6 +117,14 @@ export default async function CompliancePage({
           <div><dt className="muted">Due in 30 days</dt><dd className="text-xl font-semibold">{overview.dueIn30Days}</dd></div>
           <div><dt className="muted">Talent pool</dt><dd className="text-xl font-semibold">{overview.talentPool}</dd></div>
         </dl>
+        {overview.oldestDue && (
+          <p className={backlogDays > 1 ? "error" : "muted"} data-testid="retention-backlog">
+            Oldest purge waiting: due {overview.oldestDue}
+            {backlogDays > 0 ? `, ${backlogDays} ${backlogDays === 1 ? "day" : "days"} late` : " (today)"}. The notice promises
+            deletion on the date; anything more than a day late means the sweep isn&apos;t keeping up or is failing (see purges in
+            progress below).
+          </p>
+        )}
         <p className="muted">
           The queue is as of the last nightly sweep. Right now {live.due} {live.due === 1 ? "person is" : "people are"} due
           {live.inProgress ? ` and ${live.inProgress} purge${live.inProgress === 1 ? " is" : "s are"} unfinished` : ""}; a purge
@@ -145,14 +157,16 @@ export default async function CompliancePage({
 
         <InProgressTable rows={overview.inProgress} />
 
-        <div className="space-y-2">
+        <div id="stale" className="space-y-2">
           <h3 className="font-semibold">Idle applications still in play ({stale.length})</h3>
           <p className="muted">
-            No activity for 3 months or more, or on a role whose round has closed. Close them on the candidate&apos;s page with a
-            decision and a reason (they can still be advanced). If nobody does, retention treats each as ended on the date
-            shown and the person is queued from then.
+            No activity for 3 months or more, or on a role whose round has closed (including accepted offers never advanced to
+            appointed). Retention never closes these by itself: the person stays off the queue, and their information is kept,
+            until an admin closes the application. Advance or reject on the candidate&apos;s page, or tick them here and close
+            them as lapsed with a written reason (a lapse is not a judgement on merit: it is left out of the adverse-impact
+            report, and the candidate sees the reason). The 6-month clock starts from that decision; a hold re-opens one.
           </p>
-          <StaleApplicationsTable rows={stale} />
+          <StaleApplicationsTable rows={stale} action={lapseApplications} />
         </div>
         {formerStaff > 0 && (
           <p className="muted" data-testid="former-staff">
@@ -167,8 +181,20 @@ export default async function CompliancePage({
         </div>
         <div className="space-y-2">
           <h3 className="font-semibold">Purge log (latest {overview.log.length})</h3>
-          <p className="muted">Ids are sha256 hashes with a server-only pepper, so a dispute can be matched without keeping the person.</p>
+          <p className="muted">
+            Each purge is logged under a hashed id and an HMAC of the person&apos;s e-mail address, both made with a server-only
+            pepper. Neither is shown here, so a name on the queue can&apos;t be lined up with an archive entry.
+          </p>
           <PurgeLogTable rows={overview.log} />
+        </div>
+        <div id="dispute" className="space-y-2">
+          <h3 className="font-semibold">Disputes after a purge</h3>
+          <p className="muted">
+            When someone whose information was deleted disputes a decision, enter the e-mail address they applied with to see
+            the decision log kept for them (stage, decision, the written reason and its date, kept 3 years). Reasons are archived
+            with e-mail addresses and phone numbers blanked; write them about the evidence, never about the person.
+          </p>
+          <ArchiveLookupForm action={lookupDispute} />
         </div>
       </section>
 

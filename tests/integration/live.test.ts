@@ -6,7 +6,7 @@ const h = vi.hoisted(() => ({ client: null as unknown }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: async () => h.client }));
 
 import { recordRetest, saveScorecard, updateLiveQuestion } from "@/app/admin/live/actions";
-import { questionsFor, retestForm, scorecardCounts, visibleScorecards } from "@/lib/server/live";
+import { questionsFor, retestForm, scorecardCounts, viewerLiveGate, visibleScorecards } from "@/lib/server/live";
 import { computeScores } from "@/lib/server/scores";
 import { finalComposite, liveComposite, preLiveComposite } from "@/lib/scoring/composite";
 import { kindsForRole, type ScoredKind } from "@/lib/live/scorecard";
@@ -199,6 +199,90 @@ describe("independent raters (docs/09 §5)", () => {
   });
 });
 
+describe("database guard: direct writes through PostgREST (migration 0019)", () => {
+  it("another panellist's DRAFT stays hidden even after you submit", async () => {
+    const c = await liveCandidate("live-draft-hidden", SWE);
+    expect(msg(await score(raterA, SWE, c.appId, "panel_interview", 3, "draft"), "ok")).toMatch(/Draft saved/);
+    expect(msg(await score(raterB, SWE, c.appId, "panel_interview", 4), "ok")).toMatch(/submitted/);
+    expect((await visibleScorecards(raterB.client, c.appId, raterB.id)).map((x) => x.rater)).toEqual([raterB.id]);
+    const { data: direct } = await raterB.client.from("live_scorecards").select("rater, submitted_at").eq("application_id", c.appId);
+    expect(direct).toEqual([{ rater: raterB.id, submitted_at: expect.any(String) }]);
+    // Once A submits, B sees A's submitted card.
+    expect(msg(await score(raterA, SWE, c.appId, "panel_interview", 3), "ok")).toMatch(/submitted/);
+    expect((await visibleScorecards(raterB.client, c.appId, raterB.id)).map((x) => x.rater).sort()).toEqual([raterA.id, raterB.id].sort());
+  });
+
+  it("recomputes a submitted card's total and checks it against the card's questions", async () => {
+    const c = await liveCandidate("live-guard-total", SWE);
+    const keys = await keysFor(SWE, c.appId, "live_defence");
+    const twos = Object.fromEntries(keys.map((k) => [k, 2]));
+    const insert = (row: Record<string, unknown>) =>
+      raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "live_defence", ...row }).select("total, submitted_at").maybeSingle();
+
+    // Scores under unknown keys, a partial card, a card without its questions: refused.
+    expect((await insert({ scores: { anything: 5 }, total: 100, submitted_at: new Date().toISOString() })).error?.message).toMatch(/scorecard_questions_mismatch/);
+    expect((await insert({ scores: { anything: 5 }, question_keys: keys, total: 100, submitted_at: new Date().toISOString() })).error?.message).toMatch(/scorecard_scores_invalid/);
+    expect((await insert({ scores: { [keys[0]]: 5 }, question_keys: keys, total: 100, submitted_at: new Date().toISOString() })).error?.message).toMatch(/scorecard_scores_missing/);
+    const madeUp = ["made_up", ...keys.slice(1)];
+    expect((await insert({ scores: Object.fromEntries(madeUp.map((k) => [k, 2])), question_keys: madeUp, total: 100, submitted_at: new Date().toISOString() })).error?.message).toMatch(/scorecard_questions_mismatch/);
+    expect((await insert({ scores: { ...twos, [keys[0]]: 7 }, question_keys: keys, submitted_at: new Date().toISOString() })).error?.message).toMatch(/scorecard_scores_invalid/);
+
+    // A complete card: the client's total is ignored, the database computes it (all 2s → 25).
+    const ok = await insert({ scores: twos, question_keys: keys, total: 100, submitted_at: new Date().toISOString() });
+    expect(ok.error).toBeNull();
+    expect(Number(ok.data!.total)).toBe(25);
+    // A draft never carries a total.
+    const draft = await raterB.client
+      .from("live_scorecards")
+      .insert({ application_id: c.appId, kind: "live_defence", scores: { [keys[0]]: 5 }, question_keys: keys, total: 100 })
+      .select("total")
+      .single();
+    expect(draft.data?.total).toBeNull();
+
+    // A part the role doesn't have, and 'portfolio' (no scorecard yet): refused.
+    const exec = await raterA.client.from("live_scorecards").insert({ application_id: (await liveCandidate("live-guard-ba", BA)).appId, kind: "exec_scenario", scores: {} });
+    expect(exec.error?.message).toMatch(/scorecard_kind_not_for_role/);
+    const portfolio = await raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "portfolio", scores: { x: "not a number" }, total: 100, submitted_at: new Date().toISOString() });
+    expect(portfolio.error?.message).toMatch(/scorecard_kind_unsupported/);
+  });
+
+  it("refuses cards for an application outside the shortlist / live stage", async () => {
+    const c = await liveCandidate("live-guard-stage", SWE);
+    seed(`update public.applications set stage = 'work_1' where id = '${c.appId}';`);
+    const { error } = await raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "panel_interview", scores: { anything: 5 }, total: 100, submitted_at: new Date().toISOString() });
+    expect(error?.message).toMatch(/application_not_at_live_stage/);
+    const retest = await raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "reasoning_retest", scores: { raw: 12, seed: 5 }, submitted_at: new Date().toISOString() });
+    expect(retest.error?.message).toMatch(/application_not_at_live_stage/);
+  });
+
+  it("derives a retest's percentiles and delta from the raw score; no draft retests", async () => {
+    const c = await liveCandidate("live-guard-retest", SWE);
+    const draft = await raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "reasoning_retest", scores: { raw: 12, seed: 5 } });
+    expect(draft.error?.message).toMatch(/retest_must_be_submitted/);
+    expect((await raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "reasoning_retest", scores: { raw: 13, seed: 5 }, submitted_at: new Date().toISOString() })).error?.message).toMatch(/retest_raw_invalid/);
+    expect((await raterA.client.from("live_scorecards").insert({ application_id: c.appId, kind: "reasoning_retest", scores: { raw: 12 }, submitted_at: new Date().toISOString() })).error?.message).toMatch(/retest_seed_invalid/);
+
+    // Forged total and percentiles are replaced by the database's (online percentile 30, live from raw 12).
+    const { data, error } = await raterA.client
+      .from("live_scorecards")
+      .insert({ application_id: c.appId, kind: "reasoning_retest", scores: { raw: 12, seed: 5, live_percentile: 0, delta: 0 }, total: 0, submitted_at: new Date().toISOString() })
+      .select("total, scores")
+      .single();
+    expect(error).toBeNull();
+    const live = livePercentile(12).percentile;
+    expect(Number(data!.total)).toBe(live);
+    expect(data!.scores).toEqual({ raw: 12, seed: 5, norm_version: "live-provisional-normal-v1", live_percentile: live, online_percentile: 30, delta: Math.round((30 - live) * 10) / 10 });
+    const { data: app } = await admin.from("applications").select("live_delta").eq("id", c.appId).single();
+    expect(Number(app!.live_delta)).toBe(Math.round((30 - live) * 10) / 10);
+
+    // The SQL norm is the TypeScript one for every raw score.
+    for (let raw = 0; raw <= 12; raw++) {
+      const { data: pct } = await raterA.client.rpc("live_retest_percentile", { p_raw: raw });
+      expect(Number(pct)).toBe(livePercentile(raw).percentile);
+    }
+  });
+});
+
 describe("final composite (docs/09 §2: 50% pre-live + 50% live)", () => {
   const parts = { reasoning: 30, interview: 60, quiz: 70, work_1: 50, work_2: 90 };
   const finalOf = async (appId: string) => {
@@ -226,6 +310,34 @@ describe("final composite (docs/09 §2: 50% pre-live + 50% live)", () => {
     const [s] = await computeScores(admin, { applicationIds: [c.appId] });
     expect(s.final).toBe(expected);
     expect(s.live.coverage).toBe(1);
+  });
+});
+
+describe("what each panellist may see of live and final scores (viewerLiveGate)", () => {
+  it("B sees neither A's part score nor the final until B has submitted the same parts", async () => {
+    const c = await liveCandidate("live-gate", SWE);
+    const [pre] = await computeScores(admin, { applicationIds: [c.appId] });
+    const gate = async (u: User) => (await viewerLiveGate(u.client, u.id, [{ applicationId: c.appId, roleSlug: SWE, preLive: pre.preLive }])).get(c.appId)!;
+
+    expect(msg(await score(raterA, SWE, c.appId, "panel_interview", 5), "ok")).toMatch(/submitted/);
+    // The service-role aggregate already has A's card; B's view doesn't.
+    expect((await computeScores(admin, { applicationIds: [c.appId] }))[0].live.score).toBe(100);
+    expect(await gate(raterB)).toMatchObject({ parts: {}, live: { score: null }, final: null, allSubmitted: false });
+    expect((await gate(raterA)).parts).toEqual({ panel_interview: 100 });
+
+    for (const kind of ["live_defence", "exec_scenario"] as const) expect(msg(await score(raterA, SWE, c.appId, kind, 5), "ok")).toMatch(/submitted/);
+    expect((await gate(raterA)).final).not.toBeNull();
+    expect((await gate(raterB)).final).toBeNull();
+    // B submits one part: sees that part only (the mean of both cards), still no final.
+    expect(msg(await score(raterB, SWE, c.appId, "panel_interview", 1), "ok")).toMatch(/submitted/);
+    const b1 = await gate(raterB);
+    expect(b1.parts).toEqual({ panel_interview: 50 });
+    expect(b1.final).toBeNull();
+    for (const kind of ["live_defence", "exec_scenario"] as const) expect(msg(await score(raterB, SWE, c.appId, kind, 1), "ok")).toMatch(/submitted/);
+    const b2 = await gate(raterB);
+    expect(b2.allSubmitted).toBe(true);
+    const { data: app } = await admin.from("applications").select("final_score").eq("id", c.appId).single();
+    expect(b2.final).toBe(Number(app!.final_score));
   });
 });
 
@@ -265,7 +377,10 @@ describe("reasoning retest (docs/04 §6)", () => {
     // Final, and validated.
     expect(msg(await outcome(recordRetest(form({ application_id: c.appId, raw: "9", seed: "12345" }))), "error")).toMatch(/already recorded/);
     h.client = raterB.client;
-    expect(msg(await outcome(recordRetest(form({ application_id: c.appId, raw: "13", seed: "12345" }))), "error")).toMatch(/0 to 12/);
+    const typo = await outcome(recordRetest(form({ application_id: c.appId, raw: "13", seed: "12345" })));
+    expect(msg(typo, "error")).toMatch(/0 to 12/);
+    // Back to the same printed form: the seed survives the error.
+    expect(typo !== "404" && typo.searchParams.get("seed")).toBe("12345");
     expect(msg(await outcome(recordRetest(form({ application_id: c.appId, raw: "", seed: "12345" }))), "error")).toMatch(/raw score/);
   });
 

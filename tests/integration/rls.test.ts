@@ -64,7 +64,8 @@ describe("candidates see only their own rows", () => {
   it("admin_candidates view shows a candidate only themselves, an admin everyone", async () => {
     const mine = await a.client.from("admin_candidates").select("user_id");
     expect(mine.data!.map((r) => r.user_id)).toEqual([a.id]);
-    const all = await admin.client.from("admin_candidates").select("user_id");
+    // Filter to the two test accounts: the shared local DB can hold more than PostgREST's 1000-row page.
+    const all = await admin.client.from("admin_candidates").select("user_id").in("user_id", [a.id, b.id]);
     const ids = all.data!.map((r) => r.user_id);
     expect(ids).toContain(a.id);
     expect(ids).toContain(b.id);

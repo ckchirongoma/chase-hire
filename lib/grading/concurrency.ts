@@ -11,3 +11,23 @@ export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (it
   await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
   return out;
 }
+
+/**
+ * A shared limiter: at most `limit` wrapped calls run at once across every caller holding it
+ * (e.g. all LLM samples of one submission, whichever criterion they belong to).
+ */
+export function createLimiter(limit: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const queue: (() => void)[] = [];
+  const max = Math.max(1, limit);
+  return async <T,>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= max) await new Promise<void>((resolve) => queue.push(resolve));
+    active++;
+    try {
+      return await fn();
+    } finally {
+      active--;
+      queue.shift()?.();
+    }
+  };
+}

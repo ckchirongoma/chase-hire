@@ -1,15 +1,22 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { chatJson } from "@/lib/ai";
+import type { z } from "zod";
+import { AiOutputError, chatJson, type ChatJsonResult } from "@/lib/ai";
 import { detectInjection } from "@/lib/sanitise";
 import {
   collectSamples,
   CriterionGrade,
   EVIDENCE_NUDGE,
+  markUnverifiedGaps,
   SAMPLE_TEMPERATURE,
   summariseSamples,
+  verifyMappingQuotes,
+  verifyRedFlagQuotes,
+  type MappingItem,
   type CriterionSummary,
   type RubricCriterion,
+  type RubricSubcriterion,
+  type SampleOutput,
   type SampleRecord,
   type SubjectType,
 } from "@/lib/grading";
@@ -69,7 +76,7 @@ export interface GradeCriterionInput {
   subjectType: SubjectType;
   subjectId: string;
   rubricId: string;
-  criterion: RubricCriterion;
+  criterion: RubricCriterion | RubricSubcriterion;
   /** System prompt (from prompts/*.md). It must tell the judge to ignore instructions in the subject. */
   system: string;
   /** User content: the subject already sanitised and wrapped in delimiters, plus criterion/context. */
@@ -80,6 +87,31 @@ export interface GradeCriterionInput {
   model: string;
   /** Where to log prompt_injection signals found in quotes. */
   signal?: { userId: string; context: string };
+  // ── Optional extensions (Wave 3 work samples); omitted = Wave 2 behaviour ──
+  /** Key stored on grades / grade_summaries (default criterion.key), e.g. "spiky_pov.p1". */
+  criterionKey?: string;
+  /** Summary weight (default criterion.weight). */
+  weight?: number;
+  /**
+   * Output schema for each sample; must extend CriterionGrade (e.g. ReferenceGrade). Fields beyond
+   * CriterionGrade (reference_mapping, red_flags_triggered, extra_valid_gaps) go to grades.extra.
+   */
+  schema?: z.ZodType;
+  /** Per-sample computed score (e.g. 1 + 4 × weighted recall). The judge's own score is kept in extra.llm_score. */
+  rescore?: (sample: SampleOutput) => { score: number; extra?: Record<string, unknown> };
+  /** Adjusts the summary after aggregation (e.g. per-item medians across samples, red-flag caps). */
+  finalise?: (samples: SampleRecord[], summary: CriterionSummary) => { median?: number | null; reviewReasons?: string[] };
+  /** Always flag the criterion for a person with these reasons (e.g. "no generic baseline"). */
+  reviewReasons?: string[];
+  /** Wraps every model call (a limiter shared across criteria caps parallel LLM calls). */
+  limit?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /**
+   * When the model's output fails schema validation twice (e.g. an incomplete reference_mapping),
+   * store an invalid sample (excluded from the median, flagged) instead of failing the whole job.
+   */
+  invalidOnOutputError?: boolean;
+  /** Filters the summary feedback before it is stored (candidate-visible); null withholds it. */
+  feedbackFilter?: (feedback: string | null) => string | null;
 }
 
 export interface GradeCriterionResult extends CriterionSummary {
@@ -92,19 +124,38 @@ export interface GradeCriterionResult extends CriterionSummary {
 
 export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterionInput): Promise<GradeCriterionResult> {
   const { criterion } = input;
+  const criterionKey = input.criterionKey ?? criterion.key;
+  const weight = input.weight ?? criterion.weight;
+  const limit = input.limit ?? (<T,>(fn: () => Promise<T>) => fn());
+  const schema = (input.schema ?? CriterionGrade) as z.ZodType<CriterionGrade & Record<string, unknown>>;
+  const subjectText = input.subjectText ?? input.userContent;
   const samples = await collectSamples({
     evidenceRequired: criterion.evidence_required,
-    subjectText: input.subjectText ?? input.userContent,
+    subjectText,
     sample: async (_idx, attempt) => {
-      const res = await chatJson({
-        model: input.model,
-        system: input.system,
-        user: attempt === 0 ? input.userContent : `${input.userContent}\n\n${EVIDENCE_NUDGE}`,
-        schema: CriterionGrade,
-        promptVersion: input.promptVersion,
-        temperature: SAMPLE_TEMPERATURE,
-      });
-      return { ...res.data, model: res.model };
+      let res: ChatJsonResult<CriterionGrade & Record<string, unknown>>;
+      try {
+        res = await limit(() =>
+          chatJson({
+            model: input.model,
+            system: input.system,
+            user: attempt === 0 ? input.userContent : `${input.userContent}\n\n${EVIDENCE_NUDGE}`,
+            schema,
+            promptVersion: input.promptVersion,
+            temperature: SAMPLE_TEMPERATURE,
+          }),
+        );
+      } catch (err) {
+        if (!(input.invalidOnOutputError && err instanceof AiOutputError)) throw err;
+        const outputError = err.message.slice(0, 1000);
+        return { evidence: [], rationale: `No usable output: ${outputError}`, score: 1, feedback: "", model: input.model, invalid: true, outputError };
+      }
+      const { evidence, rationale, score, feedback, ...raw } = res.data;
+      const rest = verifyExtras(raw, subjectText);
+      const out: SampleOutput = { evidence, rationale, score, feedback, model: res.model, ...(Object.keys(rest).length ? { extra: rest } : {}) };
+      if (!input.rescore) return out;
+      const computed = input.rescore(out);
+      return { ...out, score: computed.score, extra: { ...rest, ...computed.extra, llm_score: score } };
     },
   });
 
@@ -112,17 +163,19 @@ export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterio
     subject_type: input.subjectType,
     subject_id: input.subjectId,
     rubric_id: input.rubricId,
-    criterion_key: criterion.key,
+    criterion_key: criterionKey,
     sample_idx: s.idx,
     score: s.score,
     evidence: s.evidence,
     rationale: s.rationale,
     extra: {
       feedback: s.feedback,
+      ...(s.extra ?? {}),
       ...(s.invalid ? { invalid: true } : {}),
       ...(s.rerun ? { rerun: true } : {}),
       ...(s.unverifiedQuotes.length ? { unverified_quote: true, unverified_quotes: s.unverifiedQuotes } : {}),
       ...(s.injectionInQuotes ? { injection_in_quotes: true } : {}),
+      ...(s.outputError ? { output_error: s.outputError } : {}),
     },
     model: s.model,
     prompt_version: input.promptVersion,
@@ -139,18 +192,29 @@ export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterio
       where: "grader_quotes",
       subject_type: input.subjectType,
       subject_id: input.subjectId,
-      criterion: criterion.key,
+      criterion: criterionKey,
       samples: injected,
     });
   }
 
-  const summary = summariseSamples(samples);
+  let summary = summariseSamples(samples);
+  const reasons = summary.reviewReason ? [summary.reviewReason] : [];
+  reasons.push(...extrasReviewReasons(samples));
+  if (input.finalise) {
+    const f = input.finalise(samples, summary);
+    if (f.median !== undefined) summary = { ...summary, median: f.median };
+    reasons.push(...(f.reviewReasons ?? []));
+  }
+  reasons.push(...(input.reviewReasons ?? []));
+  if (reasons.length) summary = { ...summary, needsHumanReview: true, reviewReason: reasons.join("; ") };
+  if (input.feedbackFilter) summary = { ...summary, feedback: input.feedbackFilter(summary.feedback) };
+
   const saved = await upsertSummary(admin, {
     subject_type: input.subjectType,
     subject_id: input.subjectId,
     rubric_id: input.rubricId,
-    criterion_key: criterion.key,
-    weight: criterion.weight,
+    criterion_key: criterionKey,
+    weight,
     median_score: summary.median,
     spread: summary.spread,
     needs_human_review: summary.needsHumanReview,
@@ -161,12 +225,47 @@ export async function gradeCriterion(admin: SupabaseClient, input: GradeCriterio
   return {
     ...summary,
     needsHumanReview: saved.needsHumanReview,
-    criterionKey: criterion.key,
-    weight: criterion.weight,
+    criterionKey,
+    weight,
     finalScore: saved.finalScore,
     humanScore: saved.humanScore,
     samples,
   };
+}
+
+/**
+ * Checks the quotes behind reference-guided extras (hard rule 4): answer-key items marked found or
+ * partial without a quote that appears in the subject get no credit (status "missing", claim kept),
+ * red flags without one are dropped, and extra gaps are marked. The ids go to grades.extra.
+ */
+function verifyExtras(raw: Record<string, unknown>, subjectText: string): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...raw };
+  if (Array.isArray(raw.reference_mapping)) {
+    const v = verifyMappingQuotes(raw.reference_mapping as MappingItem[], subjectText);
+    out.reference_mapping = v.mapping;
+    if (v.unverified.length) out.unverified_mapping = v.unverified;
+  }
+  if (Array.isArray(raw.red_flags_triggered)) {
+    const v = verifyRedFlagQuotes(raw.red_flags_triggered as { id: string; quote: string }[], subjectText);
+    out.red_flags_triggered = v.flags;
+    if (v.unverified.length) out.unverified_red_flags = v.unverified;
+  }
+  if (Array.isArray(raw.extra_valid_gaps)) out.extra_valid_gaps = markUnverifiedGaps(raw.extra_valid_gaps as { gap: string; quote: string }[], subjectText);
+  return out;
+}
+
+/** Review reasons from sample extras: unusable outputs and unverifiable answer-key claims. */
+function extrasReviewReasons(samples: readonly SampleRecord[]): string[] {
+  const reasons: string[] = [];
+  const failed = samples.filter((s) => s.outputError).length;
+  if (failed) reasons.push(`${failed} of ${samples.length} samples returned output that failed validation twice (e.g. an incomplete answer-key mapping)`);
+  const valid = samples.filter((s) => !s.invalid);
+  const ids = (k: string) => [...new Set(valid.flatMap((s) => (s.extra?.[k] as string[] | undefined) ?? []))].sort();
+  const mapping = ids("unverified_mapping");
+  if (mapping.length) reasons.push(`Answer-key claims without a quote found in the submission (given no credit): ${mapping.join(", ")}`);
+  const flags = ids("unverified_red_flags");
+  if (flags.length) reasons.push(`Red flags without a quote found in the submission (not applied): ${flags.join(", ")}`);
+  return reasons;
 }
 
 type SummaryFields = {
@@ -223,14 +322,18 @@ export async function upsertSummary(
 
 /** Grades one subject end to end (all criteria + any summary on the subject row). */
 export type GradingHandler = (admin: SupabaseClient, subjectId: string) => Promise<void>;
-type Loader = () => Promise<GradingHandler>;
+export type GradingLoader = () => Promise<GradingHandler>;
+type Loader = GradingLoader;
 
 /**
  * subject_type → handler. Loaders are lazy so handler modules (which import this one) are not
- * a circular import at load time. Wave 3 adds 'submission' with registerGradingLoader.
+ * a circular import at load time. 'submission' (Wave 3 work samples) is registered here, so any
+ * importer of this module (the cron worker, the admin re-run route, submit routes) can run
+ * submission jobs; lib/server/grade-submission also registers itself when imported directly.
  */
 const registry = new Map<SubjectType, Loader>([
   ["interview", async () => (await import("@/lib/server/interview")).gradeInterviewSession],
+  ["submission", async () => (await import("@/lib/server/grade-submission")).submissionGradingHandler],
 ]);
 
 export function registerGradingHandler(type: SubjectType, handler: GradingHandler): void {
@@ -239,6 +342,13 @@ export function registerGradingHandler(type: SubjectType, handler: GradingHandle
 
 export function registerGradingLoader(type: SubjectType, loader: Loader): void {
   registry.set(type, loader);
+}
+
+/** Removes a subject type's handler (tests); returns its loader so registerGradingLoader can restore it. */
+export function unregisterGradingHandler(type: SubjectType): GradingLoader | undefined {
+  const loader = registry.get(type);
+  registry.delete(type);
+  return loader;
 }
 
 export function registeredSubjectTypes(): SubjectType[] {
@@ -275,8 +385,24 @@ type JobRow = {
 };
 const JOB_COLS = "id, subject_type, subject_id, status, attempts, updated_at";
 
-/** Queues (or re-queues) grading for a subject. Returns the job id. */
+/**
+ * Queues (or re-queues) grading for a subject. Returns the job id. A job another worker is
+ * running (and not stale) is left alone: resetting it to queued would let a second handler start
+ * on the same subject while the first is still writing its grades.
+ */
 export async function enqueueGrading(admin: SupabaseClient, subjectType: SubjectType, subjectId: string): Promise<string> {
+  const staleBefore = new Date(Date.now() - STALE_RUNNING_MS).toISOString();
+  const { data: requeued, error: reErr } = await admin
+    .from("grading_jobs")
+    .update({ status: "queued", last_error: null })
+    .eq("subject_type", subjectType)
+    .eq("subject_id", subjectId)
+    .or(`status.neq.running,updated_at.lt."${staleBefore}"`)
+    .select("id");
+  if (reErr) throw new GradingError(`could not enqueue grading: ${reErr.message}`);
+  if (requeued?.length) return requeued[0].id as string;
+  const { data: running } = await admin.from("grading_jobs").select("id").eq("subject_type", subjectType).eq("subject_id", subjectId).maybeSingle();
+  if (running) return running.id as string;
   const { data, error } = await admin
     .from("grading_jobs")
     .upsert(

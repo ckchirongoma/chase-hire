@@ -12,7 +12,15 @@ import type { CriterionGrade, Evidence } from "./schema";
 export const SAMPLE_COUNT = 3;
 export const SAMPLE_TEMPERATURE = 0.3;
 
-export type SampleOutput = CriterionGrade & { model: string };
+export type SampleOutput = CriterionGrade & {
+  model: string;
+  /** Reference-guided extras (reference_mapping, red_flags_triggered, ...) kept in grades.extra. */
+  extra?: Record<string, unknown>;
+  /** The sample is unusable whatever its evidence (e.g. its output failed validation twice). */
+  invalid?: boolean;
+  /** Why the output was unusable (stored for the admin). */
+  outputError?: string;
+};
 
 export interface SampleRecord {
   idx: number;
@@ -29,6 +37,10 @@ export interface SampleRecord {
   unverifiedQuotes: string[];
   /** A quote carries instruction-like text aimed at an AI. */
   injectionInQuotes: boolean;
+  /** Extras from the judge output (see SampleOutput.extra). */
+  extra?: Record<string, unknown>;
+  /** Set when the model's output failed validation twice (the sample is invalid). */
+  outputError?: string;
 }
 
 export interface CollectOptions {
@@ -45,11 +57,11 @@ export async function collectSamples(opts: CollectOptions): Promise<SampleRecord
   const one = async (idx: number): Promise<SampleRecord> => {
     let out = await opts.sample(idx, 0);
     let rerun = false;
-    if (opts.evidenceRequired && out.evidence.length === 0) {
+    if (opts.evidenceRequired && out.evidence.length === 0 && !out.invalid) {
       rerun = true;
       out = await opts.sample(idx, 1);
     }
-    const invalid = opts.evidenceRequired && out.evidence.length === 0;
+    const invalid = out.invalid === true || (opts.evidenceRequired && out.evidence.length === 0);
     return {
       idx,
       score: out.score,
@@ -61,6 +73,8 @@ export async function collectSamples(opts: CollectOptions): Promise<SampleRecord
       rerun,
       unverifiedQuotes: unverifiedQuotes(out.evidence, opts.subjectText),
       injectionInQuotes: out.evidence.some((e) => detectInjection(e.quote)),
+      ...(out.extra ? { extra: out.extra } : {}),
+      ...(out.outputError ? { outputError: out.outputError } : {}),
     };
   };
   return Promise.all(Array.from({ length: count }, (_, i) => one(i)));

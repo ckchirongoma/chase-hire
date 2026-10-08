@@ -5,6 +5,8 @@ import { requireAdmin } from "@/lib/server/auth";
 import { fmtDate, STAGE_LABEL, STATUS_LABEL } from "@/lib/format";
 import InterviewPanel from "@/components/admin/interview-panel";
 import { QuizPanel } from "@/components/admin/quiz-panel";
+import WorkPanel from "@/components/admin/work-panel";
+import WorkGrades from "@/components/admin/work-grades";
 
 export const dynamic = "force-dynamic";
 
@@ -132,6 +134,8 @@ export default async function CandidateDetail({
           <h2 className="h2">{(a.roles as unknown as { title: string } | null)?.title}: assessment detail</h2>
           <InterviewPanel applicationId={a.id} />
           <QuizPanel applicationId={a.id} />
+          <WorkPanel applicationId={a.id} />
+          <WorkGrades applicationId={a.id} />
         </section>
       ))}
 

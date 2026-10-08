@@ -9,6 +9,7 @@ import {
   findGradingJob,
   gradeCriterion,
   registerGradingHandler,
+  unregisterGradingHandler,
   runGradingJob,
   runPendingGradingJobs,
 } from "@/lib/server/grading";
@@ -176,11 +177,19 @@ describe("grading jobs", () => {
 
   it("fails a job whose subject type has no handler, and the pending runner leaves those queued", async () => {
     const subject = randomUUID();
-    const id = await enqueueGrading(admin, "submission", subject);
-    const pending = await runPendingGradingJobs(admin, { limit: 50 });
-    expect(pending.some((r) => r.id === id)).toBe(false);
-    expect(await runGradingJob(admin, id)).toMatchObject({ status: "failed", error: "No grading handler registered for submission" });
-    await admin.from("grading_jobs").delete().eq("id", id);
+    unregisterGradingHandler("gold");
+    try {
+      const id = await enqueueGrading(admin, "gold", subject);
+      const pending = await runPendingGradingJobs(admin, { limit: 50 });
+      expect(pending.some((r) => r.id === id)).toBe(false);
+      expect(await runGradingJob(admin, id)).toMatchObject({ status: "failed", error: "No grading handler registered for gold" });
+      await admin.from("grading_jobs").delete().eq("id", id);
+    } finally {
+      registerGradingHandler("gold", async (_admin, subjectId) => {
+        calls.push(subjectId);
+        if (failOnce.delete(subjectId)) throw new Error("model timed out");
+      });
+    }
   });
 
   it("POST (re-run one subject now) is admin-only", async () => {

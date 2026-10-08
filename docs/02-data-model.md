@@ -48,6 +48,8 @@ dedupe_flags(
 ```sql
 roles(
   id uuid pk, slug text unique, title text, summary text, spec_md text,
+  jd_md text,                       -- candidate-facing job description (lib/markdown.ts subset);
+                                    -- spec_md stays short: the AI interviewer reads it
   salary_min int, salary_max int, location_note text,
   reasoning_min_stars int,          -- hurdle, see doc 04
   quiz_bank_id uuid, active bool)

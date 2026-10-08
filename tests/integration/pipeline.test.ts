@@ -113,13 +113,23 @@ describe("composite scores (docs/09 §2)", () => {
     expect(s.live).toEqual(live);
     expect(s.final).toBe(finalComposite(pre, live));
     expect(s.execComms).toEqual({ score: 75, n: 1 });
-    expect(s.flags).toMatchObject({ openReviewRequests: 1, lockedSessions: 0, gradesNeedingReview: 0 });
+    expect(s.flags).toMatchObject({ openReviewRequests: 1, lockedSessions: 0, gradesNeedingReview: 0, submissionFlags: 0 });
 
     expect(await refreshScores(admin, [u.appId])).toBe(1);
     const { data: app } = await admin.from("applications").select("composite_score, final_score").eq("id", u.appId).single();
     expect(Number(app!.composite_score)).toBe(62.5);
     expect(Number(app!.final_score)).toBe(s.final);
     expect(await refreshScores(admin, [u.appId])).toBe(0); // unchanged → no write
+  });
+
+  it("counts submission review flags and locked sessions as flags", async () => {
+    const u = await applicant("flags");
+    const { sub1 } = await seedStages(u, SWE, { interview: 50, quiz: 50, work1: 50, work2: 50 });
+    seed(`update public.submissions set review_flags = '[{"kind":"repo_private","detail":"x"},{"kind":"late_snapshot","detail":"y"}]' where id = '${sub1}';
+          update public.quiz_attempts set submitted_at = null, locked_at = now() where application_id = '${u.appId}';`);
+    const [s] = await computeScores(admin, { applicationIds: [u.appId] });
+    expect(s.flags).toMatchObject({ submissionFlags: 2, lockedSessions: 1 });
+    expect(s.parts.quiz).toBeNull(); // an unsubmitted quiz doesn't count
   });
 
   it("is partial (with coverage) mid-pipeline and null before any stage", async () => {

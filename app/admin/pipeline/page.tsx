@@ -66,6 +66,7 @@ export default async function PipelinePage({
       s.flags.gradesNeedingReview ? `${s.flags.gradesNeedingReview} grades to review` : null,
       s.flags.lockedSessions ? "locked session" : null,
       s.flags.injectionSignals ? "injection signal" : null,
+      s.flags.submissionFlags ? `${s.flags.submissionFlags} submission flag${s.flags.submissionFlags === 1 ? "" : "s"}` : null,
       s.liveDelta !== null && s.liveDelta > 25 ? `live delta ${s.liveDelta}` : null,
     ].filter((f): f is string => f !== null),
   });

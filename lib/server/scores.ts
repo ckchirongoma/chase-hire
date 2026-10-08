@@ -40,6 +40,8 @@ export interface AppScore {
     gradesNeedingReview: number;
     lockedSessions: number;
     injectionSignals: number;
+    /** Things a person should check on work submissions (submissions.review_flags). */
+    submissionFlags: number;
   };
 }
 
@@ -76,12 +78,12 @@ export async function computeScores(admin: SupabaseClient, opts: { applicationId
     inChunks<{ application_id: string; pct: number | null; submitted_at: string | null; locked_at: string | null }>(appIds, (c) =>
       admin.from("quiz_attempts").select("application_id, pct, submitted_at, locked_at").in("application_id", c),
     ),
-    inChunks<{ application_id: string; work_stages: { app_stage: string } | null; submissions: { id: string; score: number | null } | null }>(appIds, (c) =>
+    inChunks<{ application_id: string; work_stages: { app_stage: string } | null; submissions: { id: string; score: number | null; review_flags: unknown[] | null } | null }>(appIds, (c) =>
       admin
         .from("work_attempts")
-        .select("application_id, work_stages(app_stage), submissions(id, score)")
+        .select("application_id, work_stages(app_stage), submissions(id, score, review_flags)")
         .in("application_id", c)
-        .returns<{ application_id: string; work_stages: { app_stage: string } | null; submissions: { id: string; score: number | null } | null }[]>(),
+        .returns<{ application_id: string; work_stages: { app_stage: string } | null; submissions: { id: string; score: number | null; review_flags: unknown[] | null } | null }[]>(),
     ),
     inChunks<{ application_id: string; kind: string; total: number | null; submitted_at: string | null }>(appIds, (c) =>
       admin.from("live_scorecards").select("application_id, kind, total, submitted_at").in("application_id", c),
@@ -113,7 +115,10 @@ export async function computeScores(admin: SupabaseClient, opts: { applicationId
   const sessionBy = new Map(sessions.map((s) => [s.application_id, s]));
   const quizBy = new Map(quizzes.map((q) => [q.application_id, q]));
   const workBy = new Map<string, Partial<Record<"work_1" | "work_2", number | null>>>();
+  const submissionFlagsBy = new Map<string, number>();
   for (const w of work) {
+    const n = Array.isArray(w.submissions?.review_flags) ? w.submissions.review_flags.length : 0;
+    if (n) submissionFlagsBy.set(w.application_id, (submissionFlagsBy.get(w.application_id) ?? 0) + n);
     const st = w.work_stages?.app_stage;
     if (st !== "work_1" && st !== "work_2") continue;
     workBy.set(w.application_id, { ...workBy.get(w.application_id), [st]: w.submissions?.score ?? null });
@@ -177,6 +182,7 @@ export async function computeScores(admin: SupabaseClient, opts: { applicationId
         gradesNeedingReview: needsReviewBy.get(a.id) ?? 0,
         lockedSessions: locked,
         injectionSignals: injectionsBy.get(a.user_id) ?? 0,
+        submissionFlags: submissionFlagsBy.get(a.id) ?? 0,
       },
     };
   });

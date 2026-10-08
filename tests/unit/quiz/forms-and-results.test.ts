@@ -83,7 +83,17 @@ describe("nextStep (results page button)", () => {
     expect(nextStep({ ...app, stage: "quiz", status: "awaiting_review", quiz: { submitted_at: "2026-10-07T10:00:00Z" } })).toBeNull();
     expect(nextStep({ ...app, stage: "interview", status: "awaiting_review" })).toBeNull();
     expect(nextStep({ ...app, stage: "quiz", status: "rejected" })).toBeNull();
-    expect(nextStep({ ...app, stage: "work_1", status: "advanced" })).toBeNull();
+    expect(nextStep({ ...app, stage: "work_1", status: "advanced" })).toEqual({
+      href: "/apply/software-engineer/work/work_1",
+      label: "Open work assessment 1",
+    });
+    expect(
+      nextStep({ ...app, stage: "work_2", status: "in_progress", work: [{ app_stage: "work_2", started_at: "2026-10-07T10:00:00Z", submitted_at: null }] })?.label,
+    ).toBe("Continue work assessment 2");
+    expect(
+      nextStep({ ...app, stage: "work_1", status: "in_progress", work: [{ app_stage: "work_1", started_at: "2026-10-07T10:00:00Z", submitted_at: "2026-10-07T12:00:00Z" }] }),
+    ).toBeNull();
+    expect(nextStep({ ...app, stage: "shortlist", status: "advanced" })).toBeNull();
   });
 });
 

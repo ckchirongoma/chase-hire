@@ -20,6 +20,7 @@ import {
   type SampleRecord,
   type SubjectType,
 } from "@/lib/grading";
+import { refreshQuietly, refreshScoresForSubject } from "@/lib/server/scores";
 
 /**
  * Shared LLM grading core (docs/09 §7), reused by every AI-graded stage:
@@ -446,6 +447,7 @@ export async function runGradingJob(admin: SupabaseClient, jobId: string): Promi
     await handler(admin, job.subject_id);
     // Only mark done if nobody re-queued the job while it ran.
     await admin.from("grading_jobs").update({ status: "done" }).eq("id", job.id).eq("status", "running");
+    await refreshQuietly(refreshScoresForSubject(admin, job.subject_type, job.subject_id));
     return { ...base, status: "done", attempts };
   } catch (err) {
     const message = (err instanceof Error ? err.message : String(err)).slice(0, 2000);

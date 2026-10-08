@@ -8,6 +8,8 @@ import { QuizPanel } from "@/components/admin/quiz-panel";
 import WorkPanel from "@/components/admin/work-panel";
 import WorkGrades from "@/components/admin/work-grades";
 import SessionControls from "@/components/admin/session-controls";
+import { computeScores, refreshQuietly, refreshScores } from "@/lib/server/scores";
+import { createAdminClient } from "@/lib/supabase/admin";
 
 export const dynamic = "force-dynamic";
 
@@ -24,6 +26,8 @@ async function decide(formData: FormData) {
   const parsed = Decision.safeParse(Object.fromEntries(formData));
   const uid = String(formData.get("user_id"));
   if (!parsed.success) redirect(`/admin/candidates/${uid}?error=${encodeURIComponent(parsed.error.issues[0].message)}`);
+  // The decision snapshot records the composite, so bring it up to date first.
+  await refreshQuietly(refreshScores(createAdminClient(), [parsed.data.application_id]));
   const { error } = await supabase.rpc("admin_decide", {
     p_application_id: parsed.data.application_id,
     p_decision: parsed.data.decision,
@@ -79,6 +83,9 @@ export default async function CandidateDetail({
     ? await supabase.from("reasoning_responses").select("position, family, tier, served_at, answered_at, answer, answer_key, correct").eq("attempt_id", latestAttempt.id).order("position")
     : { data: [] };
 
+  const scoreList = applications.data?.length ? await computeScores(createAdminClient(), { applicationIds: applications.data.map((a) => a.id) }) : [];
+  const scoreOf = new Map(scoreList.map((x) => [x.applicationId, x]));
+
   const cv = cvs.data?.[0];
   const { data: signed } = cv ? await supabase.storage.from("cvs").createSignedUrl(cv.storage_path, 300) : { data: null };
 
@@ -110,6 +117,19 @@ export default async function CandidateDetail({
                 <strong>{(a.roles as unknown as { title: string } | null)?.title}</strong> · {STAGE_LABEL[a.stage]} ·{" "}
                 {STATUS_LABEL[a.status]} {a.below_hurdle && <span className="badge-warn">below reasoning hurdle ({a.reasoning_stars}★)</span>}
               </p>
+              {(() => {
+                const sc = scoreOf.get(a.id);
+                if (!sc) return null;
+                return (
+                  <p className="muted" data-testid="composite">
+                    Composite (pre-live) <strong>{sc.preLive.score ?? "—"}</strong>
+                    {sc.preLive.score !== null && sc.preLive.coverage < 1 && <> ({Math.round(sc.preLive.coverage * 100)}% of stages; missing {sc.preLive.missing.join(", ")})</>}
+                    {sc.final !== null && <> · final <strong>{sc.final}</strong></>}
+                    {sc.live.score !== null && <> · live {sc.live.score}</>}
+                    {sc.execComms.score !== null && <> · exec comms {sc.execComms.score} (n={sc.execComms.n})</>}
+                  </p>
+                );
+              })()}
               {decisions.map((d) => (
                 <p key={d.decided_at} className="muted">{fmtDate(d.decided_at)} · {d.decision} at {d.stage}: {d.reason}</p>
               ))}

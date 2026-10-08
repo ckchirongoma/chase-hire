@@ -9,7 +9,10 @@ export default async function AdminLayout({ children }: { children: React.ReactN
     <div className="space-y-6">
       <nav className="flex flex-wrap gap-4 text-sm">
         <span className="font-semibold">Admin</span>
+        <Link href="/admin/pipeline" className="underline">Pipeline</Link>
         <Link href="/admin/candidates" className="underline">Candidates</Link>
+        <Link href="/admin/grading" className="underline">Grading queue</Link>
+        <Link href="/admin/reviews" className="underline">Review requests</Link>
         <Link href="/admin/dedupe" className="underline">Dedupe</Link>
         <Link href="/admin/roles" className="underline">Roles</Link>
         <Link href="/admin/banks" className="underline">Reasoning bank</Link>

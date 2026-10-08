@@ -5,6 +5,7 @@ import { assembleQuiz, QuizBankError, type BankItem } from "@/lib/quiz/assemble"
 import { QUIZ_GRACE_MS, topicsFor } from "@/lib/quiz/blueprint";
 import { normaliseAnswer, scoreQuiz, type TopicScores } from "@/lib/quiz/scoring";
 import { answerTimeFlag } from "@/lib/quiz/signals";
+import { refreshQuietly, refreshScores } from "@/lib/server/scores";
 
 /**
  * Role quiz flow (doc 05 Part B). Every function takes the service-role client and an
@@ -337,6 +338,7 @@ export async function finaliseQuiz(admin: SupabaseClient, attemptId: string): Pr
   if (error && !error.message.includes("already_submitted")) throw new QuizError(error.message, 500);
 
   await settleApplication(admin, { id: app.id, stage: app.stage, status: app.status });
+  await refreshQuietly(refreshScores(admin, [app.id]));
   if (data?.[0]) return data[0] as AttemptRow;
   // Someone else finalised it first.
   const { data: row } = await admin.from("quiz_attempts").select(ATTEMPT_COLS).eq("id", attemptId).maybeSingle();

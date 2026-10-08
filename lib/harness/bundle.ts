@@ -1,4 +1,5 @@
-import { decodeEntities } from "./app-login";
+import { decodeEntities, tagAttributes } from "./app-login";
+import { elements, startTags, stripTags } from "./html-scan";
 import { scanSecrets, type FoundJwt } from "./jwt";
 
 /**
@@ -32,26 +33,32 @@ export function extractScriptUrls(html: string, base: URL): string[] {
     const u = sameOrigin(raw, base);
     if (u && /\.m?js(?:$|\?)/.test(u.pathname + (u.search ? "?" : ""))) out.add(u.toString());
   };
-  for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) add(m[1]);
-  for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
-    const tag = m[0];
-    if (!/\brel\s*=\s*["']?(?:preload|modulepreload|prefetch)/i.test(tag)) continue;
-    if (/\brel\s*=\s*["']?preload/i.test(tag) && !/\bas\s*=\s*["']?script/i.test(tag)) continue;
-    const href = tag.match(/\bhref\s*=\s*["']([^"']+)["']/i);
-    if (href) add(href[1]);
+  for (const t of startTags(html, ["script", "link"])) {
+    const at = tagAttributes(t.raw);
+    if (t.name === "script") {
+      if (at.src) add(at.src);
+      continue;
+    }
+    const rel = (at.rel ?? "").toLowerCase();
+    if (!/\b(?:preload|modulepreload|prefetch)\b/.test(rel)) continue;
+    if (/\bpreload\b/.test(rel) && (at.as ?? "").toLowerCase() !== "script") continue;
+    if (at.href) add(at.href);
   }
-  // RSC payloads escape slashes and quotes: unescape before matching.
+  // RSC payloads escape slashes and quotes: unescape before matching. Bounded lengths keep the
+  // scan linear on hostile input.
   const flat = html.replace(/\\\//g, "/").replace(/\\"/g, '"');
-  for (const m of flat.matchAll(/\/_next\/static\/[A-Za-z0-9_\-./~%[\]@()]+?\.js\b/g)) add(m[0]);
-  for (const m of flat.matchAll(/["'](static\/chunks\/[A-Za-z0-9_\-./~%[\]@()]+?\.js)["']/g)) add(`/_next/${m[1]}`);
+  for (const m of flat.matchAll(/\/_next\/static\/[A-Za-z0-9_\-./~%[\]@()]{1,400}?\.js\b/g)) add(m[0]);
+  for (const m of flat.matchAll(/["'](static\/chunks\/[A-Za-z0-9_\-./~%[\]@()]{1,400}?\.js)["']/g)) add(`/_next/${m[1]}`);
   return [...out];
 }
 
 /** Same-origin page links (<a href>) worth crawling, without assets, API routes or sign-out links. */
 export function extractPageLinks(html: string, base: URL): string[] {
   const out = new Set<string>();
-  for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"'#][^"']*)["']/gi)) {
-    const u = sameOrigin(m[1], base);
+  for (const t of startTags(html, ["a"])) {
+    const href = tagAttributes(t.raw).href;
+    if (!href || href.startsWith("#")) continue;
+    const u = sameOrigin(href, base);
     if (!u) continue;
     if (/^\/(?:api|_next|auth\/(?:signout|logout))\b|\/(?:logout|signout|sign-out|log-out)\b/i.test(u.pathname)) continue;
     if (/\.[a-z0-9]{2,5}$/i.test(u.pathname)) continue;
@@ -78,11 +85,12 @@ export interface EntityLink {
 /** Same-origin links to a customer page (/customer/:id, /customers/:id) with their link text. */
 export function extractCustomerLinks(html: string, base: URL): EntityLink[] {
   const out = new Map<string, EntityLink>();
-  for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi)) {
-    const u = sameOrigin(decodeEntities(m[1]), base);
+  for (const el of elements(html, "a", 20_000)) {
+    const href = tagAttributes(el.tag.raw).href;
+    const u = href ? sameOrigin(href, base) : null;
     const id = u?.pathname.match(/^\/customers?\/([A-Za-z0-9_-]{1,64})\/?$/)?.[1];
     if (!u || !id || out.has(id)) continue;
-    const text = decodeEntities(m[2].replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 200);
+    const text = decodeEntities(stripTags(el.inner)).replace(/\s+/g, " ").trim().slice(0, 200);
     out.set(id, { url: u.toString(), id, text });
   }
   return [...out.values()];

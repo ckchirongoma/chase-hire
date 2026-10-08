@@ -154,8 +154,15 @@ Everything in this pack is synthetic. Every name, number and email address is fi
 
 The BA's MVP is here: STARTER_REPO_URL
 
-Clone it and push it, as it is, to a new repository on your own GitHub account, then do your work
-there. Submit that repository's URL.
+It is a public repository: all you need is a GitHub account, and there is no access to request.
+
+1. Clone it, then push it **as it is, with its whole history**, to a new repository on your own
+   GitHub account. Do not use GitHub's "Use this template" button (it drops the history) and do
+   not fork it (forks are listed on the original, where everyone can see them).
+2. Make your repository **public**. We read it, its history and its CI results without signing in
+   to GitHub, so a private repository cannot be graded.
+3. Do your work there and submit that repository's URL. We grade the commit that is the latest
+   when you submit, so do not rewrite or force-push over it after submitting.
 
 Read the brief in the platform for what to build. A later month's export will be used when we grade your import.
 `;

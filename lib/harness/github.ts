@@ -77,10 +77,16 @@ export async function dispatchWorkflow(cfg: DispatchConfig, inputs: Record<strin
   return { runUrl: body?.html_url ?? null };
 }
 
-/** The command an admin runs locally when dispatch is not configured. */
+/**
+ * The commands an admin runs locally when dispatch is not configured: the STATIC checks only
+ * (R1, R2, R3 static, R6, R7; R4/R5 inconclusive). They never run the candidate's code, so they
+ * are safe from the platform checkout. The build, tests and db reset (--exec, --db-reset) run
+ * candidate code and belong in CI or a throwaway VM (repo-checks.ts refuses them without
+ * --disposable-sandbox); the report step, which needs the platform's secret key, never runs there.
+ */
 export function localRepoCheckCommands(input: { submissionId: string; repoUrl: string; sha: string }): string[] {
   return [
-    `npx tsx scripts/verify-swe1/repo-checks.ts --repo ${input.repoUrl} --sha ${input.sha} --out results.json --exec --db-reset`,
+    `npx tsx scripts/verify-swe1/repo-checks.ts --repo ${input.repoUrl} --sha ${input.sha} --out results.json`,
     `npx tsx --env-file=.env.local scripts/verify-swe1/report.ts --in results.json --submission-id ${input.submissionId} --repo-url ${input.repoUrl} --sha ${input.sha}`,
   ];
 }

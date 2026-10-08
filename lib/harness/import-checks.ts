@@ -443,6 +443,7 @@ export async function runImportChecks(input: ImportCheckInput): Promise<ImportRu
         const named = names.filter((n) => up7.body.toLowerCase().includes(n.toLowerCase()));
         const ev: Evidence = { upload: uploadEvidence(up7), columns_named: named, differences: diffs };
         if (up7.status === 401 || up7.status === 403) results.push(inconclusive("M7", `POST /api/import refused the manager (HTTP ${up7.status})`, ev));
+        else if (up7.status === 404 && !diffs.length) results.push(inconclusive("M7", "POST /api/import is not found (route renamed?)", ev));
         else if (up7.status === null) results.push(inconclusive("M7", `the drift upload did not complete (${up7.error})`, ev));
         else if (is2xx(up7.status)) results.push(fail("M7", `The drift file (renamed ${exp.drift.renamed.from} → ${exp.drift.renamed.to}) was accepted with HTTP ${up7.status}${diffs.length ? ` and changed data: ${diffs.join("; ")}` : ""}`, ev));
         else if (diffs.length) results.push(fail("M7", `The drift file was rejected (HTTP ${up7.status}) but data changed: ${diffs.join("; ")}`, ev));

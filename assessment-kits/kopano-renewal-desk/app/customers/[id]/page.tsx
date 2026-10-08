@@ -6,7 +6,8 @@ import { OutcomeForm } from "@/components/OutcomeForm";
 import { SummaryPanel } from "@/components/SummaryPanel";
 import { requireCaller } from "@/lib/auth";
 import { CONSENT_LABELS, dateTime, day, rands } from "@/lib/format";
-import { BLOCK_MESSAGES, canReceive, type ContactPointLite } from "@/lib/messaging";
+import { deriveContractStatus } from "@/lib/import/normalise";
+import { BLOCK_MESSAGES, eligibleContacts, type ContactPointLite } from "@/lib/messaging";
 import { OUTCOME_LABELS, type Outcome } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -38,7 +39,7 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
   const accountIds = (accounts ?? []).map((a) => a.id);
   const [linesRes, contactsRes, interactionsRes, templatesRes, queueRes, optedOutRes, optoutRes, agentsRes] = await Promise.all([
     accountIds.length ? db.from("lines").select("*").in("account_id", accountIds).order("contract_end_date", { ascending: true }) : Promise.resolve({ data: [] }),
-    db.from("contact_points").select("id, type, value, person_name, role, consent_status, verified_at, source").eq("customer_id", id).order("type"),
+    db.from("contact_points").select("id, type, value, person_name, role, consent_status, verified_at, consent_note, source").eq("customer_id", id).order("type"),
     db.from("interactions").select("id, agent_id, outcome, next_action_at, notes, created_at").eq("customer_id", id).order("created_at", { ascending: false }),
     db.from("templates").select("id, name, category, body").eq("approved", true).order("name"),
     db.from("message_queue").select("id, template_id, channel, status, created_at").eq("customer_id", id).order("created_at", { ascending: false }).limit(10),
@@ -53,7 +54,7 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
   const optedOut = optedOutRes.data === true;
   const agentName = new Map((agentsRes.data ?? []).map((a) => [a.id, a.name]));
   const accountNo = new Map((accounts ?? []).map((a) => [a.id, a.account_no]));
-  const messageable = (contacts as ContactPointLite[]).filter((c) => canReceive(c, "utility"));
+  const messageable = eligibleContacts(contacts as ContactPointLite[], "utility");
   const blocked = optedOut ? BLOCK_MESSAGES.opted_out : messageable.length === 0 ? BLOCK_MESSAGES.no_consented_contact : null;
 
   return (
@@ -98,7 +99,8 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
                     <td>{accountNo.get(l.account_id)}</td>
                     <td>{l.priceplan_name ?? l.priceplan ?? "–"}</td>
                     <td>{day(l.contract_end_date)}</td>
-                    <td>{l.active ? l.contract_status : `Ported out ${day(l.ported_out_at)}`}</td>
+                    {/* BR-E3: derived from the end date when shown, so it is never stale between imports. */}
+                    <td>{l.active ? deriveContractStatus(l.contract_end_date) : `Ported out ${day(l.ported_out_at)}`}</td>
                     <td>{rands(l.monthly_charge_zar)}</td>
                   </tr>
                 ))}
@@ -137,8 +139,9 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
                     <td>
                       {CONSENT_LABELS[c.consent_status] ?? c.consent_status}
                       {c.verified_at && <div className="muted">confirmed {day(c.verified_at)}</div>}
+                      {c.consent_note && <div className="muted">note: {c.consent_note}</div>}
                     </td>
-                    <td>{c.type !== "landline" && <ConsentButtons contactPointId={c.id} />}</td>
+                    <td>{c.type !== "landline" && <ConsentButtons contactPointId={c.id} status={c.consent_status} canLift={caller.isManager} />}</td>
                   </tr>
                 ))}
               </tbody>

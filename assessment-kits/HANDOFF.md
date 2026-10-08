@@ -1,6 +1,6 @@
 # Kopano Renewal Desk: handoff pack for engineering
 
-*From: Business Analysis · To: the engineer taking the MVP to production · Version 1.2*
+*From: Business Analysis · To: the engineer taking the MVP to production · Version 1.3*
 
 Everything here is agreed with Lerato Dube (GM Virtual Sales) unless it is listed under open
 questions. All customer data you will see is synthetic.
@@ -55,13 +55,14 @@ Stories marked **must** are the ones engineering has committed to for this relea
 ### RD-05 Capture contact details and consent
 *As an agent I want to record the decision maker's details and what they agreed to so that we can message them lawfully.*
 - **Given** a call, **when** the customer agrees to receive messages, **then** I can mark the contact point "Opted in", which records the date.
-- **Given** the customer asks not to be contacted, **when** I mark the contact point "Opted out", **then** no message can be queued to it again.
-- Landlines can be recorded but can never be marked for messaging.
+- **Given** the customer asks not to be contacted, **when** I mark the contact point "Opted out", **then** no message can be queued to that number or address again, on any channel.
+- **Given** a contact point is opted out, **when** an agent tries to mark it "Opted in" again (by any route), **then** it is refused. Only a manager can lift an opt-out, and must give a reason, which is kept with who lifted it and when.
+- Landlines can be recorded but can never be marked for messaging: a number's type follows from the number itself (BR-C5), so a landline cannot be saved as a mobile or WhatsApp number.
 
 ### RD-06 Log a call outcome
 *As an agent I want to log the outcome of every call so that the team knows what happened and what is next.*
 - **Given** a call, **when** I log an outcome, **then** I choose one of: Call back, Quote requested, Sale, Not interested, No answer; I may add notes (up to 2,000 characters) and a next-action date.
-- **Given** an outcome is saved, **then** it appears in the customer's history with my name and the time, and it can never be edited or deleted (history is append-only).
+- **Given** an outcome is saved, **then** it appears in the customer's history with my name and the time it was logged (it cannot be backdated or logged as someone else), and it can never be edited or deleted (history is append-only).
 - **Given** I try to log an outcome for a customer that is not mine, **then** it is refused.
 
 ### RD-07 Mandatory callback date (must)
@@ -85,7 +86,7 @@ Stories marked **must** are the ones engineering has committed to for this relea
 
 ### RD-10 Queue a templated message
 *As an agent I want to send a Network-approved template to a consenting customer so that I can remind them about their renewal.*
-- **Given** a customer with a consented contact point (BR-C2), **when** I choose an approved template and press "Queue message", **then** the message is queued (status "queued") against the best contact point: WhatsApp, then mobile, then email. The Desk never sends; the Network's platform does.
+- **Given** a customer with a consented contact point (BR-C2), **when** I choose an approved template and press "Queue message", **then** the message is queued (status "queued") against the best qualifying contact point: WhatsApp, then mobile, then email; within the same channel, one with an explicit opt-in comes first. The Desk never sends; the Network's platform does.
 - **Given** a template is not approved, **then** it cannot be chosen or queued.
 - **Given** the template is a marketing template, **then** only contact points with an explicit opt-in qualify.
 - **Given** the customer has no qualifying contact point, **then** queueing is refused with the reason.
@@ -145,6 +146,7 @@ Stories marked **must** are the ones engineering has committed to for this relea
 | Log outcome | own customers, as themselves | all, as themselves | all, as themselves | ✗ |
 | Edit or delete an outcome | ✗ | ✗ | ✗ | ✗ |
 | Record contact consent | own customers | all | all | ✗ |
+| Lift an opt-out (with a reason) | ✗ | ✓ | ✓ | ✗ |
 | Queue a message | own customers (rules RD-10/11) | all (same rules) | all (same rules) | ✗ |
 | View other agents' calls or allocations | ✗ | ✓ | ✓ | ✗ |
 | Allocate customers | ✗ | ✓ | ✓ | ✗ |

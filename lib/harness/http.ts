@@ -149,6 +149,24 @@ export function describeError(err: unknown, timeoutMs?: number): string {
   return (e?.code ? `${e.code}: ` : "") + (e?.message || String(err)).slice(0, 200);
 }
 
+const CREDENTIAL_HEADERS = new Set(["cookie", "authorization", "apikey", "proxy-authorization", "x-api-key"]);
+
+/**
+ * Headers for the next redirect hop (always a GET without a body): the body's headers go, and on
+ * a cross-origin hop so do the credentials (the test user's session cookie and token, the
+ * publishable key), as browsers and fetch do.
+ */
+export function redirectHeaders(headers: Record<string, string>, from: URL, to: URL): Record<string, string> {
+  const crossOrigin = from.origin !== to.origin;
+  return Object.fromEntries(
+    Object.entries(headers).filter(([k]) => {
+      const name = k.toLowerCase();
+      if (name === "content-type" || name === "content-length") return false;
+      return !(crossOrigin && CREDENTIAL_HEADERS.has(name));
+    }),
+  );
+}
+
 /** A guarded HTTP client bound to one run's budget. */
 export function createHttp(opts: { budget: Budget; allowPrivate?: boolean; defaultTimeoutMs?: number }): Http {
   const allowPrivate = opts.allowPrivate ?? privateAllowed();
@@ -160,13 +178,16 @@ export function createHttp(opts: { budget: Budget; allowPrivate?: boolean; defau
       const body = ro.body === undefined ? undefined : Buffer.isBuffer(ro.body) ? ro.body : Buffer.from(ro.body);
       const redirects: string[] = [];
       const started = Date.now();
+      let headers = ro.headers ?? {};
       for (let hop = 0; ; hop++) {
         opts.budget.ensure();
         assertFetchableUrl(url, allowPrivate);
         const timeoutMs = Math.max(250, Math.min(ro.timeoutMs ?? opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS, opts.budget.remaining() - 250));
-        const res = await once(url, { method: hop === 0 ? method : "GET", headers: ro.headers ?? {}, body: hop === 0 ? body : undefined, timeoutMs, maxBytes: ro.maxBytes ?? DEFAULT_MAX_BYTES, allowPrivate });
+        const res = await once(url, { method: hop === 0 ? method : "GET", headers, body: hop === 0 ? body : undefined, timeoutMs, maxBytes: ro.maxBytes ?? DEFAULT_MAX_BYTES, allowPrivate });
         if (res.status >= 300 && res.status < 400 && res.headers.location && hop < (ro.followRedirects ?? 0)) {
-          url = new URL(res.headers.location, url);
+          const next = new URL(res.headers.location, url);
+          headers = redirectHeaders(headers, url, next);
+          url = next;
           redirects.push(url.toString());
           continue;
         }

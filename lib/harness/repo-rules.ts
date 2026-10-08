@@ -1,3 +1,5 @@
+import { fail, inconclusive, pass, type CheckResult, type Evidence } from "./checks";
+
 /**
  * Pure rules behind the repo checks (R1–R7). scripts/verify-swe1/repo-checks.ts gathers files
  * and command results from a clone; these functions decide. Nothing here runs candidate code.
@@ -34,14 +36,117 @@ export function parseGitleaksReport(json: unknown): GitleaksFinding[] {
   });
 }
 
-/** Does the README say the leaked key was rotated (revoked / regenerated / replaced)? */
-export function rotationDocumented(readme: string | null): { documented: boolean; quote: string | null } {
-  if (!readme) return { documented: false, quote: null };
-  const sentences = readme.replace(/\r/g, "").split(/(?<=[.!?])\s+|\n+/);
-  const verb = /\b(rotat(?:e|ed|ing|ion)|revok(?:e|ed|ing)|regenerat(?:e|ed|ing)|reissu(?:e|ed)|roll(?:ed)?\s+(?:the\s+)?(?:key|secret)s?|invalidat(?:e|ed))\b/i;
-  const noun = /\b(keys?|secrets?|credentials?|tokens?|service[\s_-]?role|\.env|api\s*key|password)\b/i;
-  const hit = sentences.find((s) => verb.test(s) && noun.test(s) && !/\b(should|would|todo|need to|not yet|didn'?t|did not)\b/i.test(s));
-  return { documented: !!hit, quote: hit ? hit.trim().slice(0, 300) : null };
+/**
+ * How the README speaks about rotating the leaked key:
+ * - documented: an affirmative, past-tense statement ("the key was rotated", "I revoked it");
+ * - unclear: rotation is mentioned without saying it was done ("Key rotation: see the dashboard");
+ * - negated: it says it was not done, or defers it ("never rotated", "out of scope", "left as a
+ *   follow-up", "we should rotate");
+ * - none: no sentence about rotating a key.
+ */
+export type RotationStatus = "documented" | "unclear" | "negated" | "none";
+
+const ROTATION_WORD = /\b(rotat\w*|revok\w*|revocation|regenerat\w*|re-?issu\w*|roll(?:ed|ing)?\s+(?:over\s+)?(?:the\s+)?(?:\w+\s+)?(?:keys?|secrets?|tokens?|credentials?)|invalidat\w*)\b/i;
+const ROTATION_PAST = /\b(rotated|revoked|regenerated|re-?issued|rolled|invalidated)\b/i;
+const ROTATION_STEM = String.raw`(?:rotat|revok|regenerat|re-?issu|roll|invalidat)`;
+const KEY_NOUN = /\b(keys?|secrets?|credentials?|tokens?|service[\s_-]?role|\.env[\w.-]*|api\s*keys?|passwords?|\w+_(?:key|secret|token))\b/i;
+/** A negation shortly before the verb: "was never rotated", "not revoked", "No credentials were revoked", "didn't rotate". */
+const NEGATED_NEAR = new RegExp(String.raw`(?:\b(?:never|not|no|none|without|nor)\b|n['’]t\b)\W+(?:[\w'’-]+\W+){0,3}?${ROTATION_STEM}`, "i");
+/** Deferred, planned or out of scope: "will be rotated", "should rotate", "left as a follow-up". */
+const DEFERRED = new RegExp(
+  [
+    String.raw`\b(?:out\s+of\s+scope|later|follow[\s-]?up|todo|to-do|tbd|next\s+steps?|pending|recommend\w*|suggest\w*|yet\s+to|plan(?:s|ned)?\s+to|need(?:s|ed)?\s+to|have\s+to|has\s+to|going\s+to)\b`,
+    String.raw`\b(?:will|shall|must|should|would|could|can)\s+(?:\w+\s+){0,2}?${ROTATION_STEM}`,
+    String.raw`\bask(?:ed|ing)?\s+(?:\w+\s+){0,3}?to\s+${ROTATION_STEM}`,
+  ].join("|"),
+  "i",
+);
+
+/** Does the README say the leaked key was rotated (revoked / regenerated)? Only an affirmative, past-tense statement counts. */
+export function rotationDocumented(readme: string | null): { documented: boolean; status: RotationStatus; quote: string | null } {
+  if (!readme) return { documented: false, status: "none", quote: null };
+  // Clauses: sentences, lines, list items, and the parts around ";", ":" and ", but". Headings
+  // ("## Key rotation") name a topic, they do not say anything was done.
+  const clauses = readme
+    .replace(/\r/g, "")
+    .split("\n")
+    .filter((line) => !/^\s{0,3}#/.test(line))
+    .flatMap((line) => line.split(/(?<=[.!?])\s+|;\s*|:\s+|,?\s+but\s+/i))
+    .map((s) => s.replace(/^[\s>*+-]+/, "").replace(/`|\*\*/g, "").trim())
+    .filter(Boolean);
+  let unclear: string | null = null;
+  let negated: string | null = null;
+  for (const c of clauses) {
+    if (!ROTATION_WORD.test(c) || !KEY_NOUN.test(c)) continue;
+    if (NEGATED_NEAR.test(c) || DEFERRED.test(c)) negated ??= c;
+    else if (ROTATION_PAST.test(c)) return { documented: true, status: "documented", quote: c.slice(0, 300) };
+    else unclear ??= c;
+  }
+  if (unclear) return { documented: false, status: "unclear", quote: unclear.slice(0, 300) };
+  if (negated) return { documented: false, status: "negated", quote: negated.slice(0, 300) };
+  return { documented: false, status: "none", quote: null };
+}
+
+export interface R1Input {
+  /** gitleaks over the history of the graded commit (null: gitleaks did not run or failed). */
+  history: GitleaksFinding[] | null;
+  /**
+   * Files of the graded commit that still hold a secret: gitleaks over the checked-out tree, else
+   * (dir scan unavailable) the files of history findings that still exist at the commit.
+   */
+  present: string[];
+  /** How `present` was established (evidence). */
+  presentVia: string;
+  rotation: { status: RotationStatus; quote: string | null };
+  /** Without gitleaks: .env files ever committed, and how many added lines looked like secrets. */
+  envHistory?: { files: string[]; secretLines: number };
+  /** Why gitleaks could not decide (tool missing, exit code). */
+  gitleaksProblem?: string | null;
+  evidence?: Evidence;
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/**
+ * R1. A secret still present in the graded commit always fails, whatever the README says. A
+ * secret only in history passes when the README affirmatively says the key was rotated (rotated
+ * but not rewritten: a reviewer confirms the quote); is inconclusive when the README mentions
+ * rotation without saying it was done; and fails otherwise.
+ */
+export function r1Verdict(input: R1Input): CheckResult {
+  const { rotation } = input;
+  const ev: Evidence = {
+    ...(input.evidence ?? {}),
+    rotation_status: rotation.status,
+    rotation_quote: rotation.quote,
+    present_at_graded_commit: input.present.slice(0, 20),
+    present_checked_via: input.presentVia,
+  };
+  const quoted = rotation.quote ? `: "${rotation.quote.slice(0, 160)}"` : "";
+  if (input.present.length) {
+    return fail("R1", `A secret is still in the graded commit (${input.present.slice(0, 5).join(", ")}): rotating the key does not excuse shipping it`, ev);
+  }
+  if (input.history) {
+    const unique = [...new Map(input.history.map((f) => [`${f.rule}|${f.file}|${f.commit}`, f])).values()];
+    ev.findings = unique.length;
+    ev.examples = unique.slice(0, 15).map((f) => `${f.rule} in ${f.file} @ ${f.commit}`);
+    if (!unique.length) return pass("R1", "gitleaks finds no secret anywhere in the history of the submitted commit", ev);
+    const found = `gitleaks finds ${plural(unique.length, "secret")} in history (none left in the graded commit)`;
+    if (rotation.status === "documented") return pass("R1", `${found}, and the README says the key was rotated`, ev, `rotated but not rewritten (ideal is both): confirm the README quote is about the leaked key${quoted}`);
+    if (rotation.status === "unclear") return inconclusive("R1", `${found}; the README mentions rotation but does not say it was done${quoted}`, ev);
+    return fail("R1", `${found}, and the README does not say the key was rotated${rotation.status === "negated" ? ` (it says${quoted})` : ""}`, ev);
+  }
+  const env = input.envHistory;
+  if (env && env.secretLines > 0) {
+    ev.env_files_in_history = env.files;
+    ev.secret_lines_in_env_history = env.secretLines;
+    const what = `${env.files.join(", ")} with ${plural(env.secretLines, "secret-looking value")} is in history`;
+    if (rotation.status === "documented" || rotation.status === "unclear") {
+      return inconclusive("R1", `${what}; the README ${rotation.status === "documented" ? "says the key was rotated" : "mentions rotation"}${quoted}, but gitleaks did not run (${input.gitleaksProblem ?? "unavailable"}): confirm the full-history scan by hand`, ev);
+    }
+    return fail("R1", `${what} and the README does not say the key was rotated${rotation.status === "negated" ? ` (it says${quoted})` : ""}`, ev);
+  }
+  return inconclusive("R1", input.gitleaksProblem ?? "gitleaks did not run", ev);
 }
 
 /** .env files (other than examples) ever added in history, from `git log --diff-filter=A --name-only`. */
@@ -109,7 +214,12 @@ export interface MigrationAnalysis {
   tables: string[];
   withoutRls: string[];
   disabledLater: string[];
+  /** Files the Supabase CLI skips (not named <digits>_<name>.sql): `supabase db reset` never applies them. */
+  notApplied: string[];
 }
+
+/** The Supabase CLI applies supabase/migrations/<digits>_<name>.sql only (pkg/migration: ^([0-9]+)_(.*)\.sql$). */
+export const CLI_MIGRATION_NAME = /^[0-9]+_.*\.sql$/;
 
 function stripSqlComments(sql: string): string {
   return sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ");
@@ -167,7 +277,13 @@ export function analyseMigrations(files: RepoFile[]): MigrationAnalysis {
     }
   }
   const tables = [...rls.keys()].sort();
-  return { files: sorted.map((f) => f.path), tables, withoutRls: tables.filter((t) => !rls.get(t)), disabledLater: [...disabledLater].filter((t) => !rls.get(t)) };
+  return {
+    files: sorted.map((f) => f.path),
+    tables,
+    withoutRls: tables.filter((t) => !rls.get(t)),
+    disabledLater: [...disabledLater].filter((t) => !rls.get(t)),
+    notApplied: sorted.map((f) => f.path).filter((p) => !CLI_MIGRATION_NAME.test(p.split("/").pop() ?? "")),
+  };
 }
 
 // ───────────────────────── R5: tests for the import and RD-07 ─────────────────────────

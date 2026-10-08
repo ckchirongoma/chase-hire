@@ -46,8 +46,21 @@ const INTERNAL = path.resolve(arg("internal-out", `${OUT}.internal`));
 const FORCE = process.argv.includes("--force");
 const SECRET_SEED = arg("secret-seed", "kopano-renewal-desk starter v1");
 
-if (OUT === REFERENCE || OUT.startsWith(`${REFERENCE}${path.sep}`) || REFERENCE.startsWith(`${OUT}${path.sep}`)) {
-  throw new Error("--out must be outside the reference app");
+const inside = (child, parent) => child === parent || child.startsWith(`${parent}${path.sep}`);
+function refuse(message) {
+  console.error(`make-starter: ${message}`);
+  process.exit(2);
+}
+if (inside(OUT, REFERENCE) || inside(REFERENCE, OUT)) {
+  refuse("--out must be outside the reference app");
+}
+// The internal artefacts (live-db.sql, faults.json with the planted key) must never land in the
+// starter's tree, where the last commit (`git add -A`) would hand them to candidates.
+if (inside(INTERNAL, OUT) || inside(OUT, INTERNAL)) {
+  refuse("--internal-out must be outside --out (and must not contain it)");
+}
+if (inside(INTERNAL, REFERENCE) || inside(REFERENCE, INTERNAL)) {
+  refuse("--internal-out must be outside the reference app");
 }
 
 // ───────────────────────── File helpers ─────────────────────────
@@ -168,6 +181,7 @@ const M_SECURITY = `${MIG}/20261001000002_security.sql`;
 const M_RULES = `${MIG}/20261001000003_rules.sql`;
 const M_IMPORT = `${MIG}/20261001000004_import.sql`;
 const M_RATE = `${MIG}/20261001000005_rate_limit.sql`;
+const M_HARDEN = `${MIG}/20261001000006_hardening.sql`;
 
 // ───────────────────────── Copy ─────────────────────────
 
@@ -559,9 +573,18 @@ function F09_phonesStoredAsNumbers() {
   edit("lib/import/base.ts", "      msisdn_e164: phone.e164,\n      number_type: phone.type,\n", "      msisdn_e164: Number(phone.e164),\n", { label: "F09" });
   edit(M_SCHEMA, "  msisdn_e164 text not null unique check (msisdn_e164 ~ '^\\+27[0-9]{9}$'),\n  number_type text not null check (number_type in ('mobile', 'landline')),\n", "  msisdn_e164 bigint not null unique,\n", { label: "F09" });
   edit(M_RULES, "  l.msisdn_e164,\n  l.number_type,\n", "  l.msisdn_e164,\n", { label: "F09", done: (t) => !t.includes("l.number_type") });
+  // The contact-point number checks would refuse the bare digits the BA's normaliser now produces.
+  editBetween(
+    M_HARDEN,
+    "  -- BR-C5: a phone number is E.164 text, and its type follows from the number.",
+    "        using errcode = '23514', hint = 'not_landline';\n    end if;\n  end if;\n\n",
+    "",
+    { label: "F09", done: (t) => !t.includes("hint = 'landline'") && t.includes("create or replace function public.contact_points_guard()") },
+  );
 }
 F09_phonesStoredAsNumbers.verify = (sql) => {
   check(/msisdn_e164 bigint not null unique/.test(sql) && !/number_type/.test(sql), "F09: msisdn bigint, no landline flag");
+  check(!/hint = '(landline|phone_format|not_landline)'/.test(sql), "F09: contact points take any number as any type");
   check(read("lib/import/base.ts").includes("msisdn_e164: Number(phone.e164)"), "F09: import stores numbers");
   check(read("lib/import/normalise.ts").includes('replace(/^0+/, "")'), "F09: normaliser drops the leading zero");
 };
@@ -586,10 +609,26 @@ function F11_statusFromExportColumn() {
   edit("lib/import/base.ts", "      contract_status: deriveContractStatus(endDate),\n", '      contract_status: text(cells["Contract Status"]) ?? "Unknown",\n', { label: "F11" });
   edit("lib/import/base.ts", "import { deriveContractStatus, integer, money,", "import { integer, money,", { label: "F11" });
   removeStatements(M_RULES, /(lines_set_contract_status|refresh_contract_status|derive_contract_status)/);
+  removeStatements(M_HARDEN, /(refresh_contract_status|pg_cron|cron\.schedule)/);
+  // The screens show the stored (stale) column instead of deriving it when read.
+  const page = "app/customers/[id]/page.tsx";
+  edit(page, 'import { deriveContractStatus } from "@/lib/import/normalise";\n', "", { label: "F11", done: (t) => !t.includes("deriveContractStatus") });
+  edit(
+    page,
+    "                    {/* BR-E3: derived from the end date when shown, so it is never stale between imports. */}\n                    <td>{l.active ? deriveContractStatus(l.contract_end_date) : `Ported out ${day(l.ported_out_at)}`}</td>\n",
+    "                    <td>{l.active ? l.contract_status : `Ported out ${day(l.ported_out_at)}`}</td>\n",
+    { label: "F11" },
+  );
+  edit("lib/summary.ts", 'import { deriveContractStatus } from "@/lib/import/normalise";\n', "", { label: "F11", done: (t) => !t.includes("deriveContractStatus") });
+  edit("lib/summary.ts", "      contract_status: deriveContractStatus(l.contract_end_date),\n", "      contract_status: l.contract_status,\n", { label: "F11" });
 }
 F11_statusFromExportColumn.verify = (sql) => {
   check(read("lib/import/base.ts").includes('contract_status: text(cells["Contract Status"])'), "F11: status from the export column");
-  check(!/lines_set_contract_status|refresh_contract_status/.test(sql), "F11: no status trigger");
+  check(!/lines_set_contract_status|refresh_contract_status|pg_cron|cron\.schedule/.test(sql), "F11: no status trigger, refresh or scheduled job");
+  for (const f of ["app/customers/[id]/page.tsx", "lib/summary.ts"]) {
+    const t = read(f);
+    check(!t.includes("deriveContractStatus") && t.includes("l.contract_status"), `F11: ${f} shows the stored status`);
+  }
 };
 
 /** F12: the opt-out list is never loaded or applied to messaging. */
@@ -599,6 +638,7 @@ function F12_optoutsNotApplied() {
   edit("app/api/messages/route.ts", "/** Queues a templated message (RD-10, RD-11). Nothing is sent from the Desk. */", "/** Queues a templated message. Nothing is sent from the Desk. */", { label: "F12" });
   removeStatements(M_RULES, /message_queue_guard/);
   removeStatements(M_IMPORT, /public\.(import_optouts|match_optouts)\b/);
+  removeStatements(M_HARDEN, /(message_queue_guard|public\.match_optouts\b)/);
   remove("lib/import/optouts.ts");
   edit("scripts/seed.ts", 'import { importOptoutsFile } from "../lib/import/optouts";\n', "", { label: "F12", done: (t) => !t.includes("importOptoutsFile") });
   edit("scripts/seed.ts", '  const optouts = await importOptoutsFile(admin, files.optouts, read(files.optouts));\n  console.log(`opt-outs: ${JSON.stringify(optouts.counts)}`);\n', "", { label: "F12", done: (t) => !t.includes("importOptoutsFile") });
@@ -854,6 +894,10 @@ buildHistory.verify = () => {
   check(!git(["ls-files"]).split("\n").includes(".env.local"), "F13: .env.local not in HEAD");
   check(git(["log", "--all", "-p", "--", ".env.local"]).includes(fakeSecret()), "F13: the key is still in history");
   check(git(["status", "--porcelain"]).trim() === "", "F13: clean working tree");
+  const tracked = git(["ls-files"]).split("\n");
+  check(!tracked.some((f) => /(^|\/)(live-db\.sql|faults\.json)$/.test(f)), "history: no internal artefact (live-db.sql, faults.json) is committed");
+  const everCommitted = git(["log", "--all", "--name-only", "--pretty=format:"]).split("\n");
+  check(!everCommitted.some((f) => /(^|\/)(live-db\.sql|faults\.json)$/.test(f)), "history: no internal artefact was ever committed");
   check(Number(git(["rev-list", "--count", "HEAD"]).trim()) >= 8, "F13: several commits");
 };
 

@@ -396,6 +396,14 @@ describe("bundle C (SWE Test 1)", () => {
     expect(() => fillStarterRepoUrl("x STARTER_REPO_URL", "http://example.com/starter")).toThrow(/github/);
     expect(() => fillStarterRepoUrl("x STARTER_REPO_URL", "not a url")).toThrow();
   }, 120_000);
+
+  it("tells candidates how to reach the starter and that their copy must be public (the platform reads it without signing in)", () => {
+    const readme = file("bundle_c/candidate/README.md").toString();
+    expect(readme).toMatch(/public repository: all you need is a GitHub account/);
+    expect(readme).toMatch(/whole history/);
+    expect(readme).toMatch(/Make your repository \*\*public\*\*/);
+    expect(readme).toMatch(/Do not use GitHub's "Use this template" button/);
+  });
 });
 
 describe("bundle C handoff pack", () => {

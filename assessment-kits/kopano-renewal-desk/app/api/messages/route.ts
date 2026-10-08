@@ -22,7 +22,7 @@ export async function POST(req: Request) {
 
   const [{ data: optedOut }, { data: contacts }] = await Promise.all([
     caller.db.rpc("customer_opted_out", { p_customer_id: customerId }),
-    caller.db.from("contact_points").select("id, type, consent_status, verified_at").eq("customer_id", customerId),
+    caller.db.from("contact_points").select("id, type, value, consent_status, verified_at").eq("customer_id", customerId),
   ]);
   const reason = messageBlockReason({ optedOut: optedOut === true, template: template as TemplateLite, contacts: (contacts ?? []) as ContactPointLite[] });
   if (reason) return errorJson(STATUS_FOR[reason], BLOCK_MESSAGES[reason], { reason });

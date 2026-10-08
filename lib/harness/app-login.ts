@@ -1,3 +1,4 @@
+import { elements, startTags } from "./html-scan";
 import { decodeJwt } from "./jwt";
 
 /**
@@ -49,11 +50,9 @@ const EMAIL_NAME = /e-?mail|user(?:name)?|login|identifier|account/i;
 /** Login forms on a page: forms with a password input and an email/username input. */
 export function parseLoginForms(html: string, pageUrl: string): LoginFormSpec[] {
   const out: LoginFormSpec[] = [];
-  for (const fm of html.matchAll(/<form\b[^>]*>[\s\S]*?<\/form\s*>/gi)) {
-    const formHtml = fm[0];
-    const formTag = formHtml.match(/^<form\b[^>]*>/i)![0];
-    const fa = tagAttributes(formTag);
-    const controls = [...formHtml.matchAll(/<(input|button|textarea|select)\b[^>]*>/gi)].map((m) => ({ kind: m[1].toLowerCase(), a: tagAttributes(m[0]) }));
+  for (const fm of elements(html, "form", 200_000)) {
+    const fa = tagAttributes(fm.tag.raw);
+    const controls = startTags(fm.inner, ["input", "button", "textarea", "select"]).map((t) => ({ kind: t.name, a: tagAttributes(t.raw) }));
     const inputs = controls.filter((c) => c.kind === "input");
     const password = inputs.find((c) => (c.a.type ?? "").toLowerCase() === "password" && c.a.name);
     if (!password) continue;

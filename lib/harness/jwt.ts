@@ -4,7 +4,8 @@
  * never stored in full: `preview` keeps the first 12 characters.
  */
 
-const JWT_RE = /eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{0,}/g;
+/** Maximal runs of base64url characters and dots: consumed left to right, so the scan is linear. */
+const TOKEN_RUN = /[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)*/g;
 const SECRET_KEY_RE = /\bsb_secret_[A-Za-z0-9_-]{8,}/g;
 const PUBLISHABLE_KEY_RE = /\bsb_publishable_[A-Za-z0-9_-]{8,}/g;
 
@@ -56,11 +57,31 @@ export interface FoundJwt {
   token: string;
 }
 
+/**
+ * JWT-shaped tokens (eyJ<header>.eyJ<payload>.<signature>) in text. A regex like
+ * /eyJ[\w-]{5,}\.eyJ…/ backtracks from every "eyJ" to the end of a long run (quadratic on a
+ * hostile 2 MB chunk of "eyJeyJ…"), so runs are tokenised once and split on dots instead.
+ */
+export function jwtCandidates(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(TOKEN_RUN)) {
+    const run = m[0];
+    if (!run.includes(".") || !run.includes("eyJ")) continue;
+    const parts = run.split(".");
+    for (let i = 0; i + 1 < parts.length; i++) {
+      const at = parts[i].indexOf("eyJ");
+      if (at < 0 || parts[i].length - at < 8 || !parts[i + 1].startsWith("eyJ") || parts[i + 1].length < 8) continue;
+      out.push(`${parts[i].slice(at)}.${parts[i + 1]}.${parts[i + 2] ?? ""}`);
+      i += 2;
+    }
+  }
+  return out;
+}
+
 export function findJwts(text: string): FoundJwt[] {
   const seen = new Set<string>();
   const out: FoundJwt[] = [];
-  for (const m of text.matchAll(JWT_RE)) {
-    const token = m[0];
+  for (const token of jwtCandidates(text)) {
     if (seen.has(token)) continue;
     seen.add(token);
     const claims = decodeJwt(token);

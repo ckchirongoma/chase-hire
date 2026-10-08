@@ -2,7 +2,7 @@ import "server-only";
 import { NextResponse } from "next/server";
 import type { SupabaseClient, User } from "@supabase/supabase-js";
 import { z } from "zod";
-import { CHECK_KEYS, kindOf, toRunRow, type CheckKey, type CheckResult } from "@/lib/harness/checks";
+import { CHECK_KEYS, holdBackInconclusive, kindOf, latestByKey, toRunRow, type CheckKey, type CheckResult, type StoredRun } from "@/lib/harness/checks";
 import { BUNDLE_FILES, HarnessExpected, optoutEntries, optoutEntriesFromSheet, type OptoutEntry } from "@/lib/harness/expected";
 import { dispatchConfig, dispatchWorkflow, localRepoCheckCommands } from "@/lib/harness/github";
 import { isPrivilegedKey } from "@/lib/harness/jwt";
@@ -27,9 +27,10 @@ import { routeUser } from "@/lib/server/route";
  *   GITHUB_ACTIONS_TOKEN and GITHUB_ACTIONS_REPO are set; otherwise the panel shows the local
  *   commands (scripts/verify-swe1/).
  *
- * Results are verification_runs rows (one per check, latest wins in the grader). Scores stay
- * advisory: nothing here changes an application's status. harness_runs (migration 0015) logs
- * each run and stops two runs of the same kind overlapping on one submission.
+ * Results are verification_runs rows (one per check, latest wins in the grader). An inconclusive
+ * result never replaces a conclusive or manual one (it is noted in harness_runs.summary instead).
+ * Scores stay advisory: nothing here changes an application's status. harness_runs (migration
+ * 0015) logs each run and stops two runs of the same kind overlapping on one submission.
  */
 
 export class HarnessError extends Error {
@@ -134,17 +135,35 @@ async function finishRun(admin: SupabaseClient, runId: string, status: "done" | 
   await admin.from("harness_runs").update({ status, finished_at: new Date().toISOString(), summary }).eq("id", runId);
 }
 
-async function writeResults(admin: SupabaseClient, submissionId: string, results: CheckResult[], meta: { ranBy: string | null; runId: string; target: string | null; startedAt: number }) {
-  if (!results.length) return;
-  const rows = results.map((r) => toRunRow(submissionId, r, { ranBy: meta.ranBy, meta: { harness_run: meta.runId, target_url: meta.target, duration_ms: Date.now() - meta.startedAt } }));
-  const { error } = await admin.from("verification_runs").insert(rows);
-  if (error) throw new HarnessError(`could not store the results: ${error.message}`, 500);
+type Kept = { key: CheckKey; reason: string }[];
+
+/**
+ * Writes one verification_runs row per result, except inconclusive results for checks whose
+ * latest row is conclusive or manual (see holdBackInconclusive): those are returned as `kept`.
+ */
+async function writeResults(admin: SupabaseClient, submissionId: string, results: CheckResult[], meta: { ranBy: string | null; runId: string; target: string | null; startedAt: number }): Promise<Kept> {
+  if (!results.length) return [];
+  const { data: stored, error: readError } = await admin
+    .from("verification_runs")
+    .select("check_key, passed, manual, detail")
+    .eq("submission_id", submissionId)
+    .in("check_key", results.map((r) => r.key))
+    .order("ran_at", { ascending: false });
+  if (readError) throw new HarnessError(`could not read earlier results: ${readError.message}`, 500);
+  const { write, kept } = holdBackInconclusive(results, latestByKey((stored ?? []) as StoredRun[]));
+  if (write.length) {
+    const rows = write.map((r) => toRunRow(submissionId, r, { ranBy: meta.ranBy, meta: { harness_run: meta.runId, target_url: meta.target, duration_ms: Date.now() - meta.startedAt } }));
+    const { error } = await admin.from("verification_runs").insert(rows);
+    if (error) throw new HarnessError(`could not store the results: ${error.message}`, 500);
+  }
+  return kept;
 }
 
-const tally = (results: CheckResult[]) => ({
+const tally = (results: CheckResult[], kept: Kept = []) => ({
   passed: results.filter((r) => r.passed === true).map((r) => r.key),
   failed: results.filter((r) => r.passed === false).map((r) => r.key),
-  inconclusive: results.filter((r) => r.passed === null).map((r) => r.key),
+  inconclusive: results.filter((r) => r.passed === null && !kept.some((k) => k.key === r.key)).map((r) => r.key),
+  kept: kept.map((k) => k.key),
 });
 
 export interface HarnessRunSummary {
@@ -153,7 +172,10 @@ export interface HarnessRunSummary {
   skipped: CheckKey[];
   passed: CheckKey[];
   failed: CheckKey[];
+  /** Inconclusive this run, and written (no earlier conclusive result). */
   inconclusive: CheckKey[];
+  /** Inconclusive this run, not written: the earlier conclusive or manual result stands. */
+  kept: CheckKey[];
 }
 
 const brief = (r: CheckResult) => ({ key: r.key, passed: r.passed, summary: String(r.detail.summary).slice(0, 300) });
@@ -196,9 +218,9 @@ export async function runUrlHarness(admin: SupabaseClient, submissionId: string,
           observatoryUrl: opts.observatoryUrl ?? process.env.HARNESS_OBSERVATORY_URL ?? undefined,
         })
       : { results: (["U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8"] as const).map((key) => ({ key, passed: null, detail: { summary: "Inconclusive: no deployed URL was submitted", inconclusive: true as const, reason: "no deployed URL was submitted" } })), context: {} };
-    await writeResults(admin, submissionId, results, { ranBy: opts.ranBy, runId, target: sub.deployedUrl, startedAt });
-    const t = tally(results);
-    await finishRun(admin, runId, "done", { ...t, context, opt_out_list: optouts.source });
+    const kept = await writeResults(admin, submissionId, results, { ranBy: opts.ranBy, runId, target: sub.deployedUrl, startedAt });
+    const t = tally(results, kept);
+    await finishRun(admin, runId, "done", { ...t, kept_earlier: kept, context, opt_out_list: optouts.source });
     return { runId, results: results.map(brief), skipped: [], ...t };
   } catch (err) {
     await finishRun(admin, runId, "failed", { error: err instanceof Error ? err.message.slice(0, 500) : String(err) });
@@ -221,9 +243,9 @@ export async function runImportHarness(admin: SupabaseClient, submissionId: stri
     const http = createHttp({ budget: new Budget(opts.budgetMs ?? IMPORT_BUDGET_MS) });
     const logins = parseTestLogins(sub.testLogins);
     const run = await runImportChecks({ http, deployedUrl: sub.deployedUrl, logins, expected, files: { month2, drift }, overrides: mergeOverrides(opts.overrides, logins), settlePollMs: opts.settlePollMs });
-    await writeResults(admin, submissionId, run.results, { ranBy: opts.ranBy, runId, target: sub.deployedUrl, startedAt });
-    const t = tally(run.results);
-    await finishRun(admin, runId, "done", { ...t, skipped: run.skipped, context: run.context });
+    const kept = await writeResults(admin, submissionId, run.results, { ranBy: opts.ranBy, runId, target: sub.deployedUrl, startedAt });
+    const t = tally(run.results, kept);
+    await finishRun(admin, runId, "done", { ...t, kept_earlier: kept, skipped: run.skipped, context: run.context });
     return { runId, results: run.results.map(brief), skipped: run.skipped, ...t };
   } catch (err) {
     await finishRun(admin, runId, "failed", { error: err instanceof Error ? err.message.slice(0, 500) : String(err) });
@@ -401,7 +423,16 @@ export function readFlash(raw: string | undefined, submissionId: string): { ok: 
 /** Turns a run summary into the one-line flash message. */
 export function describeRun(label: string, s: HarnessRunSummary): string {
   const part = (name: string, keys: CheckKey[]) => (keys.length ? `${name}: ${keys.join(", ")}` : null);
-  return [`${label} finished.`, part("passed", s.passed), part("failed", s.failed), part("inconclusive", s.inconclusive), part("skipped (month 2 already imported; earlier results stand)", s.skipped)].filter(Boolean).join(" ");
+  return [
+    `${label} finished.`,
+    part("passed", s.passed),
+    part("failed", s.failed),
+    part("inconclusive", s.inconclusive),
+    part("inconclusive this time, earlier result kept", s.kept ?? []),
+    part("skipped (month 2 already imported; earlier results stand)", s.skipped),
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 export function errorOutcome(err: unknown): { ok: false; message: string; status: number } {

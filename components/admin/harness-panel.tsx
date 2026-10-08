@@ -1,6 +1,6 @@
 import { cookies } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
-import { CHECK_KEYS, CHECK_LABELS, DATA_CHECKS, IMPORT_CHECKS, REPO_CHECKS, URL_CHECKS, type CheckKey } from "@/lib/harness/checks";
+import { CHECK_KEYS, CHECK_LABELS, DATA_CHECKS, IMPORT_CHECKS, kindOf, REPO_CHECKS, URL_CHECKS, type CheckKey } from "@/lib/harness/checks";
 import { dispatchConfig, localRepoCheckCommands } from "@/lib/harness/github";
 import { FLASH_COOKIE, readFlash } from "@/lib/server/harness";
 import { fmtDate } from "@/lib/format";
@@ -67,6 +67,15 @@ export default async function HarnessPanel({ submissionId }: { submissionId: str
     history.set(r.check_key, (history.get(r.check_key) ?? 0) + 1);
   }
   const lastOf = (kind: string) => ((harnessRows ?? []) as HRun[]).find((h) => h.kind === kind);
+  /** The latest run of this check's kind came back inconclusive and kept the earlier result (not written). */
+  const keptNote = (k: CheckKey, shown: Run | undefined): string | null => {
+    const kind = kindOf(k) === "data" ? "import" : kindOf(k);
+    const h = lastOf(kind);
+    const kept = Array.isArray(h?.summary?.kept_earlier) ? (h.summary.kept_earlier as { key?: unknown; reason?: unknown }[]) : [];
+    const hit = kept.find((x) => x?.key === k);
+    if (!h || !hit || (shown && new Date(h.started_at) < new Date(shown.ran_at))) return null;
+    return `The run of ${fmtDate(h.started_at)} could not decide (${String(hit.reason ?? "").slice(0, 200)}); the result above stands.`;
+  };
   const flash = readFlash(jar.get(FLASH_COOKIE)?.value, submissionId);
   const sha = (sub.repo_commit_sha as string | null) ?? ((sub.snapshot as { repo?: { sha?: string | null } } | null)?.repo?.sha ?? null);
   const commands = sub.repo_url && sha ? localRepoCheckCommands({ submissionId, repoUrl: sub.repo_url as string, sha }) : [];
@@ -110,6 +119,7 @@ export default async function HarnessPanel({ submissionId }: { submissionId: str
       </div>
       <p className="muted">
         Automated evidence for the grader and for you. Latest result per check (a manual result counts like any other run). Inconclusive means the check could not decide: record a manual result.
+        A later run that cannot decide never replaces a pass, a fail or your manual result.
         Results never change an application&apos;s status.
       </p>
 
@@ -128,6 +138,7 @@ export default async function HarnessPanel({ submissionId }: { submissionId: str
                 const r = latest.get(k);
                 const reason = typeof r?.detail?.reason === "string" ? r.detail.reason : null;
                 const note = typeof r?.detail?.reviewer_note === "string" ? r.detail.reviewer_note : null;
+                const kept = keptNote(k, r);
                 return (
                   <tr key={k}>
                     <th className="w-14 whitespace-nowrap">{k}</th>
@@ -142,6 +153,7 @@ export default async function HarnessPanel({ submissionId }: { submissionId: str
                           <p className="text-sm">{String(r.detail?.summary ?? "").slice(0, 400)}</p>
                           {reason && r.passed !== null ? <p className="text-xs text-slate-500">{reason}</p> : null}
                           {note && <p className="text-xs text-amber-800">Check by hand: {note}</p>}
+                          {kept && <p className="text-xs text-slate-500">{kept}</p>}
                           <p className="text-xs text-slate-400">
                             {fmtDate(r.ran_at)}
                             {(history.get(k) ?? 0) > 1 && ` · ${history.get(k)} runs`}
@@ -232,7 +244,11 @@ export default async function HarnessPanel({ submissionId }: { submissionId: str
             <details open={!dispatch}>
               <summary className="cursor-pointer text-xs text-slate-500">Local commands</summary>
               <pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2 text-xs">{commands.join("\n\n")}</pre>
-              <p className="text-xs text-slate-500">--exec runs the candidate&apos;s npm scripts inside Docker; --db-reset needs Docker and the Supabase CLI. Omit them to run the static checks only.</p>
+              <p className="text-xs text-slate-500">
+                These run the static checks only (R1, R2, R3 without the db reset, R6, R7); R4 and R5 stay inconclusive. They never run the candidate&apos;s code. The build, tests and db
+                reset run the candidate&apos;s code, so they run only in GitHub Actions or a throwaway VM (--disposable-sandbox --exec --db-reset), never on a machine with platform
+                credentials or a local Supabase. Record R4/R5 by hand if you cannot dispatch.
+              </p>
             </details>
           )}
           {sha && dispatch && (

@@ -1,12 +1,13 @@
 import "server-only";
 import { fail, inconclusive, informational, pass, snippet, type CheckKey, type CheckResult, type Evidence } from "./checks";
-import { tagAttributes } from "./app-login";
+import { looksLikeLoginPage, tagAttributes } from "./app-login";
 import { matchOptouts, type CustomerLite, type OptoutEntry } from "./expected";
 import { connect, newFrontEnd, type FrontEnd, type Sessions, type SupabaseTarget } from "./frontend";
+import { elements, startTags, stripComments, stripTags } from "./html-scan";
 import { BudgetExceeded, describeError, mapPool, SsrfError, type Http, type HttpResponse } from "./http";
 import { scanSecrets } from "./jwt";
 import { describeLogins, type ParsedLogins } from "./logins";
-import { appAuthHeaders, inList, refused, type Session } from "./supabase";
+import { appAuthHeaders, inList, refused, type RestResult, type Session } from "./supabase";
 
 /**
  * Deployed-URL checks U1–U8 (docs/07, docs/16). Admin-triggered, server-side, every request
@@ -14,9 +15,10 @@ import { appAuthHeaders, inList, refused, type Session } from "./supabase";
  *
  * These checks mostly read. A few write small, labelled probe rows to the candidate's database
  * (notes start with PROBE_NOTE): an interaction for agent B if B has none (U4), a valid
- * call_back control outcome (U6), and whatever a broken app lets through (U3/U6/U7), which is
- * itself the evidence. The month-2 import checks are the destructive ones and have their own
- * button.
+ * call_back control outcome (U6), one queued message to a customer NOT on the opt-out list (the
+ * U7 control, sent only after the opted-out customer was refused), and whatever a broken app lets
+ * through (U3/U6/U7), which is itself the evidence. The month-2 import checks are the destructive
+ * ones and have their own button.
  */
 
 export const PROBE_NOTE = "Verification harness probe";
@@ -149,11 +151,25 @@ function u2(ctx: Ctx): CheckResult {
     limits: fe.limitsHit,
     hits: hits.slice(0, 20),
   };
+  // Pages fetched as a signed-in user that did not land back on the login page.
+  const signedIn = fe.pages.filter((p) => p.as !== "anon" && p.status !== null && p.status >= 200 && p.status < 300 && !looksLikeLoginPage(new URL(p.finalUrl ?? p.url).pathname));
+  const customerPage = signedIn.some((p) => /^\/customers?\/[^/]+\/?$/.test(new URL(p.finalUrl ?? p.url).pathname));
+  evidence.signed_in_pages = signedIn.length;
+  evidence.customer_page_scanned = customerPage;
   const unique = [...new Set(hits.map((h) => h.kind))];
   if (hits.length) return fail("U2", `Secret material in the shipped front end: ${unique.join(", ")} (${hits.length} occurrence${hits.length === 1 ? "" : "s"})`, evidence);
   if (!fe.pages.some((p) => p.status && p.status < 300)) return inconclusive("U2", "no page of the deployment could be fetched", evidence);
   if (!scripts.length) return inconclusive("U2", "no same-origin JS chunks were found to scan", evidence);
-  return pass("U2", `No service-role JWT or sb_secret_ key in ${scripts.length} JS chunks and ${evidence.pages_scanned} pages`, evidence, fe.limitsHit.length ? `crawl limits hit (${fe.limitsHit.join("; ")}): chunks beyond them were not scanned` : undefined);
+  // Client components that only signed-in pages load (where F04 ships its key) were never fetched.
+  if (!signedIn.length) {
+    const why = ctx.sessions.errors.length ? ctx.sessions.errors.join("; ") : "no test user could sign in";
+    return inconclusive("U2", `no secret in the ${scripts.length} JS chunks of the public pages, but no signed-in page was scanned (${why}): chunks that only signed-in pages load were not checked`, evidence);
+  }
+  const notes = [
+    customerPage ? null : "no customer page (/customers/:id) was reached while signed in: its client components were not scanned",
+    fe.limitsHit.length ? `crawl limits hit (${fe.limitsHit.join("; ")}): chunks beyond them were not scanned` : null,
+  ].filter((x): x is string => !!x);
+  return pass("U2", `No service-role JWT or sb_secret_ key in ${scripts.length} JS chunks and ${evidence.pages_scanned} pages (${signedIn.length} signed in)`, evidence, notes.length ? notes.join("; ") : undefined);
 }
 
 // ───────────────────────── U3 ─────────────────────────
@@ -165,14 +181,19 @@ async function u3(ctx: Ctx): Promise<CheckResult> {
   const exposed: string[] = [];
   const unclear: string[] = [];
   let missing = 0;
+  // Answers only PostgREST gives (a JSON array, or a PostgREST / Postgres error code).
+  let postgrest = 0;
+  const shaped = (r: RestResult<unknown>) => (is2xx(r.status) && Array.isArray(r.rows)) || (r.code !== null && /^(PGRST|42|23|22|P0)/.test(r.code));
   for (const t of CONTRACT_TABLES) {
     const get = await sb.probe.select(t, { select: "*", limit: "1" });
+    if (shaped(get)) postgrest++;
     const getOk = (is2xx(get.status) && Array.isArray(get.rows) && get.rows.length === 0) || refused(get.status);
     if (get.status === 404) missing++;
     if (is2xx(get.status) && get.rows && get.rows.length > 0) exposed.push(`anonymous read of ${t} returned rows`);
     else if (!getOk) unclear.push(`GET ${t}: HTTP ${get.status}`);
 
     const post = await sb.probe.insert(t, {});
+    if (shaped(post)) postgrest++;
     // RLS is checked before NOT NULL/CHECK constraints, so a constraint error means RLS let the row through.
     const constraint = post.code !== null && /^(23|22)/.test(post.code);
     const postRefused = refused(post.status) || post.code === "42501";
@@ -181,8 +202,11 @@ async function u3(ctx: Ctx): Promise<CheckResult> {
     else if (!postRefused) unclear.push(`POST ${t}: HTTP ${post.status}${post.code ? ` ${post.code}` : ""}`);
     rows.push({ table: t, get_status: get.status, get_rows: get.rows?.length ?? null, get_code: get.code, post_status: post.status, post_code: post.code, post_message: post.message });
   }
-  const evidence: Evidence = { supabase_url: sb.url, via: sb.via, key_kind: sb.keyKind, verified: sb.verified, probes: rows };
+  const evidence: Evidence = { supabase_url: sb.url, via: sb.via, key_kind: sb.keyKind, verified: sb.verified, postgrest_answers: postgrest, probes: rows };
   if (exposed.length) return fail("U3", `Anonymous access not refused: ${exposed.join("; ")}`, evidence);
+  if (!sb.verified && postgrest === 0) {
+    return inconclusive("U3", `${sb.url} did not answer like Supabase (/auth/v1/settings) and no probe got a PostgREST answer, so its refusals may not come from the candidate's database: enter the project URL and publishable key in the harness form`, evidence);
+  }
   if (missing === CONTRACT_TABLES.length) return inconclusive("U3", "none of customers, lines, interactions exist under those names (renamed?): judge by hand", evidence);
   if (unclear.length) return inconclusive("U3", `unexpected responses: ${unclear.join("; ")}`, evidence);
   return pass("U3", "Anonymous reads of customers, lines and interactions return nothing or are refused, and anonymous inserts are refused", evidence);
@@ -222,12 +246,7 @@ async function loadAllocations(ctx: Ctx): Promise<void> {
   for (const links of Object.values(ctx.fe.customerLinks)) for (const l of links) if (l.text.length >= 3 && !ctx.names.has(l.id)) ctx.names.set(l.id, l.text);
 }
 
-const h1Of = (html: string) =>
-  html
-    .match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]
-    ?.replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim() ?? "";
+const h1Of = (html: string) => stripTags(elements(html, "h1", 20_000)[0]?.inner ?? "").replace(/\s+/g, " ").trim();
 
 /** Agent A opening a page of a customer only agent B has: does A see what B sees? */
 async function pageLeak(ctx: Ctx, a: Session, b: Session, customerId: string, knownName: string | null): Promise<{ probe: Evidence; leak: string | null } | null> {
@@ -406,6 +425,12 @@ async function u5(ctx: Ctx): Promise<CheckResult> {
 
 // ───────────────────────── U6 ─────────────────────────
 
+/** An error that names the opt-out / legal do-not-contact list. */
+const OPT_OUT_TEXT = /\bopt[\s_-]?(?:ed[\s_-]?)?out|\bdo[\s_-]?not[\s_-]?contact|\blegal|\bunsubscrib|\bsuppress/i;
+
+/** The database refused the row: RLS / grants (401, 403, 42501) or a trigger / constraint (P0xxx, 23xxx). */
+const dbRefused = (r: { status: number; code: string | null }) => r.status === 401 || r.status === 403 || r.code === "42501" || (r.code !== null && /^(P0|23)/.test(r.code));
+
 async function u6(ctx: Ctx): Promise<CheckResult> {
   const sb = ctx.sb;
   const a = ctx.sessions.a;
@@ -424,8 +449,9 @@ async function u6(ctx: Ctx): Promise<CheckResult> {
     evidence.rest = { status: r.status, code: r.code, message: r.message };
     rest = r;
     restCreated = is2xx(r.status);
-    // Refused by RLS/grants (the DB path is closed) or by a constraint/trigger (23xxx, P0xxx).
-    restHeld = !restCreated && (r.status === 401 || r.status === 403 || r.code === "42501" || (r.code !== null && /^(23|P0)/.test(r.code)));
+    // Refused by RLS/grants (the DB path is closed) or by a constraint/trigger (23xxx, P0xxx). A
+    // bare 401/403 counts only from a project verified as Supabase (else it may be any gateway).
+    restHeld = !restCreated && (sb.verified || r.code !== null) && dbRefused(r);
   }
 
   // 2. The app route, bypassing the UI.
@@ -467,35 +493,34 @@ export function templatesFromPage(html: string): PageTemplate[] {
   const add = (id: string | undefined, category: string | null) => {
     if (id && id.length <= 80 && !out.has(id)) out.set(id, { id, category });
   };
-  for (const sel of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select\s*>/gi)) {
-    const name = tagAttributes(`<select ${sel[1]}>`).name ?? "";
-    const options = [...sel[2].matchAll(/(<option\b[^>]*>)([\s\S]*?)<\/option\s*>/gi)];
-    if (!/template/i.test(name) && !options.some((o) => /utility|marketing|template/i.test(o[2]))) continue;
+  for (const sel of elements(html, "select", 200_000)) {
+    const name = tagAttributes(sel.tag.raw).name ?? "";
+    const options = elements(sel.inner, "option", 4_000).map((o) => ({ at: tagAttributes(o.tag.raw), text: o.inner }));
+    if (!/template/i.test(name) && !options.some((o) => /utility|marketing|template/i.test(o.text))) continue;
     for (const o of options) {
-      const at = tagAttributes(o[1]);
-      if (at.value && !("disabled" in at)) add(at.value, /utility/i.test(o[2]) ? "utility" : /marketing/i.test(o[2]) ? "marketing" : null);
+      if (o.at.value && !("disabled" in o.at)) add(o.at.value, /utility/i.test(o.text) ? "utility" : /marketing/i.test(o.text) ? "marketing" : null);
     }
   }
   const flat = html.replace(/\\"/g, '"');
+  let lists = 0;
   for (const m of flat.matchAll(/"templates?"\s*:\s*\[/g)) {
+    if (++lists > 5) break;
     // Each object's id, paired with the category before the next id (bodies may hold braces).
     const region = flat.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 20_000);
     const objects = region.split(/"id"\s*:\s*"/).slice(1);
     for (const o of objects.slice(0, 50)) add(o.match(/^([^"]{1,80})"/)?.[1], o.match(/"category"\s*:\s*"([^"]{1,40})"/)?.[1] ?? null);
   }
-  for (const i of html.matchAll(/<input\b[^>]*>/gi)) {
-    const at = tagAttributes(i[0]);
+  for (const t of startTags(html, ["input"])) {
+    const at = tagAttributes(t.raw);
     if (at.name && /template/i.test(at.name) && at.value) add(at.value, null);
   }
   return [...out.values()].sort((a, b) => Number(/utility/i.test(b.category ?? "")) - Number(/utility/i.test(a.category ?? "")));
 }
 
 /** Does the page show a template picker (the messaging form is not blocked for this customer)? */
-const showsTemplatePicker = (html: string) => {
+const showsTemplatePicker = (html: string) =>
   // React marks text boundaries with <!-- --> comments: "Reminder<!-- --> (<!-- -->utility<!-- -->)".
-  const clean = html.replace(/<!--[\s\S]*?-->/g, "");
-  return /<select\b[\s\S]*?<\/select\s*>/i.test(clean) && /<option\b[^>]*>[^<]*(utility|marketing|template)/i.test(clean);
-};
+  elements(stripComments(html), "select", 200_000).some((sel) => elements(sel.inner, "option", 4_000).some((o) => /utility|marketing|template/i.test(o.inner)));
 
 async function u7(ctx: Ctx): Promise<CheckResult> {
   const sb = ctx.sb;
@@ -516,9 +541,10 @@ async function u7(ctx: Ctx): Promise<CheckResult> {
   } else evidence.list_source = ctx.input.optoutSource ?? `bundle opt-out list (${entries.length} names)`;
   if (!entries.length) return inconclusive("U7", "no opt-out list available (bundle missing and the app's optouts table is empty or unreadable)", evidence);
 
-  // Opted-out customers one signed-in user can see.
+  // Opted-out customers one signed-in user can see, and everything each user can see (for the control).
   type Cand = { who: string; session: Session; customer: CustomerLite; via: string; listed: string; page: string | null };
   let cands: Cand[] = [];
+  const visible = new Map<string, { rows: CustomerLite[]; links: Map<string, string> }>();
   for (const [who, s, pageKey] of sessions) {
     if (cands.length >= 25) break;
     let rows: CustomerLite[] = [];
@@ -528,6 +554,7 @@ async function u7(ctx: Ctx): Promise<CheckResult> {
     }
     const links = ctx.fe.customerLinks[pageKey] ?? [];
     if (!rows.length) rows = links.map((l) => ({ id: l.id, legal_name: l.text }));
+    visible.set(who, { rows, links: new Map(links.map((l) => [l.id, l.url])) });
     const matches = matchOptouts(rows, entries);
     evidence[`matches_${who.replace(/\s+/g, "_").toLowerCase()}`] = matches.length;
     for (const m of matches.slice(0, 25)) {
@@ -538,30 +565,48 @@ async function u7(ctx: Ctx): Promise<CheckResult> {
   }
   if (!cands.length) return inconclusive("U7", `none of the customers the test users can see is on the opt-out list (by reg no or normalised name)${sb ? "" : `; only customers linked from their pages were checked, and ${noRest(ctx)}`}`, evidence);
 
-  // Prefer a customer who could otherwise be messaged (a consented contact point), so a refusal
-  // is down to the opt-out and not to missing consent.
   const pageOf = new Map<string, string>();
-  const fetchPage = async (c: Cand) => {
-    const url = c.page ?? new URL(`/customers/${c.customer.id}`, ctx.base).toString();
-    const r = await ctx.http.request(url, { headers: appAuthHeaders(sb?.url ?? null, c.session), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
-    if (r && r.status === 200) pageOf.set(c.customer.id, r.text());
+  const fetchPage = async (customerId: string, session: Session, url: string | null) => {
+    if (pageOf.has(customerId)) return;
+    const r = await ctx.http.request(url ?? new URL(`/customers/${customerId}`, ctx.base).toString(), { headers: appAuthHeaders(sb?.url ?? null, session), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
+    if (r && r.status === 200) pageOf.set(customerId, r.text());
   };
-  if (sb) {
-    const cp = await sb.probe.select("contact_points", { select: "customer_id,consent_status", customer_id: inList(cands.map((c) => c.customer.id)), limit: "1000" }, cands[0].session);
-    if (cp.rows) {
-      const consented = new Set(cp.rows.filter((r) => r.consent_status && !/opted[\s_-]?out|unknown|none|^no$|refused|withdrawn/i.test(String(r.consent_status))).map((r) => String(r.customer_id)));
-      cands = [...cands.filter((c) => consented.has(c.customer.id)), ...cands.filter((c) => !consented.has(c.customer.id))];
-      evidence.with_consented_contact = consented.size;
-    }
-  } else {
+  /** Customers with a consented contact point (REST), so a refusal is down to the opt-out and not to missing consent. */
+  const consentedAmong = async (ids: string[], session: Session): Promise<Set<string> | null> => {
+    if (!sb || !ids.length) return null;
+    const cp = await sb.probe.select("contact_points", { select: "customer_id,consent_status", customer_id: inList(ids.slice(0, 100)), limit: "2000" }, session);
+    if (!cp.rows) return null;
+    return new Set(cp.rows.filter((r) => r.consent_status && !/opted[\s_-]?out|unknown|none|^no$|refused|withdrawn/i.test(String(r.consent_status))).map((r) => String(r.customer_id)));
+  };
+  const byPicker = (ids: string[]) => ids.filter((id) => showsTemplatePicker(pageOf.get(id) ?? ""));
+
+  // Prefer an opted-out customer who could otherwise be messaged.
+  const candConsent = await consentedAmong(cands.map((c) => c.customer.id), cands[0].session);
+  if (candConsent) {
+    cands = [...cands.filter((c) => candConsent.has(c.customer.id)), ...cands.filter((c) => !candConsent.has(c.customer.id))];
+    evidence.with_consented_contact = candConsent.size;
+  } else if (!sb) {
     // No REST: a customer whose page still offers the template picker is one the app would message.
-    await mapPool(cands.slice(0, 10), 3, fetchPage);
-    const open = cands.filter((c) => showsTemplatePicker(pageOf.get(c.customer.id) ?? ""));
-    cands = [...open, ...cands.filter((c) => !open.includes(c))];
-    evidence.pages_with_message_form = open.length;
+    await mapPool(cands.slice(0, 10), 3, (c) => fetchPage(c.customer.id, c.session, c.page));
+    const open = new Set(byPicker(cands.map((c) => c.customer.id)));
+    cands = [...cands.filter((c) => open.has(c.customer.id)), ...cands.filter((c) => !open.has(c.customer.id))];
+    evidence.pages_with_message_form = open.size;
   }
   const pick = cands[0];
   evidence.customer = { id: pick.customer.id, legal_name: pick.customer.legal_name ?? null, listed_as: pick.listed, matched_by: pick.via, as: pick.who };
+
+  // The control: a customer the same user sees who is NOT on the list (consented / offered the form first).
+  const seen = visible.get(pick.who) ?? { rows: [], links: new Map<string, string>() };
+  const listedIds = new Set(matchOptouts(seen.rows, entries).map((m) => m.customer.id));
+  let controls = seen.rows.filter((c) => !listedIds.has(c.id));
+  const controlConsent = await consentedAmong(controls.map((c) => c.id), pick.session);
+  if (controlConsent) controls = [...controls.filter((c) => controlConsent.has(c.id)), ...controls.filter((c) => !controlConsent.has(c.id))];
+  else if (!sb) {
+    await mapPool(controls.slice(0, 5), 3, (c) => fetchPage(c.id, pick.session, seen.links.get(c.id) ?? null));
+    const open = new Set(byPicker(controls.slice(0, 5).map((c) => c.id)));
+    controls = [...controls.filter((c) => open.has(c.id)), ...controls.filter((c) => !open.has(c.id))];
+  }
+  const control = controls[0] ?? null;
 
   let templateId: string | null = null;
   if (sb) {
@@ -574,22 +619,28 @@ async function u7(ctx: Ctx): Promise<CheckResult> {
     } else evidence.template_rest_status = t.status;
   }
   if (!templateId) {
-    if (!pageOf.has(pick.customer.id)) await fetchPage(pick);
-    const found = templatesFromPage(pageOf.get(pick.customer.id) ?? "")[0];
+    // From the opted-out customer's page, else the control's (a hardened app may hide the form for opted-out customers).
+    await fetchPage(pick.customer.id, pick.session, pick.page);
+    let found = templatesFromPage(pageOf.get(pick.customer.id) ?? "")[0];
+    if (!found && control) {
+      await fetchPage(control.id, pick.session, seen.links.get(control.id) ?? null);
+      found = templatesFromPage(pageOf.get(control.id) ?? "")[0];
+    }
     if (found) {
       templateId = found.id;
       evidence.template = { id: found.id, category: found.category, from: "customer page" };
     }
   }
-  if (!templateId) return inconclusive("U7", `no message template is visible to the ${pick.who} (not via REST, not on the customer's page)`, evidence);
+  if (!templateId) return inconclusive("U7", `no message template is visible to the ${pick.who} (not via REST, not on the customer pages)`, evidence);
 
   const api = await appPost(ctx, "/api/messages", { customerId: pick.customer.id, templateId }, pick.session);
   const body = api.text();
   evidence.api = { status: api.status, body: snippet(body, 200) };
-  let rest: { status: number; code: string | null } | null = null;
+  const queueRow = (customerId: string) => ({ customer_id: customerId, template_id: templateId, status: "queued", created_by: pick.session.userId });
+  let rest: RestResult<unknown> | null = null;
   if (sb) {
-    const r = await sb.probe.insert("message_queue", { customer_id: pick.customer.id, template_id: templateId, status: "queued", created_by: pick.session.userId }, pick.session, "return=representation");
-    evidence.rest = { status: r.status, code: r.code, message: r.message };
+    const r = await sb.probe.insert("message_queue", queueRow(pick.customer.id), pick.session, "return=representation");
+    evidence.rest = { status: r.status, code: r.code, message: r.message, hint: r.hint };
     rest = r;
   }
 
@@ -598,14 +649,51 @@ async function u7(ctx: Ctx): Promise<CheckResult> {
   if (api.status === 401) return inconclusive("U7", "POST /api/messages refused the signed-in user (401): session not accepted, test by hand", evidence);
   if (api.status === 404 && (looksHtml(api) || !/opt|consent|block/i.test(body))) return inconclusive("U7", "POST /api/messages returned 404 (route renamed?)", evidence);
   if (!is4xx(api.status)) return inconclusive("U7", `POST /api/messages returned HTTP ${api.status} (expected 4xx)`, evidence);
-  const saysOptOut = /opt[\s_-]?(?:ed[\s_-]?)?out|do[\s_-]?not[\s_-]?contact|legal|unsubscrib|suppress/i.test(body);
+  const saysOptOut = OPT_OUT_TEXT.test(body);
   if (!saysOptOut && /consent|contact/i.test(body)) return inconclusive("U7", `the message to "${pick.listed}" was refused for a missing consented contact, not the opt-out, so the opt-out rule was not tested`, evidence);
-  if (!rest) return inconclusive("U7", `POST /api/messages refused the opted-out customer "${pick.listed}" (${api.status}), but ${noRest(ctx)}`, evidence);
+
+  // Positive control: the same request for a customer who is not on the list must go through,
+  // or a refusal proves nothing (a route that rejects every request also "refuses" opted-out ones).
+  let controlOk = false;
+  if (control) {
+    const c = await appPost(ctx, "/api/messages", { customerId: control.id, templateId }, pick.session);
+    controlOk = is2xx(c.status);
+    evidence.control = { customer_id: control.id, legal_name: control.legal_name ?? null, status: c.status, body: snippet(c.text(), 160) };
+    if (!controlOk && !saysOptOut) {
+      return inconclusive("U7", `the app also refused a message to "${control.legal_name ?? control.id}", who is not on the opt-out list (HTTP ${c.status}), so the refusal (HTTP ${api.status}) proves nothing about the opt-out rule`, evidence);
+    }
+  } else {
+    evidence.control = "no customer outside the opt-out list is visible to the same user";
+    if (!saysOptOut) return inconclusive("U7", `the refusal (HTTP ${api.status}) does not mention the opt-out, and no customer outside the list was available to show that other messages go through`, evidence);
+  }
+
+  if (!rest || !sb) return inconclusive("U7", `POST /api/messages refused the opted-out customer "${pick.listed}" (${api.status}), but ${noRest(ctx)}`, evidence);
+
+  // The database half. Closed to direct inserts (RLS / grants) holds for everyone. A trigger or
+  // constraint error (P0xxx, 23xxx) holds only if it cites the opt-out, or if the same insert for
+  // a customer not on the list goes through (a trigger may refuse for other reasons: an unapproved
+  // template, missing consent, a missing column).
+  const apiPart = `POST /api/messages refused "${pick.listed}" (${api.status})`;
+  const restCode = `HTTP ${rest.status}${rest.code ? ` (${rest.code})` : ""}`;
+  if (!dbRefused(rest) || (!sb.verified && rest.code === null)) {
+    return inconclusive("U7", `${apiPart}, but the REST insert into message_queue returned ${restCode}, which is not a refusal by RLS, a grant or a trigger: unclear whether the database rule holds`, evidence);
+  }
+  let dbHow: string;
+  if (rest.status === 401 || rest.status === 403 || rest.code === "42501") dbHow = `closed to direct inserts (${rest.code ?? rest.status})`;
+  else if (OPT_OUT_TEXT.test(`${rest.message ?? ""} ${rest.hint ?? ""}`)) dbHow = `a trigger citing the opt-out (${rest.code})`;
+  else if (control) {
+    const rc = await sb.probe.insert("message_queue", queueRow(control.id), pick.session, "return=representation");
+    evidence.rest_control = { customer_id: control.id, status: rc.status, code: rc.code, message: rc.message };
+    if (!is2xx(rc.status)) return inconclusive("U7", `${apiPart}; the database refused it with ${restCode} but also refused the same insert for a customer not on the list (HTTP ${rc.status}${rc.code ? ` ${rc.code}` : ""}), so the database refusal proves nothing about the opt-out`, evidence);
+    dbHow = `${rest.code}, while the same insert for a customer not on the list went through`;
+  } else {
+    return inconclusive("U7", `${apiPart}; the database refused it with ${restCode} without citing the opt-out, and no customer outside the list was available to compare`, evidence);
+  }
   return pass(
     "U7",
-    `Message to opted-out customer "${pick.listed}" refused by the API (${api.status}) and the database (${rest.code ?? rest.status})`,
+    `Message to opted-out customer "${pick.listed}" refused by the API (${api.status}) and the database (${dbHow})${controlOk ? "; a message to a customer not on the list went through" : ""}`,
     evidence,
-    saysOptOut ? undefined : "the refusal does not mention the opt-out: confirm it was refused for that reason (not, say, a missing consented contact)",
+    controlOk ? (saysOptOut ? undefined : "the refusal does not mention the opt-out, though a message to a customer not on the list went through") : "the control message to a customer not on the list was refused too; the refusal cites the opt-out",
   );
 }
 

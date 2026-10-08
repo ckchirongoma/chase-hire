@@ -30,6 +30,8 @@ export interface FetchedText {
   error: string | null;
   /** Which session fetched it (for pages). */
   as: string;
+  /** Where redirects ended (pages): a signed-in fetch that lands on the login page was not signed in. */
+  finalUrl?: string;
 }
 
 export interface FrontEnd {
@@ -101,9 +103,12 @@ export async function crawl(http: Http, fe: FrontEnd, paths: string[], opts: { h
     const fetched = await mapPool(todo.slice(0, room), 4, (u) => fetchText(http, fe, u, headers, CRAWL_LIMITS.scriptBytes, opts.as, 3));
     const links: string[] = [];
     for (const p of fetched) {
-      const { text, finalUrl, ...meta } = p;
+      const { text, ...meta } = p;
+      const finalUrl = p.finalUrl;
       fe.pages.push(meta);
       if (!text) continue;
+      // Parsing is linear (html-scan.ts), but a slow run must still stop inside the route's maxDuration.
+      http.budget.ensure(2_000);
       const at = new URL(finalUrl);
       fe.texts.set(`${finalUrl}#${opts.as}`, text);
       for (const s of extractScriptUrls(text, at)) if (!scripts.includes(s)) scripts.push(s);

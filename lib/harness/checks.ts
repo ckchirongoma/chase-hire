@@ -174,6 +174,43 @@ export function toRunRow(
   };
 }
 
+// ───────────────────────── Keeping conclusive results ─────────────────────────
+
+/** A stored verification_runs row, as far as the "latest result" rule needs it. */
+export interface StoredRun {
+  check_key: string;
+  passed: boolean | null;
+  manual: boolean;
+  detail: Record<string, unknown> | null;
+}
+
+/** A pass/fail, a reviewer's manual result, or an informational reading (U8): anything but "could not decide". */
+export const isConclusiveRow = (r: StoredRun) => r.passed !== null || r.manual === true || r.detail?.inconclusive !== true;
+
+/** The newest stored row per check key, from rows ordered newest first. */
+export function latestByKey(rowsNewestFirst: readonly StoredRun[]): Map<string, StoredRun> {
+  const out = new Map<string, StoredRun>();
+  for (const r of rowsNewestFirst) if (!out.has(r.check_key)) out.set(r.check_key, r);
+  return out;
+}
+
+/**
+ * The grader and the admin panel read the latest row per check, and treat an inconclusive row as
+ * "not run". So an inconclusive result is held back (not written) when the check's latest row is
+ * conclusive or manual: a transient failure on a re-run must not erase earlier evidence or a
+ * reviewer's result. Held-back results are reported (harness_runs.summary) instead.
+ */
+export function holdBackInconclusive(results: CheckResult[], latest: Map<string, StoredRun>): { write: CheckResult[]; kept: { key: CheckKey; reason: string }[] } {
+  const write: CheckResult[] = [];
+  const kept: { key: CheckKey; reason: string }[] = [];
+  for (const r of results) {
+    const prev = latest.get(r.key);
+    if (r.passed === null && r.detail.inconclusive === true && prev && isConclusiveRow(prev)) kept.push({ key: r.key, reason: String(r.detail.reason ?? r.detail.summary).slice(0, 300) });
+    else write.push(r);
+  }
+  return { write, kept };
+}
+
 /** Redacts JWTs and secret-looking keys from free text before it is stored as evidence. */
 export function redactSecrets(text: string): string {
   return text

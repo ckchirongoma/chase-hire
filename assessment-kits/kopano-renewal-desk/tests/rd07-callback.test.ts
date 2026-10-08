@@ -42,6 +42,27 @@ describe.skipIf(!DB_TESTS)("RD-07 in the database and the API", () => {
     expect(error?.code).toBe("23514");
   });
 
+  it("a forged created_at cannot make a past callback date valid (REST)", async () => {
+    const { error } = await agent.db
+      .from("interactions")
+      .insert({ customer_id: customerId, agent_id: agent.id, outcome: "call_back", next_action_at: "2026-01-02T09:00:00Z", created_at: "2026-01-01T09:00:00Z" });
+    expect(error?.code).toBe("23514");
+  });
+
+  it("history cannot be backdated: the database records the time and the signed-in agent", async () => {
+    const before = Date.now();
+    const { data, error } = await agent.db
+      .from("interactions")
+      .insert({ customer_id: customerId, agent_id: agent.id, outcome: "no_answer", created_at: "2020-01-01T09:00:00Z" })
+      .select("agent_id, created_at")
+      .single();
+    expect(error).toBeNull();
+    expect(data?.agent_id).toBe(agent.id);
+    expect(new Date(data!.created_at).getTime()).toBeGreaterThanOrEqual(before - 60_000);
+    const { error: editError, data: edited } = await agent.db.from("interactions").update({ notes: "changed" }).eq("customer_id", customerId).select("id");
+    expect(editError !== null || (edited ?? []).length === 0).toBe(true);
+  });
+
   it("POST /api/outcomes answers 422 for call_back without a date and 201 with one", async () => {
     const { POST } = await import("@/app/api/outcomes/route");
     const bad = await POST(authedRequest("/api/outcomes", agent, { customerId, outcome: "call_back" }));

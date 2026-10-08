@@ -129,15 +129,65 @@ describe("URL checks U1–U8", () => {
     psql(`update public.harness_runs set status = 'failed' where submission_id = '${goodSub}' and status = 'running'`);
   });
 
-  it("records everything as inconclusive when the test logins are unusable", async () => {
+  it("records checks it cannot decide as inconclusive, without replacing a reviewer's result", async () => {
     const sub = await swe1Submission(good, "Logins are in the README.");
-    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: good.observatoryUrl });
+    const { data: auth } = await boss.client.auth.getUser();
+    await recordManualResult(boss.client, auth.user!, sub, { check_key: "U4", result: "pass", note: "Signed in as both agents by hand: no cross-tenant rows" });
+    const s = await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: good.observatoryUrl });
     const rows = await latest(sub);
-    for (const k of ["U4", "U6"]) {
-      expect(rows.get(k)?.passed).toBeNull();
-      expect(rows.get(k)?.detail.inconclusive).toBe(true);
-    }
+    expect(rows.get("U6")).toMatchObject({ passed: null, detail: { inconclusive: true } });
+    expect(rows.get("U2")).toMatchObject({ passed: null, detail: { inconclusive: true, reason: expect.stringMatching(/no signed-in page was scanned/) } });
     expect(rows.get("U3")?.passed).toBe(true); // anonymous probes need no login
+    // U4 could not decide this time: the manual pass stays the latest row (the grader reads it).
+    expect(rows.get("U4")).toMatchObject({ passed: true, manual: true });
+    expect(s.kept).toEqual(["U4"]);
+    const { data: run } = await admin.from("harness_runs").select("summary").eq("id", s.runId).single();
+    expect((run!.summary as { kept_earlier: { key: string }[] }).kept_earlier.map((k) => k.key)).toEqual(["U4"]);
+  }, 120_000);
+
+  it("does not pass U2 on public chunks alone when the test users cannot sign in (F04 ships on signed-in pages)", async () => {
+    const wrong = bad.testLogins.replace(bad.users.a.password, "wrong-a").replace(bad.users.b.password, "wrong-b").replace(bad.users.manager.password, "wrong-m");
+    const sub = await swe1Submission(bad, wrong);
+    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: bad.observatoryUrl });
+    const rows = await latest(sub);
+    expect(rows.get("U2")).toMatchObject({ passed: null, detail: { inconclusive: true } });
+  }, 120_000);
+});
+
+describe("apps that could fool a naive check", () => {
+  let rejectAll: FakeTarget;
+  let opaque: FakeTarget;
+  let noImport: FakeTarget;
+  beforeAll(async () => {
+    [rejectAll, opaque, noImport] = await Promise.all([startFakeTarget("good", { messagesRejectAll: true }), startFakeTarget("good", { opaqueSupabase: true }), startFakeTarget("good", { noImportRoute: true })]);
+  });
+  afterAll(async () => {
+    await Promise.all([rejectAll?.close(), opaque?.close(), noImport?.close()]);
+  });
+
+  it("U7: a messages route that refuses everything (and a closed message_queue) is inconclusive, not a pass", async () => {
+    const sub = await swe1Submission(rejectAll);
+    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: rejectAll.observatoryUrl });
+    const rows = await latest(sub);
+    expect(rows.get("U7")).toMatchObject({ passed: null, detail: { inconclusive: true, reason: expect.stringMatching(/not on the opt-out list .* proves nothing/) } });
+    const ev = rows.get("U7")!.detail.evidence as { control: { status: number } };
+    expect(ev.control.status).toBe(400);
+  }, 120_000);
+
+  it("U3: refusals from a host that is not verifiably Supabase prove nothing", async () => {
+    const sub = await swe1Submission(opaque);
+    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: opaque.observatoryUrl });
+    const rows = await latest(sub);
+    expect(rows.get("U3")).toMatchObject({ passed: null, detail: { inconclusive: true, reason: expect.stringMatching(/did not answer like Supabase/) } });
+    // The app routes still refuse a dated-less call_back, but a bare 401 from that host is no DB evidence.
+    expect(rows.get("U6")?.passed).not.toBe(true);
+  }, 120_000);
+
+  it("M1–M7: a missing /api/import is inconclusive everywhere, never a fail", async () => {
+    const sub = await swe1Submission(noImport);
+    await runImportHarness(admin, sub, opts());
+    const rows = await latest(sub);
+    for (const k of ["M1", "M2", "M3", "M4", "M5", "M6", "M7"]) expect({ k, passed: rows.get(k)?.passed, reason: rows.get(k)?.detail.reason }).toMatchObject({ k, passed: null, reason: expect.stringMatching(/not found/) });
   }, 120_000);
 });
 
@@ -250,6 +300,9 @@ describe("Manual results and the CI report job", () => {
       ],
     });
     fs.writeFileSync(file, JSON.stringify(artifact));
+    // A reviewer already ran the tests by hand: the CI run's inconclusive R5 must not replace that.
+    const { data: auth } = await boss.client.auth.getUser();
+    await recordManualResult(boss.client, auth.user!, badSub, { check_key: "R5", result: "fail", note: "npm test fails: 11 normalise tests red" });
     const env = { ...process.env, SUPABASE_URL: LOCAL.url, SUPABASE_SECRET_KEY: LOCAL.secret, VITEST: "" };
     const tsx = path.resolve("node_modules/.bin/tsx");
     const args = ["scripts/verify-swe1/report.ts", "--in", file, "--submission-id", badSub, "--repo-url", REPO, "--sha", SHA];
@@ -258,6 +311,7 @@ describe("Manual results and the CI report job", () => {
     expect(rows.get("R3")).toMatchObject({ passed: false, manual: false });
     expect(rows.get("R1")?.detail.source).toBe("local");
     expect(rows.get("R4")?.detail.inconclusive).toBe(true);
+    expect(rows.get("R5")).toMatchObject({ passed: false, manual: true });
 
     // Another commit (or repo) than the one frozen at submission is refused, and nothing is written.
     const other = args.map((a) => (a === SHA ? "f".repeat(40) : a));

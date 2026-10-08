@@ -70,7 +70,8 @@ commit 8 deletes it, so it survives only in history (F13).
 
 `<out>.internal/` (never share) gets `live-db.sql`, the database "as the BA left it in the
 dashboard" that the starter's code actually runs against, and `faults.json`, with the planted
-key and the commits that add and remove it.
+key and the commits that add and remove it. The script refuses an `--internal-out` inside `--out`
+(or the reference), and checks that neither file is ever committed to the starter's history.
 
 Check the result before publishing:
 
@@ -86,20 +87,31 @@ Changing a fault: change the reference first if needed, then the fault's transfo
 transformation fails loudly instead of producing a starter without the fault. Update `FAULTS.md`,
 rebuild, and re-run the harness on both repos (docs/07 "Building the starter", step 4).
 
-## 3. Publish the starter on GitHub (private)
+## 3. Publish the starter on GitHub (public)
 
 ```bash
 cd ../kopano-renewal-desk-starter
-gh repo create chase-hiring/kopano-renewal-desk-starter --private --source . --push
+gh repo create chase-hiring/kopano-renewal-desk-starter-2026-11 --public --source . --push
 ```
 
+- **Why public.** The platform and the harness read candidates' repositories without signing in
+  to GitHub (the R checks clone them anonymously, and CI status is read anonymously), so every
+  candidate's copy must be public, and it carries the whole starter, faults and history included.
+  A private starter would add a step (collecting each candidate's GitHub username and granting
+  access) without keeping anything secret, so the starter is public too. Bundle C's README says
+  so: no access to request, and their copy must be public. (docs/07 still says "keep both repos
+  private"; that predates this decision.)
+- **Vary it every round.** Copies from earlier rounds, fixes included, stay public. Rebuild the
+  starter each round with a new `--secret-seed` (a new planted key), publish it under a new repo
+  name, and regenerate bundle C with a new seed (section 4), so this round's data, sentinel
+  customers and held-back import differ. The fault list stays the same; if earlier rounds' public
+  fixes become a problem, vary the faults themselves (`make-starter.mjs` and `FAULTS.md`). The
+  live defence (AI off) is the check that a candidate understands what they submitted.
 - **Candidates must get the history.** A repository created with GitHub's "Use this template"
-  starts from one squashed commit, which silently removes F13. The bundle C README therefore tells
-  candidates to clone the starter and push it, as it is, to a repository of their own. Marking the
-  repo as a template (docs/07) is harmless, but do not tell candidates to use the button.
-- **Access.** The repo stays private. When a candidate starts SWE Test 1, give their GitHub
-  account read access (an outside collaborator with the Read role, or an organisation team such as
-  `swe1-candidates`) and remove it after they submit.
+  starts from one squashed commit, which silently removes F13, and forks are listed on the
+  starter where other candidates can see them. The bundle C README therefore tells candidates to
+  clone the starter and push it, as it is, to a new repository of their own. Do not mark the repo
+  as a template.
 - **Push protection.** The planted key has no provider prefix, so GitHub push protection has
   nothing to block. If a secret-scanning alert appears on the starter repo, close it as "used in
   tests": the value was never a working key.
@@ -114,7 +126,7 @@ generated: edit it here, then regenerate). Use a new seed and version for every 
 
 ```bash
 npx tsx scripts/synth/generate.ts --version v2 --seed 20261107 \
-  --starter-repo-url https://github.com/chase-hiring/kopano-renewal-desk-starter
+  --starter-repo-url https://github.com/chase-hiring/kopano-renewal-desk-starter-2026-11
 npx tsx --env-file=.env.local scripts/synth/upload.ts --version v2
 ```
 
@@ -131,7 +143,9 @@ files before calibrating, so the harness's sentinel customers exist.
 ## 5. Calibrate the harness
 
 - **Reference:** run it as in section 1 (or deploy it: `npx supabase link` + `npx supabase db
-  push`, any Node host, then seed), and point the harness at it with the three seeded logins.
+  push`, turn off "Allow new users to sign up" under Authentication in the Supabase dashboard,
+  because `db push` does not carry `config.toml`'s `enable_signup = false` to a hosted project,
+  any Node host, then seed), and point the harness at it with the three seeded logins.
   Every R, U, M and D check must pass. The browser signs in with the publishable key, so the
   harness finds the Supabase project and key in the login page's JavaScript.
 - **Starter:** deploy it on a fresh Supabase project with `<out>.internal/live-db.sql` applied,

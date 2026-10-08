@@ -33,7 +33,7 @@ function repo(commits: Record<string, string | null>[]): { dir: string; sha: str
   return { dir, sha: git("rev-parse", "HEAD").trim() };
 }
 
-const args = (r: { dir: string; sha: string }): Args => ({ repo: r.dir, sha: r.sha, out: "", workdir: null, exec: false, execMode: "docker", dbReset: false, keep: false, noDocker: true });
+const args = (r: { dir: string; sha: string }): Args => ({ repo: r.dir, sha: r.sha, out: "", workdir: null, exec: false, execMode: "docker", dbReset: false, keep: false, noDocker: true, disposableSandbox: false });
 const byKey = (checks: CheckResult[]): Record<string, CheckResult> => Object.fromEntries(checks.map((c) => [c.key, c]));
 // A fake, high-entropy value generated at run time (never committed anywhere).
 const fakeSecret = () => randomBytes(24).toString("base64url");
@@ -81,12 +81,32 @@ describe("repo-checks.ts (static)", () => {
     ]);
     const { checks } = await repoChecks(args(r));
     const c = byKey(checks);
-    expect(c.R1.passed).toBe(true);
-    expect(c.R1.detail.reviewer_note).toBeTruthy();
+    // Without gitleaks the history scan is incomplete: a documented rotation is for a reviewer to confirm.
+    expect(c.R1).toMatchObject({ passed: null, detail: { inconclusive: true, summary: expect.stringMatching(/gitleaks did not run/) } });
     expect(c.R2.passed).toBe(true);
     expect(c.R3.passed).toBe(true);
     expect(c.R6.passed).toBeNull(); // workflows exist; a local repo has no CI status
     expect(c.R7.passed).toBe(true);
+  }, 60_000);
+
+  it("fails R1 when a secret is still in the graded commit, whatever the README says", async () => {
+    const r = repo([
+      { "package.json": PKG, ".env.production": `OPENROUTER_API_KEY=${fakeSecret()}\n`, "README.md": "## Security\nThe key was rotated in the dashboard.\n" },
+    ]);
+    const c = byKey((await repoChecks(args(r))).checks);
+    expect(c.R1).toMatchObject({ passed: false, detail: { summary: expect.stringMatching(/still in the graded commit.*\.env\.production/) } });
+  }, 60_000);
+
+  it("fails R3 when the migrations are not files the Supabase CLI applies (F07 moved into migrations/)", async () => {
+    const r = repo([{ "package.json": PKG, "supabase/migrations/schema.sql": "create table public.customers (id uuid);\nalter table public.customers enable row level security;" }]);
+    const c = byKey((await repoChecks(args(r))).checks);
+    expect(c.R3).toMatchObject({ passed: false, detail: { summary: expect.stringMatching(/not named <timestamp>_<name>\.sql.*schema\.sql/) } });
+  }, 60_000);
+
+  it("refuses to run candidate code (--exec, --db-reset) unless the machine is a disposable sandbox", async () => {
+    const r = repo([{ "package.json": PKG }]);
+    await expect(repoChecks({ ...args(r), exec: true })).rejects.toThrow(/disposable-sandbox/);
+    await expect(repoChecks({ ...args(r), dbReset: true })).rejects.toThrow(/disposable-sandbox/);
   }, 60_000);
 
   it("reports every check inconclusive when the commit is not in the repo", async () => {
@@ -97,15 +117,73 @@ describe("repo-checks.ts (static)", () => {
   }, 60_000);
 });
 
-// Runs only where the pinned gitleaks image is already present (never pulls it in a unit run).
-const gitleaksImage = (() => {
+// Runs only where the pinned images are already present (never pulls them in a unit run).
+const hasImage = (image: string) => {
   try {
-    execFileSync("docker", ["image", "inspect", "zricethezav/gitleaks:v8.24.2"], { stdio: "ignore", timeout: 15_000 });
+    execFileSync("docker", ["image", "inspect", image], { stdio: "ignore", timeout: 15_000 });
     return true;
   } catch {
     return false;
   }
-})();
+};
+const gitleaksImage = hasImage("zricethezav/gitleaks:v8.24.2");
+const nodeImage = hasImage("node:22-bookworm");
+
+/**
+ * The blocker: candidate code (an npm preinstall script) tries to plant core.fsmonitor in .git
+ * (the clone's, via a relative path, and its own) and to add .env.example / .gitignore. The
+ * checks that read the tree or run git must already have finished, and git must never run a
+ * command from the repo.
+ */
+function hostileRepo(): { r: { dir: string; sha: string }; marker: string } {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "verify-poc-"));
+  dirs.push(outside);
+  const marker = path.join(outside, "hook-ran");
+  const hook = path.join(outside, "hook.sh");
+  fs.writeFileSync(hook, `#!/bin/sh\necho "ran: $(pwd)" >> ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+  const evil = `const fs = require("fs");
+for (const dir of [".git", "../repo/.git"]) { try { fs.appendFileSync(dir + "/config", "\\n[core]\\n\\tfsmonitor = ${hook}\\n"); } catch {} }
+fs.writeFileSync(".env.example", "X=1\\n");
+fs.writeFileSync(".gitignore", ".env*\\n");
+fs.writeFileSync("saw-git.txt", String(fs.existsSync(".git")));
+`;
+  const pkg = JSON.stringify({ name: "poc", version: "1.0.0", scripts: { preinstall: "node evil.js", lint: "node -e 0", build: "node -e 0", test: "node -e 0" } });
+  const lock = JSON.stringify({ name: "poc", version: "1.0.0", lockfileVersion: 3, requires: true, packages: { "": { name: "poc", version: "1.0.0" } } });
+  const r = repo([{ "package.json": pkg, "package-lock.json": lock, "evil.js": evil, "README.md": "# PoC\n" }]);
+  return { r, marker };
+}
+
+describe("repo-checks.ts with candidate code (--exec)", () => {
+  it("judges git and the tree before the candidate's code runs, on an export without .git (host mode)", async () => {
+    const { r, marker } = hostileRepo();
+    const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-work-"));
+    dirs.push(workdir);
+    const { checks } = await repoChecks({ ...args(r), exec: true, execMode: "host", disposableSandbox: true, workdir, keep: true });
+    const c = byKey(checks);
+    // The commit has neither .env.example nor an .env* rule, whatever the preinstall script wrote.
+    expect(c.R7).toMatchObject({ passed: false, detail: { summary: expect.stringMatching(/no \.env\.example/) } });
+    expect(c.R4.passed).toBe(false); // ran (preinstall ok), then no TypeScript
+    expect(fs.existsSync(marker)).toBe(false);
+    const tmp = fs.readdirSync(workdir).map((d) => path.join(workdir, d))[0];
+    expect(fs.readFileSync(path.join(tmp, "export", "saw-git.txt"), "utf8")).toBe("false");
+    // The script reached the clone's .git/config (host mode is for sandboxes only), but no git ran after it.
+    expect(fs.readFileSync(path.join(tmp, "repo", ".git", "config"), "utf8")).toMatch(/fsmonitor/);
+  }, 120_000);
+
+  it.skipIf(!nodeImage)("runs the candidate's npm scripts in a container that sees only the export (docker mode)", async () => {
+    const { r, marker } = hostileRepo();
+    const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-work-"));
+    dirs.push(workdir);
+    const { checks } = await repoChecks({ ...args(r), noDocker: false, exec: true, execMode: "docker", disposableSandbox: true, workdir, keep: true });
+    const c = byKey(checks);
+    expect(c.R7.passed).toBe(false);
+    expect(c.R4).toMatchObject({ passed: false, detail: { summary: expect.stringMatching(/tsc/) } });
+    expect(fs.existsSync(marker)).toBe(false);
+    const tmp = fs.readdirSync(workdir).map((d) => path.join(workdir, d))[0];
+    expect(fs.readFileSync(path.join(tmp, "export", "saw-git.txt"), "utf8")).toBe("false");
+    expect(fs.readFileSync(path.join(tmp, "repo", ".git", "config"), "utf8")).not.toMatch(/fsmonitor/);
+  }, 240_000);
+});
 
 describe("repo-checks.ts gitleaks rules", () => {
   it.skipIf(!gitleaksImage)("finds the committed .env.local but not blank or placeholder .env.example values", async () => {
@@ -125,4 +203,21 @@ describe("repo-checks.ts gitleaks rules", () => {
     expect(examples.length).toBeGreaterThan(0);
     expect(examples.every((e) => /\.env\.local/.test(e))).toBe(true);
   }, 120_000);
+
+  it.skipIf(!gitleaksImage)("passes a secret only in history when the README says it was rotated; fails a deferred or negated rotation", async () => {
+    const history = { "package.json": PKG, ".env.local": `OPENROUTER_API_KEY=${fakeSecret()}\n` };
+    const rotated = repo([history, { ".env.local": null, "README.md": "## Security\n- F13: the key committed in .env.local was rotated in the OpenRouter dashboard.\n" }]);
+    const c1 = byKey((await repoChecks({ ...args(rotated), noDocker: false })).checks);
+    expect(c1.R1).toMatchObject({ passed: true, detail: { reviewer_note: expect.stringMatching(/rotated but not rewritten/) } });
+
+    const deferred = repo([history, { ".env.local": null, "README.md": "Key rotation is out of scope for this submission; the old key was never rotated.\n" }]);
+    const c2 = byKey((await repoChecks({ ...args(deferred), noDocker: false })).checks);
+    expect(c2.R1).toMatchObject({ passed: false, detail: { summary: expect.stringMatching(/does not say the key was rotated/) } });
+
+    // Still at the graded commit: a rotation note does not excuse it.
+    const shipped = repo([{ ...history, ".env.production": `SUPABASE_SECRET_KEY=${fakeSecret()}\n`, "README.md": "The key was rotated.\n" }]);
+    const c3 = byKey((await repoChecks({ ...args(shipped), noDocker: false })).checks);
+    expect(c3.R1).toMatchObject({ passed: false, detail: { summary: expect.stringMatching(/still in the graded commit/) } });
+    expect((c3.R1.detail.evidence as { present_checked_via: string }).present_checked_via).toMatch(/gitleaks/);
+  }, 240_000);
 });

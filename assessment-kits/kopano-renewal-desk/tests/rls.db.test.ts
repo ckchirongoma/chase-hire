@@ -70,6 +70,26 @@ describe.skipIf(!DB_TESTS)("access control (RLS) and the AI route", () => {
     expect(statuses.filter((s) => s !== 429).every((s) => s === 503)).toBe(true);
   });
 
+  it("a login that is not a Desk user sees nothing, and agents cannot run the internal helpers", async () => {
+    const admin = adminClient();
+    await admin.from("templates").upsert({ name: "RLS probe template", category: "utility", body: "Reply STOP to opt out.", approved: true }, { onConflict: "name" });
+    const email = `test-outsider-${Date.now()}@example.co.za`;
+    const { error: cErr } = await admin.auth.admin.createUser({ email, password: "Test-only-password-123", email_confirm: true });
+    expect(cErr).toBeNull();
+    const outsider = anonClient();
+    await outsider.auth.signInWithPassword({ email, password: "Test-only-password-123" });
+    for (const t of ["templates", "priceplan_rules", "customers", "agents"]) {
+      const { data } = await outsider.from(t).select("*").limit(1);
+      expect([t, (data ?? []).length]).toEqual([t, 0]);
+    }
+    const { data: forAgent } = await a.db.from("templates").select("id").limit(1);
+    expect((forAgent ?? []).length).toBe(1);
+    for (const fn of ["match_optouts", "refresh_contract_status"]) {
+      const { error } = await a.db.rpc(fn);
+      expect([fn, error !== null]).toEqual([fn, true]);
+    }
+  });
+
   it("GET /api/health reports the database", async () => {
     const { GET } = await import("@/app/api/health/route");
     const res = await GET();

@@ -187,6 +187,15 @@ function normaliseMsisdn(raw: string): string | null {
 export interface FakeOptions {
   /** false: no publishable key in the front end (the app keeps Supabase server-side). Default true. */
   keyInBundle?: boolean;
+  /**
+   * /api/messages refuses every request with a validation error (so it never reaches the opt-out
+   * rule), and agents may not insert into message_queue at all: a refusal that proves nothing.
+   */
+  messagesRejectAll?: boolean;
+  /** The "Supabase" host is some gateway: no /auth/v1/settings, every REST call a bare 401. */
+  opaqueSupabase?: boolean;
+  /** No /api/import route (renamed). */
+  noImportRoute?: boolean;
 }
 
 export interface FakeTarget {
@@ -387,6 +396,7 @@ export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promi
       return { status: 201, body: [row] };
     }
     if (table === "message_queue") {
+      if (opts.messagesRejectAll && !isManager(u)) return { status: 403, body: { code: "42501", message: "permission denied for table message_queue" } };
       if (!canSeeCustomer(u, String(body.customer_id))) return { status: 403, body: { code: "42501", message: "new row violates row-level security policy" } };
       if (optedOut(String(body.customer_id))) return { status: 400, body: { code: "P0001", message: "customer is on the opt-out list" } };
       const row = { id: randomUUID(), created_at: new Date().toISOString(), ...body };
@@ -406,6 +416,7 @@ export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promi
     const url = new URL(req.url ?? "/", "http://x");
     const body = await readBody(req);
     if (req.headers.apikey !== publishable) return send(res, 401, { message: "Invalid API key" });
+    if (opts.opaqueSupabase && url.pathname !== "/auth/v1/token") return send(res, 401, { message: "Unauthorized" });
     if (url.pathname === "/auth/v1/settings") return send(res, 200, { external: { email: true }, disable_signup: true });
     if (url.pathname === "/auth/v1/token" && req.method === "POST") {
       const j = JSON.parse(body.toString() || "{}") as { email?: string; password?: string };
@@ -557,6 +568,7 @@ export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promi
     if (req.method === "POST" && p === "/api/messages") {
       if (!u) return send(res, 401, { error: "Not signed in" });
       const j = json();
+      if (opts.messagesRejectAll) return send(res, 400, { error: "Invalid request: field 'template' is required" });
       if (good) {
         if (!canSeeCustomer(u, String(j.customerId))) return send(res, 403, { error: "Not your customer" });
         if (optedOut(String(j.customerId))) return send(res, 409, { error: "This customer is on the legal opt-out list: no messages." });
@@ -565,7 +577,7 @@ export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promi
       db.message_queue.push(row);
       return send(res, 201, row);
     }
-    if (req.method === "POST" && p === "/api/import") {
+    if (req.method === "POST" && p === "/api/import" && !opts.noImportRoute) {
       if (!u) return send(res, 401, { error: "Not signed in" });
       if (good && !isManager(u)) return send(res, 403, { error: "Managers only" });
       const file = multipartFile(body, String(req.headers["content-type"] ?? ""));

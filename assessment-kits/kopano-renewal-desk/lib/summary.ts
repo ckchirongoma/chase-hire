@@ -1,5 +1,6 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { deriveContractStatus } from "@/lib/import/normalise";
 import type { ChatMessage } from "@/lib/openrouter";
 
 /**
@@ -41,7 +42,7 @@ export async function loadSummaryContext(db: SupabaseClient, customerId: string)
       type: l.number_type ?? "unknown",
       priceplan: l.priceplan,
       contract_end_date: l.contract_end_date,
-      contract_status: l.contract_status,
+      contract_status: deriveContractStatus(l.contract_end_date),
       monthly_charge_zar: l.monthly_charge_zar,
       active: l.active,
     })),

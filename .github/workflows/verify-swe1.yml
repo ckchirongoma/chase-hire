@@ -9,9 +9,12 @@ name: verify-swe1
 #              into one file with esbuild. Uploads it as an artifact. Never touches candidate code.
 #   untrusted  permissions: {} and NO secrets: it cannot even read this repository, which is why
 #              it gets the harness as an artifact. Clones the candidate's repo at the submitted
-#              SHA and runs the bundle: gitleaks over the history, static rules, a scratch
-#              `supabase db start` for the migrations (R3), and npm ci / lint / tsc / build / test
-#              inside a Docker container (R4, R5). Its only output is results.json (an artifact).
+#              SHA and runs the bundle. First everything that reads the tree or runs git (gitleaks
+#              over the history and the tree, static rules, a scratch `supabase db start` from a
+#              private copy of the migrations for R3, CI status, .gitignore); only then the
+#              candidate's npm ci / lint / tsc / build / test (R4, R5), in Docker containers on an
+#              export of the commit without .git (everything after npm ci with --network none).
+#              Its only output is results.json (an artifact).
 #   report     (trusted) never checks out or runs candidate code. Downloads results.json,
 #              validates it strictly (lib/harness/artifact.ts: only R1–R7, booleans/null, short
 #              strings), checks the repo + SHA are the ones frozen with the submission, and inserts
@@ -127,14 +130,26 @@ jobs:
         with:
           version: 2.120.0
 
+      # Defence in depth for the containers that run candidate code (npm lifecycle scripts, and
+      # the scratch database running their SQL): no new connections from a container to this
+      # runner or to the cloud metadata address. Outbound internet (the npm registry) still works.
+      - name: Fence containers off from the runner
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo iptables -I DOCKER-USER -d 169.254.0.0/16 -j DROP
+          sudo iptables -I INPUT -i docker0 -m conntrack --ctstate NEW -j DROP
+          sudo iptables -I INPUT -i br-+ -m conntrack --ctstate NEW -j DROP
+
       - name: Run repo checks
         run: |
           mkdir -p "$RUNNER_TEMP/results"
+          # This job has no secrets and is thrown away: the one place the candidate's code may run.
           node "$RUNNER_TEMP/harness/repo-checks.mjs" \
             --repo "$REPO_URL" --sha "$SHA" \
             --out "$RUNNER_TEMP/results/results.json" \
             --workdir "$RUNNER_TEMP/work" \
-            --exec --exec-mode docker --db-reset
+            --disposable-sandbox --exec --exec-mode docker --db-reset
 
       - name: Upload results.json
         if: always()

@@ -9,6 +9,8 @@ export type BlockReason = "opted_out" | "template_not_approved" | "no_consented_
 export interface ContactPointLite {
   id: string;
   type: "mobile" | "landline" | "email" | "whatsapp";
+  /** The number (E.164) or address. An opt-out follows the value across contact points. */
+  value?: string | null;
   consent_status: ConsentStatus;
   verified_at: string | null;
 }
@@ -24,16 +26,27 @@ export const BLOCK_MESSAGES: Record<BlockReason, string> = {
   no_consented_contact: "This customer has no mobile, WhatsApp or email contact with consent for this template.",
 };
 
-/** A contact point that may receive this template: an explicit opt-in, or (utility only) the existing-customer basis. */
+const isLandlineNumber = (value: string | null | undefined) => typeof value === "string" && /^\+27[1-5]/.test(value);
+
+/** A contact point that may receive this template: an explicit opt-in, or (utility only) the existing-customer basis. Never a landline. */
 export function canReceive(c: ContactPointLite, category: TemplateLite["category"]): boolean {
-  if (c.type === "landline") return false;
+  if (c.type === "landline" || (c.type !== "email" && isLandlineNumber(c.value))) return false;
   if (c.consent_status === "opted_in") return true;
   return category === "utility" && c.consent_status === "existing_customer_s69_3";
 }
 
+/** The customer's contact points that may receive this template, leaving out any number or address they opted out on (whichever contact point recorded it). */
+export function eligibleContacts(contacts: ContactPointLite[], category: TemplateLite["category"]): ContactPointLite[] {
+  const optedOut = new Set(contacts.filter((c) => c.consent_status === "opted_out" && c.value).map((c) => c.value));
+  return contacts.filter((c) => canReceive(c, category) && !(c.value && optedOut.has(c.value)));
+}
+
+const CHANNEL_RANK: Record<ContactPointLite["type"], number> = { whatsapp: 0, mobile: 1, email: 2, landline: 3 };
+
+/** RD-10: the best channel first (WhatsApp, then mobile, then email); within a channel an explicit opt-in first. The database trigger picks the same way. */
 export function pickContactPoint(contacts: ContactPointLite[], category: TemplateLite["category"]): ContactPointLite | null {
-  const rank = (c: ContactPointLite) => (c.consent_status === "opted_in" ? 0 : 1) * 10 + (c.type === "whatsapp" ? 0 : c.type === "mobile" ? 1 : 2);
-  return contacts.filter((c) => canReceive(c, category)).sort((a, b) => rank(a) - rank(b))[0] ?? null;
+  const rank = (c: ContactPointLite) => CHANNEL_RANK[c.type] * 10 + (c.consent_status === "opted_in" ? 0 : 1);
+  return eligibleContacts(contacts, category).sort((a, b) => rank(a) - rank(b))[0] ?? null;
 }
 
 export function messageBlockReason(input: { optedOut: boolean; template: TemplateLite | null; contacts: ContactPointLite[] }): BlockReason | null {

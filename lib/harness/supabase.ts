@@ -39,6 +39,8 @@ export interface RestResult<T = Record<string, unknown>> {
   /** PostgREST error code (e.g. 42501, 23514, PGRST205) when present. */
   code: string | null;
   message: string | null;
+  /** PostgREST's hint (a trigger's `using hint = …`), when present. */
+  hint: string | null;
   bodySnippet: string;
 }
 
@@ -130,6 +132,7 @@ export class SupabaseProbe {
       count: parseCount(res.headers["content-range"]),
       code: err && typeof err.code === "string" ? err.code : null,
       message: err && typeof err.message === "string" ? err.message.slice(0, 300) : null,
+      hint: err && typeof err.hint === "string" ? err.hint.slice(0, 200) : null,
       bodySnippet: text.slice(0, 300),
     };
   }

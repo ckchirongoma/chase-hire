@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { parseArtifact, type Artifact } from "../../lib/harness/artifact";
-import { pass, fail, inconclusive, toRunRow, type CheckResult } from "../../lib/harness/checks";
+import { fail, holdBackInconclusive, inconclusive, latestByKey, pass, toRunRow, type CheckResult, type StoredRun } from "../../lib/harness/checks";
 import { ciStatusForSha } from "../../lib/harness/github";
 import { parseGithubRepo } from "../../lib/work/url";
 
@@ -132,24 +132,39 @@ async function main() {
   // A key the untrusted job did not report is recorded as inconclusive, never as a pass.
   for (const k of ["R1", "R2", "R3", "R4", "R5", "R6", "R7"] as const) if (!results.some((r) => r.key === k)) results.push(inconclusive(k, "missing from the repo-check results"));
 
+  // An inconclusive result never replaces an earlier conclusive or manual one (the grader reads the latest row).
+  const { data: stored, error: readError } = await admin
+    .from("verification_runs")
+    .select("check_key, passed, manual, detail")
+    .eq("submission_id", args.submissionId)
+    .in("check_key", results.map((r) => r.key))
+    .order("ran_at", { ascending: false });
+  if (readError) throw new ReportError(`could not read earlier results: ${readError.message}`);
+  const { write, kept } = holdBackInconclusive(results, latestByKey((stored ?? []) as StoredRun[]));
+
   const source = args.runUrl ? "github-actions" : "local";
-  const rows = results.map((r) => toRunRow(args.submissionId, r, { ranBy: ran_by, meta: { source, run_url: args.runUrl, sha: args.sha, harness_run: args.harnessRunId, tools: artifact.tools ?? {} } }));
+  const rows = write.map((r) => toRunRow(args.submissionId, r, { ranBy: ran_by, meta: { source, run_url: args.runUrl, sha: args.sha, harness_run: args.harnessRunId, tools: artifact.tools ?? {} } }));
   for (const r of rows) console.log(`${r.check_key}  ${r.passed === true ? "PASS" : r.passed === false ? "FAIL" : "----"}  ${String(r.detail.summary).slice(0, 160)}`);
+  for (const k of kept) console.log(`${k.key}  ----  not recorded: inconclusive (${k.reason.slice(0, 100)}); the earlier conclusive result stands`);
   if (args.dryRun) {
     console.log("\n--dry-run: nothing written");
     return;
   }
-  const { error } = await admin.from("verification_runs").insert(rows);
-  if (error) {
-    await finishRun(admin, args, "failed", { error: `insert failed: ${error.message}` });
-    throw new ReportError(`could not insert verification_runs: ${error.message}`);
+  if (rows.length) {
+    const { error } = await admin.from("verification_runs").insert(rows);
+    if (error) {
+      await finishRun(admin, args, "failed", { error: `insert failed: ${error.message}` });
+      throw new ReportError(`could not insert verification_runs: ${error.message}`);
+    }
   }
   await finishRun(admin, args, "done", {
     passed: results.filter((r) => r.passed === true).map((r) => r.key),
     failed: results.filter((r) => r.passed === false).map((r) => r.key),
-    inconclusive: results.filter((r) => r.passed === null).map((r) => r.key),
+    inconclusive: write.filter((r) => r.passed === null).map((r) => r.key),
+    kept: kept.map((k) => k.key),
+    kept_earlier: kept,
   });
-  console.log(`\nRecorded ${rows.length} repo checks for submission ${args.submissionId}`);
+  console.log(`\nRecorded ${rows.length} repo checks for submission ${args.submissionId}${kept.length ? ` (${kept.length} inconclusive not recorded over earlier results)` : ""}`);
 }
 
 if (!process.env.VITEST) {

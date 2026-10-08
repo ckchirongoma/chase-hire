@@ -39,6 +39,8 @@ export const MessageInput = z.object({
 export const ConsentInput = z.object({
   contactPointId: z.uuid(),
   consentStatus: z.enum(["opted_in", "opted_out"]),
+  /** Required (and recorded) when a manager lifts an opt-out (RD-05). */
+  reason: z.string().trim().min(5).max(500).optional(),
 });
 
 export const AllocationInput = z.object({

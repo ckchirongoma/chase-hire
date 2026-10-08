@@ -11,5 +11,6 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["lib/**/*.test.ts", "tests/unit/**/*.test.ts"],
+    exclude: ["node_modules/**", "assessment-kits/**"],
   },
 });

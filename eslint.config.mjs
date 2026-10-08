@@ -18,6 +18,8 @@ const eslintConfig = [
       "out/**",
       "build/**",
       "next-env.d.ts",
+      "assessment-kits/**",
+      "scripts/synth/out/**",
     ],
   },
 ];

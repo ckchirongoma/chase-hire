@@ -51,6 +51,7 @@ A lock is never a rejection.
    | `OPENROUTER_MODEL_TRANSCRIBE` | Speech-to-text, default `openai/whisper-1` |
    | `TYPESAFE_API_KEY`, `JEV_MODEL` | JEV (optional; every JEV decision has a deterministic fallback). Default model `jev-1.13.0` |
    | `CRON_SECRET` | 16+ characters; Vercel Cron sends it as a bearer token |
+   | `GITHUB_ACTIONS_TOKEN`, `GITHUB_ACTIONS_REPO` (+ optional `GITHUB_ACTIONS_REF`, `GITHUB_ACTIONS_WORKFLOW`) | SWE Test 1 repo checks: lets the admin panel dispatch `.github/workflows/verify-swe1.yml`. That workflow needs the GitHub repo secrets `SUPABASE_URL` and `SUPABASE_SECRET_KEY`, used only in its trusted report job; candidate code runs in a job with no secrets and no permissions |
 
    Changing a grader's model, prompt or rubric means re-running the calibration gold set
    (`docs/09` §8) before going live.
@@ -60,7 +61,9 @@ A lock is never a rejection.
    expired interviews (never locked ones), retries grading jobs and refreshes composite scores. It
    never advances or rejects anyone. Every timed stage is also finalised lazily when the candidate
    next loads it, and grading starts right after a stage ends, so the daily schedule is a safety net.
-6. **Assessment data.** Generate and upload the synthetic datasets with `scripts/synth/` (see
+6. **SWE Test 1 kit.** Build and publish the starter, and calibrate the harness, per
+   `assessment-kits/README.md` (internal; never shown to candidates).
+7. **Assessment data.** Generate and upload the synthetic datasets with `scripts/synth/` (see
    `docs/11`). Real client material in `context/` never reaches candidates.
 
 ## Local development
@@ -103,3 +106,5 @@ deterministic. Integration tests read the local Supabase keys from `npx supabase
 | `lib/consent/notice.ts` | POPIA notice (DRAFT: needs legal review; bump the version on any change) |
 | `app/admin/` | Pipeline, candidates, grading queue, review requests, dedupe, roles, banks, rubrics |
 | `scripts/synth/` | Synthetic assessment datasets with planted defects and answer keys |
+| `lib/harness/`, `lib/server/harness.ts`, `scripts/verify-swe1/` | SWE Test 1 verification harness: URL checks U1–U8, month-2 import checks M1–M7, data checks, repo checks R1–R7 (GitHub Actions or local sandbox), calibration |
+| `assessment-kits/` | INTERNAL: the SWE Test 1 reference app, the planted-fault starter generator, the handoff pack and the fault answer key |

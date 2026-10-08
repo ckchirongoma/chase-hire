@@ -511,7 +511,9 @@ async function r7(clone: string, sha: string): Promise<CheckResult> {
   for (const p of probes) ignored[p] = (await git(["check-ignore", "-q", "--no-index", p], clone)).code === 0;
   const tracked = (await git(["ls-tree", "-r", "-z", "--name-only", sha], clone)).out.split("\0").filter((f) => /(^|\/)\.env(\.[\w-]+)*$/.test(f) && !/\.(example|sample|template)$/.test(f));
   const example = (await git(["cat-file", "-e", `${sha}:.env.example`], clone)).code === 0;
-  const evidence: Evidence = { gitignored: ignored, env_example: example, tracked_env_files: tracked.slice(0, 20) };
+  // Lists, not a record keyed by file name: results.json evidence keys must be identifiers, so
+  // ".env.local" as a key would reach the reviewer as "e_env_local".
+  const evidence: Evidence = { gitignored: probes.filter((p) => ignored[p]), not_gitignored: probes.filter((p) => !ignored[p]), env_example: example, tracked_env_files: tracked.slice(0, 20) };
   const allIgnored = probes.every((p) => ignored[p]);
   if (allIgnored && example && !tracked.length) return pass("R7", ".env* is gitignored and .env.example exists", evidence);
   const why = [!allIgnored ? `not gitignored: ${probes.filter((p) => !ignored[p]).join(", ")}` : null, !example ? "no .env.example" : null, tracked.length ? `committed: ${tracked.join(", ")}` : null].filter(Boolean);

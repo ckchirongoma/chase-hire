@@ -149,7 +149,8 @@ export const STAGE_FIELDS: Record<StageKey, readonly FieldDef[]> = {
       kind: "text",
       name: "test_logins",
       label: "Test logins",
-      help: "Two agent logins and one manager login (email and password for each).",
+      help:
+        "One per line: \"agent: email / password\" (twice) and \"manager: email / password\". If your app only talks to Supabase on the server, add \"supabase: <project URL> / <publishable key>\".",
       required: true,
     },
     ...LOOM,

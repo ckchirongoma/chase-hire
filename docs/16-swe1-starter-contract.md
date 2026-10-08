@@ -47,12 +47,16 @@ affected automated checks report "inconclusive" and a reviewer records the resul
 
 ## Logins the candidate submits
 
-`test_logins` must contain three lines in this format (the brief says so):
+`test_logins` must contain three lines in this format (the brief says so), plus an optional fourth:
 ```
 agent: email / password
 agent: email / password
 manager: email / password
+supabase: https://<project>.supabase.co / <publishable key>   (optional)
 ```
+The harness normally finds the Supabase URL and publishable key in the app's JavaScript. An app that
+keeps Supabase server-side ships no key; without the optional line, U3, the database halves of U4/U6/U7
+and the import checks are inconclusive (the admin can also type the key into the panel).
 
 ## Check → fault map
 

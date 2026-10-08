@@ -2,7 +2,7 @@ import "server-only";
 import { fail, inconclusive, informational, pass, snippet, type CheckKey, type CheckResult, type Evidence } from "./checks";
 import { looksLikeLoginPage, tagAttributes } from "./app-login";
 import { matchOptouts, type CustomerLite, type OptoutEntry } from "./expected";
-import { connect, newFrontEnd, type FrontEnd, type Sessions, type SupabaseTarget } from "./frontend";
+import { connect, crawl, newFrontEnd, type FrontEnd, type Sessions, type SupabaseTarget } from "./frontend";
 import { elements, startTags, stripComments, stripTags } from "./html-scan";
 import { BudgetExceeded, describeError, mapPool, SsrfError, type Http, type HttpResponse } from "./http";
 import { scanSecrets } from "./jwt";
@@ -151,9 +151,8 @@ function u2(ctx: Ctx): CheckResult {
     limits: fe.limitsHit,
     hits: hits.slice(0, 20),
   };
-  // Pages fetched as a signed-in user that did not land back on the login page.
-  const signedIn = fe.pages.filter((p) => p.as !== "anon" && p.status !== null && p.status >= 200 && p.status < 300 && !looksLikeLoginPage(new URL(p.finalUrl ?? p.url).pathname));
-  const customerPage = signedIn.some((p) => /^\/customers?\/[^/]+\/?$/.test(new URL(p.finalUrl ?? p.url).pathname));
+  const signedIn = signedInPages(fe);
+  const customerPage = customerPageScanned(fe);
   evidence.signed_in_pages = signedIn.length;
   evidence.customer_page_scanned = customerPage;
   const unique = [...new Set(hits.map((h) => h.kind))];
@@ -165,11 +164,12 @@ function u2(ctx: Ctx): CheckResult {
     const why = ctx.sessions.errors.length ? ctx.sessions.errors.join("; ") : "no test user could sign in";
     return inconclusive("U2", `no secret in the ${scripts.length} JS chunks of the public pages, but no signed-in page was scanned (${why}): chunks that only signed-in pages load were not checked`, evidence);
   }
-  const notes = [
-    customerPage ? null : "no customer page (/customers/:id) was reached while signed in: its client components were not scanned",
-    fe.limitsHit.length ? `crawl limits hit (${fe.limitsHit.join("; ")}): chunks beyond them were not scanned` : null,
-  ].filter((x): x is string => !!x);
-  return pass("U2", `No service-role JWT or sb_secret_ key in ${scripts.length} JS chunks and ${evidence.pages_scanned} pages (${signedIn.length} signed in)`, evidence, notes.length ? notes.join("; ") : undefined);
+  // F04's key ships in a client component of the customer page: a pass needs that page scanned.
+  if (!customerPage) {
+    return inconclusive("U2", `no secret in ${scripts.length} JS chunks of ${signedIn.length} signed-in pages, but no customer page (/customers/:id) could be opened while signed in (renamed, or no customer visible to the test users), so its client components were not scanned`, evidence);
+  }
+  const notes = fe.limitsHit.length ? `crawl limits hit (${fe.limitsHit.join("; ")}): chunks beyond them were not scanned` : undefined;
+  return pass("U2", `No service-role JWT or sb_secret_ key in ${scripts.length} JS chunks and ${evidence.pages_scanned} pages (${signedIn.length} signed in, a customer page among them)`, evidence, notes);
 }
 
 // ───────────────────────── U3 ─────────────────────────
@@ -244,6 +244,39 @@ async function loadAllocations(ctx: Ctx): Promise<void> {
   }
   ctx.allocatedVia = via;
   for (const links of Object.values(ctx.fe.customerLinks)) for (const l of links) if (l.text.length >= 3 && !ctx.names.has(l.id)) ctx.names.set(l.id, l.text);
+}
+
+const CUSTOMER_PAGE = /^\/customers?\/[^/]+\/?$/;
+
+/** Signed-in pages that did not land back on the login page. */
+const signedInPages = (fe: FrontEnd) => fe.pages.filter((p) => p.as !== "anon" && p.status !== null && p.status >= 200 && p.status < 300 && !looksLikeLoginPage(new URL(p.finalUrl ?? p.url).pathname));
+const customerPageScanned = (fe: FrontEnd) => signedInPages(fe).some((p) => CUSTOMER_PAGE.test(new URL(p.finalUrl ?? p.url).pathname));
+
+/**
+ * U2 must scan a signed-in customer page: client components that only it loads are where F04
+ * ships its key. When the crawl reached none (an empty queue, e.g. after a month-2 import that
+ * orphaned the allocations), open one by id: a customer the agent can read over REST, else an
+ * allocated one, else any linked one.
+ */
+async function ensureCustomerPage(ctx: Ctx): Promise<void> {
+  if (customerPageScanned(ctx.fe)) return;
+  const who = ctx.sessions.a ? (["agent_a", ctx.sessions.a] as const) : ctx.sessions.manager ? (["manager", ctx.sessions.manager] as const) : null;
+  if (!who) return;
+  const [as, session] = who;
+  const candidates: string[] = [];
+  if (ctx.sb) {
+    const r = await ctx.sb.probe.select("customers", { select: "id", limit: "3" }, session);
+    if (is2xx(r.status)) candidates.push(...ids(r.rows));
+  }
+  candidates.push(...ctx.allocated.a.slice(0, 3), ...ctx.allocated.b.slice(0, 2), ...Object.values(ctx.fe.customerLinks).flat().slice(0, 2).map((l) => l.id));
+  const tried = new Set<string>();
+  for (const id of candidates) {
+    if (tried.size >= 4 || customerPageScanned(ctx.fe)) break;
+    if (tried.has(id) || !/^[\w-]{1,80}$/.test(id)) continue;
+    tried.add(id);
+    // Its own label: the per-session page cap may already be used up by the crawl.
+    await crawl(ctx.http, ctx.fe, [`/customers/${encodeURIComponent(id)}`], { headers: appAuthHeaders(ctx.sb?.url ?? null, session), as: `${as}_customer_page` });
+  }
 }
 
 const h1Of = (html: string) => stripTags(elements(html, "h1", 20_000)[0]?.inner ?? "").replace(/\s+/g, " ").trim();
@@ -759,6 +792,7 @@ export async function runUrlChecks(input: UrlCheckInput): Promise<{ results: Che
     Object.assign(ctx, { fe: c.fe, sb: c.sb, sbProblem: c.sbProblem, sbCandidates: c.sbCandidates, sessions: c.sessions });
     setup.push(...c.setupErrors);
     await loadAllocations(ctx);
+    await ensureCustomerPage(ctx);
   } catch (err) {
     setup.push(describeError(err));
   }

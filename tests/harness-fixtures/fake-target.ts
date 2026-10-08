@@ -196,6 +196,12 @@ export interface FakeOptions {
   opaqueSupabase?: boolean;
   /** No /api/import route (renamed). */
   noImportRoute?: boolean;
+  /** The queue links to no customer (as after a month-2 import that orphaned the allocations). */
+  emptyQueue?: boolean;
+  /** Where the bad app ships F04's key: a queue chunk (default) or the customer page's client component (as the real starter does). */
+  serviceKeyOn?: "queue" | "customer";
+  /** false: no /customers/:id pages at all (renamed). Default true. */
+  customerPages?: boolean;
 }
 
 export interface FakeTarget {
@@ -495,7 +501,9 @@ export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promi
     "/_next/static/chunks/app/queue/page.js": `(self.webpackChunk=self.webpackChunk||[]).push([[2],{3:()=>{let q="renewal queue"}}]);`,
     // F04: the service-role key shipped in a client component (only on a signed-in page).
     "/_next/static/chunks/app/queue/admin-panel.js": `(self.webpackChunk=self.webpackChunk||[]).push([[3],{4:()=>{let k="${serviceJwt}"}}]);`,
+    "/_next/static/chunks/app/customers/outcome-form.js": `(self.webpackChunk=self.webpackChunk||[]).push([[5],{6:()=>{let k="${serviceJwt}"}}]);`,
   };
+  const keyOnCustomerPage = !good && opts.serviceKeyOn === "customer";
   const page = (title: string, scripts: string[], extra = "") =>
     `<!doctype html><html><head><title>${title}</title>${scripts.map((s) => `<script src="${s}" async></script>`).join("")}</head><body><a href="/login">Log in</a><a href="/queue">Queue</a>${extra}<script>self.__next_f.push([1,"0:[\\"$\\",\\"script\\",{\\"src\\":\\"\\/_next\\/static\\/chunks\\/main-app.js\\"}]"])</script></body></html>`;
 
@@ -526,19 +534,20 @@ export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promi
     if (req.method === "GET" && p === "/queue") {
       if (!u) return send(res, 307, "", { location: "/login" });
       // The queue lists the caller's own customers (manager: everyone), linked to their pages.
-      const mine = isManager(u) ? db.customers : db.customers.filter((c) => allocatedTo(u).includes(c.id as string));
+      const mine = opts.emptyQueue ? [] : isManager(u) ? db.customers : db.customers.filter((c) => allocatedTo(u).includes(c.id as string));
       const rows = mine.map((c) => `<tr><td><a href="/customers/${String(c.id)}">${String(c.legal_name).replace(/&/g, "&amp;")}</a></td></tr>`).join("");
-      return send(res, 200, page("Queue", ["/_next/static/chunks/main-app.js", "/_next/static/chunks/app/queue/page.js", ...(good ? [] : ["/_next/static/chunks/app/queue/admin-panel.js"])], `<table>${rows}</table>`));
+      return send(res, 200, page("Queue", ["/_next/static/chunks/main-app.js", "/_next/static/chunks/app/queue/page.js", ...(good || keyOnCustomerPage ? [] : ["/_next/static/chunks/app/queue/admin-panel.js"])], `<table>${rows}</table>`));
     }
     const cm = p.match(/^\/customers\/([0-9a-f-]{36})$/);
-    if (req.method === "GET" && cm) {
+    if (req.method === "GET" && cm && opts.customerPages !== false) {
       if (!u) return send(res, 307, "", { location: "/login" });
       const c = db.customers.find((x) => x.id === cm[1]);
       if (!c || (good && !canSeeCustomer(u, cm[1]))) return send(res, 404, "<html>Not found</html>");
       // The message form as React renders it (text split by <!-- --> markers), plus the RSC props.
       const options = db.templates.map((t) => `<option value="${String(t.id)}">${String(t.name)}<!-- --> (<!-- -->${String(t.category)}<!-- -->)</option>`).join("");
       const props = JSON.stringify({ customerId: c.id, templates: db.templates.map((t) => ({ id: t.id, name: t.name, category: t.category, body: t.body })) }).replace(/"/g, '\\"');
-      return send(res, 200, `<html><body><h1>${String(c.legal_name)}</h1><select class="input">${options}</select><script>self.__next_f.push([1,"5:[\\"$\\",\\"$L6\\",null,${props}]"])</script></body></html>`);
+      const formChunk = keyOnCustomerPage ? `<script src="/_next/static/chunks/app/customers/outcome-form.js" async></script>` : "";
+      return send(res, 200, `<html><head>${formChunk}</head><body><h1>${String(c.legal_name)}</h1><select class="input">${options}</select><script>self.__next_f.push([1,"5:[\\"$\\",\\"$L6\\",null,${props}]"])</script></body></html>`);
     }
     if (req.method === "GET" && p === "/api/health") return send(res, 200, good ? { ok: true, db: "ok" } : { ok: true });
     if (req.method === "POST" && p === "/__observatory/api/v2/scan") return send(res, 200, { id: 1, grade: good ? "B+" : "F", score: good ? 80 : 0, tests_passed: good ? 9 : 3, tests_failed: good ? 1 : 7, tests_quantity: 10, details_url: "https://developer.mozilla.org/en-US/observatory/analyze?host=example", scanned_at: new Date().toISOString() });

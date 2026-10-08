@@ -271,6 +271,43 @@ describe("apps that keep Supabase server-side (no publishable key in the bundle)
   }, 180_000);
 });
 
+// Found in the self-test against the real starter: with the URL checks run after the month-2
+// import, F08 had orphaned every allocation, the queue linked to no customer, and U2 passed
+// without ever loading the customer page that ships F04's key.
+describe("U2 needs the customer page (where F04's client component lives)", () => {
+  let badEmpty: FakeTarget;
+  let goodEmpty: FakeTarget;
+  let goodNoPages: FakeTarget;
+  beforeAll(async () => {
+    [badEmpty, goodEmpty, goodNoPages] = await Promise.all([
+      startFakeTarget("bad", { emptyQueue: true, serviceKeyOn: "customer" }),
+      startFakeTarget("good", { emptyQueue: true }),
+      startFakeTarget("good", { emptyQueue: true, customerPages: false }),
+    ]);
+  });
+  afterAll(async () => {
+    await Promise.all([badEmpty?.close(), goodEmpty?.close(), goodNoPages?.close()]);
+  });
+
+  it("opens a customer page by id when the queue links to none, and finds the key there", async () => {
+    const sub = await swe1Submission(badEmpty);
+    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: badEmpty.observatoryUrl });
+    const rows = await latest(sub);
+    expect(rows.get("U2")).toMatchObject({ passed: false });
+    expect(JSON.stringify(rows.get("U2")!.detail.evidence)).toContain("outcome-form.js");
+  }, 120_000);
+
+  it("passes a clean app once a customer page was scanned, and is inconclusive when none can be opened", async () => {
+    const ok = await swe1Submission(goodEmpty);
+    await runUrlHarness(admin, ok, { ...opts(), observatoryUrl: goodEmpty.observatoryUrl });
+    expect((await latest(ok)).get("U2")).toMatchObject({ passed: true, detail: { evidence: { customer_page_scanned: true } } });
+
+    const none = await swe1Submission(goodNoPages);
+    await runUrlHarness(admin, none, { ...opts(), observatoryUrl: goodNoPages.observatoryUrl });
+    expect((await latest(none)).get("U2")).toMatchObject({ passed: null, detail: { inconclusive: true, reason: expect.stringMatching(/no customer page/) } });
+  }, 180_000);
+});
+
 describe("Manual results and the CI report job", () => {
   it("admins record manual rows with their own session; candidates cannot", async () => {
     const { data: auth } = await boss.client.auth.getUser();

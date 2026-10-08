@@ -19,7 +19,7 @@ We grade with an **automated harness** first, then a human, then a live defence 
 
 ## What we give the candidate
 
-The **starter repo** `chase-hiring/kopano-renewal-desk-starter` is a GitHub template. We build it once; see "Building the starter" below. It is a working Next.js + Supabase app with:
+The **starter repo** (for example `chase-hiring/kopano-renewal-desk-starter-2026-11`) is a public GitHub repository, rebuilt for every hiring round; see "Building the starter" below. Candidates clone it and push it, history included, to their own **public** repository (not "Use this template", which squashes the history and with it F13). It is a working Next.js + Supabase app with:
 - a login
 - a renewal queue
 - a customer page
@@ -73,7 +73,7 @@ These are internal; never show this list to candidates.
 > **Submit:**
 > - the repo URL (we grade the commit SHA at submission)
 > - the deployed URL
-> - test logins
+> - test logins: two agents and one manager, one per line as `agent: email / password` (and `manager: …`). If your app keeps Supabase server-side only, add a fourth line `supabase: <project URL> / <publishable key>` so our checks can test your database rules
 > - `README.md`: architecture, how to run locally, decisions, **what you found and fixed, and what you deliberately didn't do**
 > - `RELEASE_NOTES.md`: half a page written *for Lerato, the client GM*
 > - `docs/ADR-001.md`: one architecture decision record, covering one real choice you made, the options and why
@@ -165,4 +165,5 @@ This is our work, done once in Wave 3.
 2. Fork it into the starter and inject F01–F14.
 3. Recreate the F13 history: commit `.env.local` early, delete it later.
 4. Run the harness against both repos. The reference must pass everything, and the starter must fail every check that maps to an F-code.
-5. Keep both repos private. Candidates get the starter through "Use this template".
+5. Keep the **reference** app private (in our own repo only). Publish the **starter** publicly, rebuilt with a fresh seed every round (`assessment-kits/README.md` §3): the harness reads candidates' repos, history and CI without signing in, so their copies must be public anyway, and a private starter would add an access step without keeping anything secret. Copies of earlier rounds stay public, which is why each round's data and customers differ and why the live defence with AI off is decisive.
+6. Re-run the calibration (`scripts/verify-swe1/calibrate.ts`, see `assessment-kits/README.md` §5) whenever the harness, the kit or the starter changes.

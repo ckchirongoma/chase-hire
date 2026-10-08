@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import HarnessPanel from "@/components/admin/harness-panel";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { processSubmission, PROCESS_RECOVERY_MS } from "@/lib/server/work";
 import { elicitationPoints, elicitationYield } from "@/lib/persona/facts";
@@ -424,6 +425,7 @@ export default async function WorkPanel({ applicationId }: { applicationId: stri
                 )}
               </div>
             )}
+            {sub && stage?.key === "swe_test1" && <HarnessPanel submissionId={sub.id} />}
           </div>
         );
       })}

@@ -149,8 +149,30 @@ files before calibrating, so the harness's sentinel customers exist.
   Every R, U, M and D check must pass. The browser signs in with the publishable key, so the
   harness finds the Supabase project and key in the login page's JavaScript.
 - **Starter:** deploy it on a fresh Supabase project with `<out>.internal/live-db.sql` applied,
-  set `NEXT_PUBLIC_SUPABASE_SERVICE_KEY` to that project's server key, and seed it. Every check
-  that maps to an F-code in docs/16 must fail. Details are in `FAULTS.md`, "Calibrating the
-  harness".
+  and seed it with the starter's own `scripts/seed.ts`. For `NEXT_PUBLIC_SUPABASE_SERVICE_KEY`
+  (F04) use a **fake** service-role JWT (payload `{"role":"service_role"}`, signed with a random
+  throwaway secret), not the project's real server key: U2 decodes the token without verifying
+  it and R2 reads the code, so a fake key is detected the same way, and a calibration deployment
+  never publishes a working key. (The starter's outcome form, which writes with that key, then
+  fails in the browser; no check uses it.) Every check that maps to an F-code in docs/16 must
+  fail. Details are in `FAULTS.md`, "Calibrating the harness".
+- **Run it:** `scripts/verify-swe1/calibrate.ts` (from the repository root) runs U1–U8, with
+  `--import` also M1–M7 and D-a…D-c, adds R1–R7 from `repo-checks.ts`'s `results.json`, and
+  compares the result with docs/16: exit 0 when the harness and the app agree. It writes nothing
+  to the platform database.
+
+  ```bash
+  npx tsx scripts/synth/generate.ts --version v1 --seed 20261007 --out /tmp/synth   # the bundle the app was seeded from
+  git -C <reference-or-starter-repo> rev-parse HEAD                                # the SHA to check
+  npx tsx scripts/verify-swe1/repo-checks.ts --repo <repo dir> --sha <sha> --out repo.json \
+    --disposable-sandbox --exec --db-reset                                         # our own code only: see the script's header
+  npx tsx --conditions=react-server scripts/verify-swe1/calibrate.ts --expect reference \
+    --url http://127.0.0.1:3100 --logins logins.txt --bundle /tmp/synth/v1/bundle_c \
+    --repo-results repo.json --import                                              # --expect starter for the starter
+  ```
+
+  `logins.txt` holds the three `test_logins` lines the seed prints. Run it on a freshly seeded
+  deployment: the URL checks before the month-2 import, as in the admin panel. Locally R6 (no CI
+  history on GitHub) and U8 (no public host name) are inconclusive, which the script accepts.
 - The month-2 import checks change the deployment's data. Reset the reference afterwards
   (`npx supabase db reset` in `kopano-renewal-desk/`, then seed again).

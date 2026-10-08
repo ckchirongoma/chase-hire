@@ -39,6 +39,19 @@ async function consentAndUploadCv(page: Page) {
   await expect(page.getByText("Read successfully")).toBeVisible({ timeout: 60_000 });
 }
 
+/** Simulates the candidate switching away from the tab for `ms` and coming back. */
+async function leaveTab(page: Page, ms = 2300) {
+  const setHidden = (hidden: boolean) =>
+    page.evaluate((h) => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => h });
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (h ? "hidden" : "visible") });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, hidden);
+  await setHidden(true);
+  await page.waitForTimeout(ms);
+  await setHidden(false);
+}
+
 test("candidate signs up, uploads a CV, gets a star rating and applies; admin sees everyone with flags", async ({ browser }) => {
   // Admin (logged in once, used to release holds and to review).
   const adminEmail = uniqueEmail("e2e-admin");
@@ -90,20 +103,30 @@ test("candidate signs up, uploads a CV, gets a star rating and applies; admin se
     await expect(adminPage.getByText("Saved.")).toBeVisible();
   }
 
-  // Wave 2: AI CV interview (scripted questions; JEV + grader are stubbed offline).
+  // Wave 2: AI CV interview, spoken (fake microphone; transcription, JEV and the grader are stubbed offline).
   await page.goto("/roles/software-engineer");
   await page.getByRole("link", { name: /Next: AI CV interview/ }).click();
+  await expect(page.getByText(/You answer out loud/)).toBeVisible();
   await page.getByRole("button", { name: "Start the interview" }).click();
-  const answer =
-    "I personally built the nightly reporting job in Python and SQL on Postgres. I chose incremental loads over full reloads, " +
-    "which I measured with query timings before and after (from 40 minutes to 6). The hardest part was duplicate customers, " +
-    "which I fixed with a unique key and a quarantine table. I would add alerts earlier next time.";
+  await expect(page.locator("#answer")).toHaveCount(0); // no typing in voice mode
   for (let i = 0; i < 20; i++) {
     if (await page.getByText("Thank you, the interview is complete").isVisible()) break;
     await expect(page.getByTestId("current-question")).toBeVisible();
-    await page.locator("#answer").fill(answer);
+    await page.getByRole("button", { name: /Record answer/ }).click();
+    await expect(page.getByText(/Recording \d:\d\d/)).toBeVisible();
+    await page.waitForTimeout(1200);
+    await page.getByRole("button", { name: /Stop/ }).click();
     await page.getByRole("button", { name: "Send answer" }).click();
     await expect(page.getByRole("button", { name: "Sending…" })).toHaveCount(0);
+    if (i === 0) {
+      // The stub's transcript of the recording shows up as the candidate's answer.
+      await expect(page.getByText(/nightly reporting job in Python and SQL/).first()).toBeVisible();
+      // Tab rule: leaving the page for 2+ seconds pauses the interview until the candidate confirms.
+      await leaveTab(page);
+      await expect(page.getByRole("dialog", { name: "Paused: you left the page" })).toBeVisible();
+      await page.getByRole("button", { name: "I understand, continue" }).click();
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+    }
   }
   await expect(page.getByText("Thank you, the interview is complete")).toBeVisible();
 
@@ -147,6 +170,10 @@ test("candidate signs up, uploads a CV, gets a star rating and applies; admin se
   await row1.getByRole("link").first().click();
   await expect(adminPage.getByText(/assessment detail/).first()).toBeVisible();
   await expect(adminPage.getByText(/Verification concerns|verification concerns/).first()).toBeVisible();
+  await expect(adminPage.getByText(/Answers: spoken, transcribed · tab leaves 1/)).toBeVisible();
+  await expect(adminPage.getByTestId("session-controls")).toBeVisible();
+  await adminPage.getByText(/^Transcript \(/).first().click();
+  await expect(adminPage.locator("audio").first()).toBeAttached(); // each spoken answer can be played back
 
   await adminPage.goto("/admin/dedupe");
   await expect(adminPage.getByText("exact_file").first()).toBeVisible();

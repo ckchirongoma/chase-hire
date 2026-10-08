@@ -29,7 +29,6 @@ export class ImportApplyError extends Error {
 }
 
 export async function sha256Hex(buffer: ArrayBuffer | Buffer): Promise<string> {
-  const bytes = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const { createHash } = await import("node:crypto");
+  return createHash("sha256").update(buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer).digest("hex");
 }

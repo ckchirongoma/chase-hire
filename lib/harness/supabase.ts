@@ -134,7 +134,7 @@ export class SupabaseProbe {
 
   /** Row count via Content-Range (limit 1). null when the table can't be read. */
   async count(table: string, filters: Filters, session?: Session | null): Promise<RestResult & { total: number | null }> {
-    const r = await this.rest("GET", table, { select: "id", limit: "1", ...filters }, { session, count: true });
+    const r = await this.rest<Record<string, unknown>>("GET", table, { select: "id", limit: "1", ...filters }, { session, count: true });
     return { ...r, total: r.status >= 200 && r.status < 300 ? (r.count ?? r.rows?.length ?? null) : null };
   }
 

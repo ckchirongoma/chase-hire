@@ -1,0 +1,163 @@
+name: verify-swe1
+
+# SWE Test 1 repo checks (R1–R7, docs/07) for ONE submission. Dispatched from the admin panel
+# (lib/harness/github.ts, needs GITHUB_ACTIONS_TOKEN + GITHUB_ACTIONS_REPO on the platform), or
+# by hand: Actions → verify-swe1 → Run workflow.
+#
+# Two jobs, so the candidate's code never runs next to a secret:
+#   untrusted  clones the candidate's repo at the submitted SHA and runs
+#              scripts/verify-swe1/repo-checks.ts: gitleaks over the history, static rules,
+#              a scratch `supabase db start` for the migrations, and npm ci / lint / tsc /
+#              build / test inside a Docker container. permissions: {} and NO secrets. Its only
+#              output is results.json, uploaded as an artifact.
+#   report     never checks out or runs candidate code. Downloads results.json, validates it
+#              strictly (lib/harness/artifact.ts: only R1–R7, booleans/null, short strings),
+#              checks the repo + SHA are the ones frozen with the submission, and inserts
+#              verification_runs rows through the Supabase API.
+#
+# Repository secrets: SUPABASE_URL, SUPABASE_SECRET_KEY (the platform's service-role key).
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: "Submission id (uuid)"
+        required: true
+        type: string
+      repo_url:
+        description: "https://github.com/<owner>/<repo> as submitted"
+        required: true
+        type: string
+      sha:
+        description: "The commit SHA frozen at submission (40 hex)"
+        required: true
+        type: string
+      harness_run_id:
+        description: "harness_runs id from the admin panel (optional)"
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: verify-swe1-${{ inputs.submission_id }}
+  cancel-in-progress: false
+
+jobs:
+  untrusted:
+    name: Repo checks (untrusted candidate code, no secrets)
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 60
+    env:
+      REPO_URL: ${{ inputs.repo_url }}
+      SHA: ${{ inputs.sha }}
+      SUBMISSION_ID: ${{ inputs.submission_id }}
+      GITLEAKS_VERSION: "8.24.2"
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "::error::repo_url must be https://github.com/<owner>/<repo>"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be a 40-character commit SHA"; exit 1; }
+          [[ "$SUBMISSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "::error::submission_id must be a UUID"; exit 1; }
+
+      - name: Check out the harness (this repository, not the candidate's)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # No dependency cache in this job: nothing written here may be restored by the report job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install harness dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install gitleaks
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          sudo install -m 0755 "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
+          gitleaks version
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Run repo checks
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          npx tsx scripts/verify-swe1/repo-checks.ts \
+            --repo "$REPO_URL" --sha "$SHA" \
+            --out "$RUNNER_TEMP/results/results.json" \
+            --workdir "$RUNNER_TEMP/work" \
+            --exec --exec-mode docker --db-reset
+
+      - name: Upload results.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-swe1-results
+          path: ${{ runner.temp }}/results/results.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  report:
+    name: Record results (trusted, never runs candidate code)
+    needs: untrusted
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      REPO_URL: ${{ inputs.repo_url }}
+      SHA: ${{ inputs.sha }}
+      SUBMISSION_ID: ${{ inputs.submission_id }}
+      HARNESS_RUN_ID: ${{ inputs.harness_run_id }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || exit 1
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$SUBMISSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || exit 1
+          [[ -z "$HARNESS_RUN_ID" || "$HARNESS_RUN_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || exit 1
+
+      - name: Check out the harness (this repository)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install harness dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download results.json (data only)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: verify-swe1-results
+          path: ${{ runner.temp }}/in
+
+      - name: Validate and record results
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          UNTRUSTED_RESULT: ${{ needs.untrusted.result }}
+        run: |
+          set -euo pipefail
+          args=(--in "$RUNNER_TEMP/in/results.json" --submission-id "$SUBMISSION_ID" --repo-url "$REPO_URL" --sha "$SHA" --run-url "$RUN_URL" --untrusted-result "$UNTRUSTED_RESULT")
+          if [ -n "$HARNESS_RUN_ID" ]; then args+=(--harness-run-id "$HARNESS_RUN_ID"); fi
+          npx tsx scripts/verify-swe1/report.ts "${args[@]}"

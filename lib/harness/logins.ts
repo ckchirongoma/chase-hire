@@ -1,3 +1,5 @@
+import { findJwts } from "./jwt";
+
 /**
  * Parses the test logins a SWE Test 1 candidate submits (docs/16 "Logins the candidate submits"):
  *
@@ -24,12 +26,20 @@ export interface ParsedLogins {
   manager: Login | null;
   /** Problems a reviewer should know about (missing roles or passwords, assumed roles). */
   problems: string[];
+  /**
+   * The Supabase project URL and publishable key, when the candidate wrote them alongside the
+   * logins (apps that keep Supabase server-side ship neither in their bundle). Both are public
+   * by design.
+   */
+  supabaseUrl?: string | null;
+  publishableKey?: string | null;
 }
 
 const EMAIL = /[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/;
 const MANAGER_WORD = /\b(manager|mgr|supervisor|team\s*lead|admin(?:istrator)?|gm)\b/i;
 const AGENT_WORD = /\b(agents?|sales\s*agent|user\s*[ab12])\b/i;
-const PASSWORD_LABEL = /^(?:password|passwd|pass|pwd|pw)\b\s*[:=]?\s*/i;
+/** "Password: x", "pw = x" or "Password x" (a bare "pw-…" is a password, not a label). */
+const PASSWORD_LABEL = /^(?:(?:password|passwd|pass|pwd|pw)\s*[:=]\s*|password\s+)/i;
 
 function roleIn(text: string): LoginRole | null {
   if (MANAGER_WORD.test(text)) return "manager";
@@ -68,7 +78,8 @@ function passwordAfter(rest: string): string | null {
     return cell ? unquote(cell.replace(PASSWORD_LABEL, "")) || null : null;
   }
   r = r.replace(/^\s*(?:[/|,;\t]|\s-\s|\s–\s|\s—\s|:)\s*/, " ").trim();
-  r = r.replace(/^\(?\s*(?:password|passwd|pass|pwd|pw)\s*[:=]?\s*/i, "").replace(/\)\s*$/, "").trim();
+  const labelled = r.match(/^\(\s*(?:(?:password|passwd|pass|pwd|pw)\s*[:=]|password\s)\s*(.*?)\s*\)$/i);
+  r = labelled ? labelled[1] : r.replace(PASSWORD_LABEL, "").trim();
   if (!r) return null;
   // "pw | note" in a table or a trailing comment after two spaces + "(...)"
   r = r.replace(/\s+\|\s*$/, "").trim();
@@ -82,6 +93,12 @@ export function parseTestLogins(raw: string | null | undefined): ParsedLogins {
     return out;
   }
   const lines = normalise(raw);
+  const sbUrl = raw.match(/https?:\/\/[A-Za-z0-9-]+\.supabase\.(?:co|in)\b/) ?? raw.match(/supabase[^\n]*?(https?:\/\/[^\s/`'"<>|]+)/i);
+  out.supabaseUrl = sbUrl ? (sbUrl[1] ?? sbUrl[0]) : null;
+  // A legacy anon JWT is accepted; anything with more privileges is never used as the key.
+  const jwts = findJwts(raw);
+  if (jwts.some((j) => j.role !== "anon")) out.problems.push("a non-anon key (e.g. service_role) was pasted into the test logins: it is not used");
+  out.publishableKey = raw.match(/\bsb_publishable_[A-Za-z0-9_-]{8,}/)?.[0] ?? jwts.find((j) => j.role === "anon")?.token ?? null;
   const found: { role: LoginRole | null; email: string; password: string | null; line: number }[] = [];
   let headingRole: LoginRole | null = null;
 
@@ -141,6 +158,6 @@ export function parseTestLogins(raw: string | null | undefined): ParsedLogins {
 }
 
 /** Evidence-safe view: emails and roles only. */
-export function describeLogins(p: ParsedLogins): { agents: string[]; manager: string | null; problems: string[] } {
-  return { agents: p.agents.map((a) => a.email), manager: p.manager?.email ?? null, problems: p.problems };
+export function describeLogins(p: ParsedLogins): { agents: string[]; manager: string | null; problems: string[]; supabase_url: string | null; publishable_key_given: boolean } {
+  return { agents: p.agents.map((a) => a.email), manager: p.manager?.email ?? null, problems: p.problems, supabase_url: p.supabaseUrl ?? null, publishable_key_given: !!p.publishableKey };
 }

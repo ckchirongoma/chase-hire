@@ -1,7 +1,13 @@
 import { defineConfig } from "vitest/config";
+import { loadEnv } from "vite";
 import path from "node:path";
 
-export default defineConfig({
+/**
+ * `npm test` runs the unit tests (no database needed).
+ * `npm run test:db` also runs the database tests against the local Supabase stack
+ * (`npx supabase start`). They WIPE the business tables first: re-run `npm run seed` afterwards.
+ */
+export default defineConfig(({ mode }) => ({
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "."),
@@ -11,9 +17,10 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
-    // DB tests share one local database: run files one at a time.
+    env: { ...loadEnv("test", process.cwd(), ""), ...loadEnv("development", process.cwd(), ""), RUN_DB_TESTS: mode === "db" ? "1" : "" },
+    // Database tests share one database: run files one at a time.
     fileParallelism: false,
     testTimeout: 30_000,
     hookTimeout: 60_000,
   },
-});
+}));

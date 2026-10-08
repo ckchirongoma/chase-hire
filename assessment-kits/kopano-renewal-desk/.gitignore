@@ -21,3 +21,6 @@ supabase/.branches/
 npm-debug.log*
 coverage/
 .vercel
+
+# the client's data files (load them with `npm run seed -- --data ./data`, never commit them)
+/data/

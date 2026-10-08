@@ -89,12 +89,7 @@ export function planBaseImport(sheet: Sheet): BasePlan {
     fingerprints.set(fingerprint, String(row.rowNumber));
 
     const phone = normalisePhone(c["Msisdn"]);
-    if (!phone.ok) {
-      flag(row, "invalid_phone", `Msisdn ${phone.reason}: the line cannot be identified`);
-      continue;
-    }
-    seen.add(phone.e164);
-
+    if (phone.ok) seen.add(phone.e164);
     const accountNo = idText(c["Account No"]);
     const name = text(c["Customer Name"]);
     if (!accountNo || !name) {
@@ -102,15 +97,7 @@ export function planBaseImport(sheet: Sheet): BasePlan {
       continue;
     }
 
-    if (lines.has(phone.e164)) {
-      stats.conflicting_rows++;
-      flag(row, "conflicting_duplicate", `${phone.e164} already appears in row ${lines.get(phone.e164)!.row_number} with different values; the first row was kept`);
-      continue;
-    }
-
-    const end = parseDate(c["Contract End Date"]);
-    if (!end.ok) flag(row, end.reason, `Contract End Date ${end.detail}; the line was imported without changing its end date`);
-
+    // The customer and account are real even when this line's number is not.
     const regNo = text(c["Reg No"]);
     const existing = accounts.get(accountNo);
     if (!existing) {
@@ -125,6 +112,20 @@ export function planBaseImport(sheet: Sheet): BasePlan {
     } else if (!existing.reg_no && regNo) {
       existing.reg_no = regNo;
     }
+
+    if (!phone.ok) {
+      flag(row, "invalid_phone", `Msisdn ${phone.reason}: the line cannot be identified, so it was not imported`);
+      continue;
+    }
+
+    if (lines.has(phone.e164)) {
+      stats.conflicting_rows++;
+      flag(row, "conflicting_duplicate", `${phone.e164} already appears in row ${lines.get(phone.e164)!.row_number} with different values; the first row was kept`);
+      continue;
+    }
+
+    const end = parseDate(c["Contract End Date"]);
+    if (!end.ok) flag(row, end.reason, `Contract End Date ${end.detail}; the line was imported without changing its end date`);
 
     const contractEnd = end.ok ? end.date : null;
     const exportStatus = text(c["Contract Status"]);

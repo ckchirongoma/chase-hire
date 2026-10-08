@@ -61,8 +61,8 @@ export function extractPageLinks(html: string, base: URL): string[] {
 
 export interface SupabaseCandidate {
   url: string;
-  /** Why this URL was picked: supabase-host, jwt-ref, near-key, any-url. */
-  via: "supabase-host" | "jwt-ref" | "near-key" | "any-url";
+  /** Why this URL was picked: supabase-host, jwt-ref, csp (connect-src), near-key, any-url. */
+  via: "supabase-host" | "jwt-ref" | "csp" | "near-key" | "any-url";
 }
 
 export interface SupabaseConfig {
@@ -73,6 +73,20 @@ export interface SupabaseConfig {
 }
 
 const NOT_SUPABASE = /(?:^|\.)(?:googleapis\.com|gstatic\.com|google\.com|openrouter\.ai|github\.com|githubusercontent\.com|vercel\.(?:app|com|live)|nextjs\.org|w3\.org|reactjs\.org|react\.dev|mozilla\.org|schema\.org|sentry\.io|jsdelivr\.net|unpkg\.com|cloudflare\.com|loom\.com|example\.(?:com|org))$/i;
+
+/** http(s) origins allowed by connect-src in Content-Security-Policy headers. */
+export function cspConnectOrigins(policies: string[]): string[] {
+  const out = new Set<string>();
+  for (const p of policies) {
+    const directive = p.split(";").map((d) => d.trim()).find((d) => /^connect-src\s/i.test(d));
+    for (const src of directive?.split(/\s+/).slice(1) ?? []) {
+      const o = originOf(src.replace(/\/\*$/, ""));
+      if (o && !o.includes("*")) out.add(o);
+    }
+  }
+  // *.supabase.co first: the likeliest project URL.
+  return [...out].sort((a, b) => Number(/\.supabase\.(co|in)$/.test(b)) - Number(/\.supabase\.(co|in)$/.test(a)));
+}
 
 function originOf(raw: string): string | null {
   try {
@@ -89,7 +103,7 @@ function originOf(raw: string): string | null {
  * *.supabase.co/.in hosts, then the project ref in the anon JWT, then URLs written next to the
  * key (createClient(url, key) keeps them adjacent after minification), then any other URL.
  */
-export function extractSupabaseConfig(texts: string[], deployedOrigin?: string): SupabaseConfig {
+export function extractSupabaseConfig(texts: string[], deployedOrigin?: string, csp: string[] = []): SupabaseConfig {
   const joined = texts.join("\n");
   const scan = scanSecrets(joined);
   const anon: FoundJwt | undefined = scan.anonJwts[0];
@@ -111,6 +125,8 @@ export function extractSupabaseConfig(texts: string[], deployedOrigin?: string):
     if (o && /^https:\/\/[a-z0-9-]+\.supabase\.(?:co|in)$/i.test(o)) push(o, "supabase-host");
   }
   for (const j of scan.anonJwts) if (j.ref && /^[a-z0-9]{10,40}$/i.test(j.ref)) push(`https://${j.ref}.supabase.co`, "jwt-ref");
+  // Apps that keep Supabase server-side still name it in their CSP connect-src.
+  for (const o of cspConnectOrigins(csp)) if (o !== deployedOrigin && !NOT_SUPABASE.test(new URL(o).hostname)) push(o, "csp");
 
   if (key) {
     const keyAt: number[] = [];

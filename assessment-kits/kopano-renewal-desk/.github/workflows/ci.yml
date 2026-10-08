@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint and typecheck
+        run: |
+          npm run lint
+          npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:55321
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ci-placeholder-publishable-key
+
+      - name: Start Supabase (applies every migration from scratch)
+        run: npx supabase start
+
+      - name: Database tests (RLS, RD-07, RD-11, monthly import)
+        run: |
+          eval "$(npx supabase status -o env | sed -n -e 's/^API_URL=/export NEXT_PUBLIC_SUPABASE_URL=/p' -e 's/^PUBLISHABLE_KEY=/export NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=/p' -e 's/^SECRET_KEY=/export SUPABASE_SECRET_KEY=/p')"
+          npm run test:db
+
+      - name: Stop Supabase
+        if: always()
+        run: npx supabase stop --no-backup

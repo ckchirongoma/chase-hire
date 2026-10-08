@@ -206,8 +206,8 @@ export function parseEnvExample(text: string | null): Record<string, string> {
     const m = line.match(/^(?:export\s+)?([A-Z][A-Z0-9_]{0,63})\s*=\s*(.*)$/);
     if (!m) continue;
     let v = m[2].trim();
-    if (/^["'].*["']$/.test(v)) v = v.slice(1, -1);
-    else v = v.replace(/\s+#.*$/, "");
+    const quoted = v.match(/^(["'])(.*?)\1(?:\s+#.*)?$/);
+    v = quoted ? quoted[2] : v.replace(/\s+#.*$/, "");
     if (v.length > 500) continue;
     out[m[1]] = v;
   }

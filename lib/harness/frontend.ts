@@ -31,6 +31,8 @@ export interface FrontEnd {
   texts: Map<string, string>;
   totalBytes: number;
   limitsHit: string[];
+  /** Content-Security-Policy headers seen on pages (connect-src names the Supabase URL). */
+  csp: string[];
 }
 
 export interface SupabaseTarget {
@@ -50,7 +52,7 @@ export interface Sessions {
 }
 
 export function newFrontEnd(base: URL): FrontEnd {
-  return { base, pages: [], scripts: [], texts: new Map(), totalBytes: 0, limitsHit: [] };
+  return { base, pages: [], scripts: [], texts: new Map(), totalBytes: 0, limitsHit: [], csp: [] };
 }
 
 async function fetchText(http: Http, fe: FrontEnd, url: string, headers: Record<string, string>, maxBytes: number, as: string, follow: number): Promise<FetchedText & { text: string | null; finalUrl: string }> {
@@ -58,6 +60,8 @@ async function fetchText(http: Http, fe: FrontEnd, url: string, headers: Record<
     const res = await http.request(url, { headers: { accept: "text/html,application/javascript,*/*;q=0.5", ...headers }, maxBytes, timeoutMs: 12_000, followRedirects: follow });
     const text = res.status >= 200 && res.status < 300 ? res.text() : null;
     if (text) fe.totalBytes += res.body.length;
+    const csp = res.headers["content-security-policy"];
+    if (csp && !fe.csp.includes(csp) && fe.csp.length < 10) fe.csp.push(csp.slice(0, 4000));
     return { url, status: res.status, bytes: res.body.length, truncated: res.truncated, error: null, as, text, finalUrl: res.url };
   } catch (err) {
     return { url, status: null, bytes: 0, truncated: false, error: describeError(err), as, text: null, finalUrl: url };
@@ -136,12 +140,19 @@ export async function crawlAuthenticated(http: Http, fe: FrontEnd, sb: SupabaseT
  * otherwise).
  */
 export async function findSupabase(http: Http, fe: FrontEnd, overrides: { supabaseUrl?: string | null; anonKey?: string | null } = {}): Promise<{ target: SupabaseTarget | null; problem: string | null; candidates: string[] }> {
-  const cfg = extractSupabaseConfig([...fe.texts.values()], fe.base.origin);
+  const cfg = extractSupabaseConfig([...fe.texts.values()], fe.base.origin, fe.csp);
   const key = overrides.anonKey || cfg.key;
   const candidates = overrides.supabaseUrl ? [{ url: overrides.supabaseUrl.replace(/\/+$/, ""), via: "admin override" }, ...cfg.candidates] : cfg.candidates;
-  if (!key) return { target: null, problem: "no publishable/anon key found in the bundle (enter it in the harness form)", candidates: candidates.map((c) => c.url) };
+  if (!key) {
+    const where = candidates[0] ? ` (the Supabase URL looks like ${candidates[0].url}, from ${candidates[0].via})` : "";
+    return {
+      target: null,
+      problem: `no publishable/anon key in the front end: the app keeps Supabase server-side${where}. Enter the project's publishable key in the harness form (it is public by design; ask the candidate if needed)`,
+      candidates: candidates.map((c) => c.url),
+    };
+  }
   if (!candidates.length) return { target: null, problem: "no Supabase URL found in the bundle (enter it in the harness form)", candidates: [] };
-  const keyKind = overrides.anonKey ? "admin override" : (cfg.keyKind ?? "unknown");
+  const keyKind = overrides.anonKey ? "provided (harness form or test logins)" : (cfg.keyKind ?? "unknown");
   for (const c of candidates.slice(0, 4)) {
     let probe: SupabaseProbe;
     try {

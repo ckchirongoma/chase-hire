@@ -14,7 +14,8 @@
     "db:stop": "supabase stop",
     "db:reset": "supabase db reset",
     "seed": "tsx scripts/seed.ts",
-    "ai:stub": "node scripts/openrouter-stub.mjs"
+    "ai:stub": "node scripts/openrouter-stub.mjs",
+    "test:db": "vitest run --mode db"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

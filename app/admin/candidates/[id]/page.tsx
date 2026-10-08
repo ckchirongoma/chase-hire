@@ -8,6 +8,8 @@ import { QuizPanel } from "@/components/admin/quiz-panel";
 import WorkPanel from "@/components/admin/work-panel";
 import WorkGrades from "@/components/admin/work-grades";
 import SessionControls from "@/components/admin/session-controls";
+import CandidateBriefCard from "@/components/admin/candidate-brief";
+import { getBrief, type StoredBrief } from "@/lib/server/brief";
 import { computeScores, refreshQuietly, refreshScores } from "@/lib/server/scores";
 import { viewerLiveGate } from "@/lib/server/live";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -95,6 +97,13 @@ export default async function CandidateDetail({
 
   const cv = cvs.data?.[0];
   const { data: signed } = cv ? await supabase.storage.from("cvs").createSignedUrl(cv.storage_path, 300) : { data: null };
+  let brief: StoredBrief | null = null;
+  let briefError: string | null = null;
+  try {
+    brief = await getBrief(createAdminClient(), id);
+  } catch (e) {
+    briefError = e instanceof Error ? e.message : "Could not load the brief";
+  }
 
   return (
     <div className="space-y-6">
@@ -112,6 +121,8 @@ export default async function CandidateDetail({
       </div>
       {error && <p className="error">{error}</p>}
       {ok && <p className="notice">Saved.</p>}
+
+      <CandidateBriefCard userId={id} initial={brief} initialError={briefError} />
 
       <section className="card space-y-3">
         <h2 className="h2">Applications and decisions</h2>

@@ -208,3 +208,12 @@ Use the grader-criterion template. The REFERENCE is the A01–A15 table plus the
 > **User:** "{{brief}}". Answer as a competent generalist with no access to the data files, in 400 words.
 
 Store the output as `GENERIC_BASELINE` for P3 (doc 09 §3) and for SWE Test 2's non-obviousness checks.
+
+## candidate-brief.v1
+
+File: `prompts/candidate-brief.v1.md`. Model: `OPENROUTER_MODEL_GRADER`. One call per brief, temperature 0.2. Code: `lib/server/brief.ts`; stored in `candidate_briefs` (migration 0023) with the model, prompt version and a hash of the inputs.
+
+- **What it is:** an internal, advisory brief at the top of each candidate's admin page: a headline, a short summary, strengths and concerns with evidence, a recommendation per application (advance / hold / don't advance / too early, with confidence and the one thing to check next) and questions for a live session.
+- **Inputs:** the parsed CV without the identity block, reasoning stars, and per application: stage and status, the composite, interview criterion scores and concerns, the quiz, work criterion scores and feedback, flags and recorded decisions. Never the name, email or phone.
+- **When it runs:** automatically when an admin opens the profile and there is no brief or new results have arrived; "Rewrite it" forces a fresh one.
+- **What it never does:** change an application. Every advance or reject is still an admin decision with a written reason (POPIA s71).

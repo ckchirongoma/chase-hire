@@ -209,3 +209,15 @@ purge_log(user_id_hash text, purged_at timestamptz, scope text)
 | `my_reasoning` | raw score, percentile, stars, date |
 
 These views never expose answer keys, evidence quotes about other candidates, or raw grader samples.
+
+## Candidate briefs (migration 0023)
+
+```sql
+candidate_briefs(
+  id uuid pk, user_id uuid unique -> auth.users (cascade),
+  content jsonb,            -- lib/briefs/schema.ts CandidateBrief
+  inputs_hash text,         -- sha256 of the inputs; a mismatch = new results since
+  model text, prompt_version text, created_by uuid, created_at timestamptz)
+-- admin select only; written by the server (service role). Deleted with the user.
+```
+

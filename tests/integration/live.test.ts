@@ -11,6 +11,7 @@ import { computeScores } from "@/lib/server/scores";
 import { finalComposite, liveComposite, preLiveComposite } from "@/lib/scoring/composite";
 import { kindsForRole, type ScoredKind } from "@/lib/live/scorecard";
 import { livePercentile } from "@/lib/live/retest";
+import { concernKey } from "@/lib/live/panel";
 import { consent, fakeFinishedAttempt, fakeParsedCv, makeAdmin, newUser, psql, service } from "../helpers/local";
 
 const admin = service();
@@ -123,13 +124,13 @@ describe("panel question bank and verification concerns (docs/09 §5)", () => {
     const two = await liveCandidate("live-concerns-2", SWE);
     const panel2 = (await questionsFor(admin, SWE, two.appId)).byKind.get("panel_interview")!;
     expect(panel2).toHaveLength(6);
-    expect(panel2.filter((q) => q.source === "concern").map((q) => q.key)).toEqual(["concern_1", "concern_2"]);
+    expect(panel2.filter((q) => q.source === "concern").map((q) => q.key)).toEqual([concernKey(CONCERNS[0].claim), concernKey(CONCERNS[1].claim)]);
     expect(panel2[4].text).toContain(CONCERNS[0].claim);
     expect(panel2[5].text).toContain(CONCERNS[1].claim);
 
     const one = await liveCandidate("live-concerns-1", BA, [CONCERNS[0]]);
     const panel1 = (await questionsFor(admin, BA, one.appId)).byKind.get("panel_interview")!;
-    expect(panel1.map((q) => q.key)).toEqual(["ba_panel_data_problem", "ba_panel_hidden_need", "ba_panel_said_no", "ba_panel_spec_built", "concern_1", "ba_panel_ai_checked"]);
+    expect(panel1.map((q) => q.key)).toEqual(["ba_panel_data_problem", "ba_panel_hidden_need", "ba_panel_said_no", "ba_panel_spec_built", concernKey(CONCERNS[0].claim), "ba_panel_ai_checked"]);
 
     const none = await liveCandidate("live-concerns-0", BA, []);
     const q0 = await questionsFor(admin, BA, none.appId);
@@ -145,36 +146,37 @@ describe("independent raters (docs/09 §5)", () => {
 
     // A drafts, then submits. B sees nothing of A's card.
     expect(msg(await score(raterA, SWE, c.appId, "panel_interview", 3, "draft"), "ok")).toMatch(/Draft saved/);
-    expect(await visibleScorecards(raterB.client, c.appId)).toEqual([]);
+    expect(await visibleScorecards(raterB.client, c.appId, raterB.id)).toEqual([]);
     expect(msg(await score(raterA, SWE, c.appId, "panel_interview", 4), "ok")).toMatch(/submitted/);
-    expect((await visibleScorecards(raterB.client, c.appId)).filter((x) => x.rater === raterA.id)).toEqual([]);
+    expect((await visibleScorecards(raterB.client, c.appId, raterB.id)).filter((x) => x.rater === raterA.id)).toEqual([]);
     const { data: direct } = await raterB.client.from("live_scorecards").select("id").eq("application_id", c.appId);
     expect(direct).toEqual([]);
     // B may know that someone submitted (a count, no scores).
     expect((await scorecardCounts(admin, [c.appId], raterB.id)).get(c.appId)?.get("panel_interview")).toEqual({ submitted: 1, drafts: 0, mine: null });
 
     // A's stored card: every question 4 → 75, notes per question kept.
-    const [mine] = await visibleScorecards(raterA.client, c.appId);
+    const [mine] = await visibleScorecards(raterA.client, c.appId, raterA.id);
     expect(mine).toMatchObject({ kind: "panel_interview", rater: raterA.id, total: 75 });
     expect(mine.submitted_at).not.toBeNull();
-    expect(Object.keys(mine.scores)).toContain("concern_1");
-    expect(mine.notes).toContain("[concern_1] Evidence for concern_1");
+    const k1 = concernKey(CONCERNS[0].claim);
+    expect(Object.keys(mine.scores)).toContain(k1);
+    expect(mine.notes).toContain(`[${k1}] Evidence for ${k1}`);
 
     // B drafts: still blind. B submits: now sees A's card (and A sees B's).
     expect(msg(await score(raterB, SWE, c.appId, "panel_interview", 2, "draft"), "ok")).toMatch(/Draft saved/);
-    expect((await visibleScorecards(raterB.client, c.appId)).map((x) => x.rater)).toEqual([raterB.id]);
+    expect((await visibleScorecards(raterB.client, c.appId, raterB.id)).map((x) => x.rater)).toEqual([raterB.id]);
     expect(msg(await score(raterB, SWE, c.appId, "panel_interview", 2), "ok")).toMatch(/submitted/);
-    expect((await visibleScorecards(raterB.client, c.appId)).map((x) => x.rater).sort()).toEqual([raterA.id, raterB.id].sort());
-    expect((await visibleScorecards(raterA.client, c.appId)).map((x) => x.rater).sort()).toEqual([raterA.id, raterB.id].sort());
+    expect((await visibleScorecards(raterB.client, c.appId, raterB.id)).map((x) => x.rater).sort()).toEqual([raterA.id, raterB.id].sort());
+    expect((await visibleScorecards(raterA.client, c.appId, raterA.id)).map((x) => x.rater).sort()).toEqual([raterA.id, raterB.id].sort());
     // Seeing the panel interview doesn't reveal another part.
     expect(msg(await score(raterA, SWE, c.appId, "live_defence", 3), "ok")).toMatch(/submitted/);
-    expect((await visibleScorecards(raterB.client, c.appId)).some((x) => x.kind === "live_defence")).toBe(false);
+    expect((await visibleScorecards(raterB.client, c.appId, raterB.id)).some((x) => x.kind === "live_defence")).toBe(false);
 
     // Final: the action refuses, and so does the database.
     expect(msg(await score(raterA, SWE, c.appId, "panel_interview", 5), "error")).toMatch(/submitted and final/);
     const { error } = await raterA.client.from("live_scorecards").update({ total: 100 }).eq("id", mine.id);
     expect(error?.message).toMatch(/scorecard_already_submitted/);
-    const [after] = (await visibleScorecards(raterA.client, c.appId)).filter((x) => x.id === mine.id);
+    const [after] = (await visibleScorecards(raterA.client, c.appId, raterA.id)).filter((x) => x.id === mine.id);
     expect(after.total).toBe(75);
   });
 
@@ -185,7 +187,7 @@ describe("independent raters (docs/09 §5)", () => {
     expect(msg(await score(raterA, BA, c.appId, "live_defence", 7, "draft"), "error")).toMatch(/whole numbers from 1 to 5/);
     // A partial draft is fine and has no total yet.
     expect(msg(await score(raterA, BA, c.appId, "live_defence", { [keys[0]]: 3 }, "draft"), "ok")).toMatch(/Draft saved/);
-    const [draft] = await visibleScorecards(raterA.client, c.appId);
+    const [draft] = await visibleScorecards(raterA.client, c.appId, raterA.id);
     expect(draft).toMatchObject({ total: null, submitted_at: null, scores: { [keys[0]]: 3 } });
     // A BA has no exec scenario.
     h.client = raterA.client;

@@ -213,7 +213,7 @@ export default async function CalibrationPage({ searchParams }: { searchParams: 
         )}
         <details className="text-sm" open={gold.length === 0}>
           <summary className="cursor-pointer font-medium underline">Add a gold sample</summary>
-          <form action={addGoldSample} className="mt-2 space-y-2" encType="multipart/form-data">
+          <form action={addGoldSample} className="mt-2 space-y-2">
             <input type="hidden" name="rubric_key" value={key} />
             <label className="label">
               Label

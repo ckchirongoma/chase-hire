@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 // Server actions and pages run as whichever client h.client holds.
 const h = vi.hoisted(() => ({ client: null as unknown }));
@@ -10,9 +10,24 @@ import { recomputeItemStats } from "@/app/admin/banks/actions";
 import { deleteDemographics, saveDemographics } from "@/app/me/demographics/actions";
 import { DEMOGRAPHICS_NOTICE_VERSION } from "@/app/me/demographics/notice";
 import { adverseImpactAll, adverseImpact, demographicsCoverage, reliability, retentionOverview } from "@/lib/server/compliance";
-import { anon, consent, makeAdmin, newUser, psql, service } from "../helpers/local";
+import { anon, consent, makeAdmin, newUser as newUserRaw, psql, service } from "../helpers/local";
 
 const admin = service();
+
+/** Every account this file creates, removed afterwards so repeated runs don't grow the shared DB. */
+const created: string[] = [];
+async function newUser(tag: string) {
+  const u = await newUserRaw(tag);
+  created.push(u.id);
+  return u;
+}
+afterAll(() => {
+  if (!created.length) return;
+  const ids = created.map((id) => `'${id}'`).join(",");
+  // Candidates first: an admin can't go while their decisions (on those candidates) exist.
+  psql(`delete from auth.users u where u.id in (${ids}) and not exists (select 1 from public.admins a where a.user_id = u.id);
+        delete from auth.users where id in (${ids});`);
+});
 
 function seed(sql: string) {
   psql(`set session_replication_role = replica; ${sql}`);
@@ -66,6 +81,14 @@ async function bulkUsers(tag: string, n: number): Promise<string[]> {
 describe("adverse impact report (docs/09 §9)", () => {
   const slug = `ai-test-${randomUUID().slice(0, 8)}`;
   let roleId: string;
+  let seeded: string[] = [];
+
+  // Test data only: remove the 75 seeded people (cascades their applications, decisions and
+  // demographics) and the role, so repeated runs don't grow the shared database.
+  afterAll(() => {
+    if (seeded.length) psql(`delete from auth.users where id in (${seeded.map((id) => `'${id}'`).join(",")});`);
+    if (roleId) psql(`delete from public.roles where id = '${roleId}';`);
+  });
 
   beforeAll(async () => {
     const { data, error } = await admin
@@ -88,6 +111,7 @@ describe("adverse impact report (docs/09 §9)", () => {
     ];
     const total = groups.reduce((a, g) => a + g.n, 0) + 3;
     const ids = await bulkUsers("ai", total);
+    seeded = ids;
     const sql: string[] = [];
     let k = 0;
     const reason = "Test setup: decided on the quiz topic scores and the evidence.";
@@ -259,13 +283,16 @@ describe("reliability (KR-20)", () => {
       );
     });
     psql(`insert into public.item_response_archive (source, attempt_ref, form, position, correct, served, attempt_score, cohort_month) values ${rows.join(",")};`);
-
-    const rel = await reliability(boss.client);
-    const mine = rel.filter((r) => r.form === formName);
-    expect(mine.map((r) => r.cohort)).toEqual([null, "2026-09-01"]);
-    for (const r of mine) {
-      expect(r).toMatchObject({ attempts: 8, k: 6, mean: 3.5, band: "too_few" });
-      expect(r.kr20).toBeCloseTo(0.726923, 5);
+    try {
+      const rel = await reliability(boss.client);
+      const mine = rel.filter((r) => r.form === formName);
+      expect(mine.map((r) => r.cohort)).toEqual([null, "2026-09-01"]);
+      for (const r of mine) {
+        expect(r).toMatchObject({ attempts: 8, k: 6, mean: 3.5, band: "too_few" });
+        expect(r.kr20).toBeCloseTo(0.726923, 5);
+      }
+    } finally {
+      psql(`delete from public.item_response_archive where form = '${formName}';`);
     }
 
     // RLS: a candidate gets nothing.
@@ -313,22 +340,37 @@ describe("admin pages and actions", () => {
   });
 
   it("item statistics count archived answers and use the rest-score point-biserial", async () => {
-    // A live-form template nobody else answers in tests: 40 archived answers from attempts whose
-    // rest scores rise with correctness, so p = .5 and discrimination is high.
-    const { data: tmpl } = await admin.from("reasoning_items").select("id, exposures").eq("form", "live").eq("family", "verbal").eq("tier", "hard").maybeSingle();
+    // A live-form template (the paper retest is scored on scorecards, so nothing else answers it
+    // in tests): 40 archived answers whose rest scores rise with correctness, so p = .5 and the
+    // discrimination is high. No attempt_ref, so KR-20 ignores them; removed afterwards.
+    const { data: tmpl } = await admin
+      .from("reasoning_items")
+      .select("id, exposures, difficulty_p, discrimination")
+      .eq("form", "live")
+      .eq("family", "verbal")
+      .eq("tier", "hard")
+      .maybeSingle();
     if (!tmpl) return; // the live pool is seeded by migration 0017
     const before = Number(tmpl.exposures ?? 0);
     const rows = Array.from({ length: 40 }, (_, i) => {
       const correct = i % 2 === 0;
       const rest = (correct ? 8 : 3) + (i % 3);
-      return `('reasoning', '${tmpl.id}', 'verbal', 'hard', ${correct}, true, ${rest + (correct ? 1 : 0)}, gen_random_uuid(), 'live', 12, '2026-09-01')`;
+      return `('reasoning', '${tmpl.id}', 'verbal', 'hard', ${correct}, true, ${rest + (correct ? 1 : 0)}, 'live', '1900-01-01')`;
     });
-    psql(`insert into public.item_response_archive (source, item_id, family_or_topic, tier, correct, served, attempt_score, attempt_ref, form, position, cohort_month) values ${rows.join(",")};`);
-    const { data: n, error } = await admin.rpc("refresh_reasoning_item_stats");
-    expect(error).toBeNull();
-    expect(Number(n)).toBeGreaterThanOrEqual(1);
-    const { data: after } = await admin.from("reasoning_items").select("exposures, difficulty_p, discrimination").eq("id", tmpl.id).single();
-    expect(after!.exposures).toBe(before + 40);
-    expect(Number(after!.discrimination)).toBeGreaterThan(0.5);
+    psql(`insert into public.item_response_archive (source, item_id, family_or_topic, tier, correct, served, attempt_score, form, cohort_month) values ${rows.join(",")};`);
+    try {
+      const { data: n, error } = await admin.rpc("refresh_reasoning_item_stats");
+      expect(error).toBeNull();
+      expect(Number(n)).toBeGreaterThanOrEqual(1);
+      const { data: after } = await admin.from("reasoning_items").select("exposures, difficulty_p, discrimination").eq("id", tmpl.id).single();
+      expect(after!.exposures).toBe(before + 40);
+      if (before === 0) expect(Number(after!.difficulty_p)).toBe(0.5);
+      expect(Number(after!.discrimination)).toBeGreaterThan(0.5);
+    } finally {
+      const lit = (v: unknown) => (v === null || v === undefined ? "null" : String(v));
+      psql(`
+        delete from public.item_response_archive where item_id = '${tmpl.id}' and cohort_month = '1900-01-01';
+        update public.reasoning_items set exposures = ${before}, difficulty_p = ${lit(tmpl.difficulty_p)}, discrimination = ${lit(tmpl.discrimination)} where id = '${tmpl.id}';`);
+    }
   });
 });

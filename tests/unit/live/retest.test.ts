@@ -3,6 +3,7 @@ import {
   assembleLiveForm,
   deltaNeedsDiscussion,
   equatedNorm,
+  formCode,
   LIVE_BLUEPRINT,
   LIVE_DELTA_THRESHOLD,
   LIVE_ITEM_COUNT,
@@ -128,6 +129,15 @@ describe("live delta", () => {
   it("an online 90th-percentile candidate who scores 5/12 live is flagged; one who scores 9/12 is not", () => {
     expect(deltaNeedsDiscussion(liveDelta(90, livePercentile(5).percentile))).toBe(true);
     expect(deltaNeedsDiscussion(liveDelta(90, livePercentile(9).percentile))).toBe(false);
+  });
+});
+
+describe("formCode", () => {
+  it("is a stable 6-character code that does not reveal the seed", () => {
+    expect(formCode(12345)).toBe(formCode(12345));
+    expect(formCode(12345)).toMatch(/^[0-9A-Z]{6}$/);
+    expect(formCode(12345)).not.toContain("12345");
+    expect(formCode(12345)).not.toBe(formCode(12346));
   });
 });
 

@@ -1,11 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { GET as sweep } from "@/app/api/cron/sweep/route";
 import { hashUserId, listObjects, purgeDue, refreshRetentionQueue, retentionPepper } from "@/lib/server/retention";
 import { purgeAfter, utcDay } from "@/lib/stats/retention";
-import { anon, consent, fakeFinishedAttempt, fakeParsedCv, makeAdmin, newUser, psql, service } from "../helpers/local";
+import { anon, consent, fakeFinishedAttempt, fakeParsedCv, makeAdmin, newUser as newUserRaw, psql, service } from "../helpers/local";
 
 const admin = service();
+
+/** Every account this file creates, removed afterwards so repeated runs don't grow the shared DB. */
+const created: string[] = [];
+async function newUser(tag: string) {
+  const u = await newUserRaw(tag);
+  created.push(u.id);
+  return u;
+}
+afterAll(() => {
+  if (!created.length) return;
+  const ids = created.map((id) => `'${id}'`).join(",");
+  // Candidates first: an admin can't go while their decisions (on those candidates) exist.
+  psql(`delete from auth.users u where u.id in (${ids}) and not exists (select 1 from public.admins a where a.user_id = u.id);
+        delete from auth.users where id in (${ids});`);
+});
 const SWE = "software-engineer";
 
 /** Test setup only: writes rows directly with triggers off for this session. */
@@ -178,6 +193,8 @@ describe("retention queue rules (docs/12, notice: 6 months, 12 for the talent po
     if (poolErr) throw poolErr;
     rejectAt(pool.appId, boss.id, 2);
     backdate(pool.id, 3);
+    // backdate() gives both consents the same time; the opt-in came after the first one.
+    seed(`update public.consents set accepted_at = accepted_at + interval '1 minute' where user_id = '${pool.id}' and talent_pool_opt_in;`);
 
     // Opted in, then out: the latest consent decides.
     const optedOut = await applicant("ret-optout");

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { requireAdmin } from "@/lib/server/auth";
 import { fmtDate } from "@/lib/format";
 import { parseBaseline } from "@/lib/grading/baseline";
@@ -29,6 +30,15 @@ export default async function AdminRubrics() {
     .order("key")
     .order("version", { ascending: false });
   const rubrics = (data ?? []) as RubricRow[];
+  // Latest finished gold-set calibration run per rubric (docs/09 §8): go-live status per criterion.
+  const { data: runData } = await supabase
+    .from("calibration_runs")
+    .select("rubric_key, rubric_version, per_criterion, passed, finished_at")
+    .eq("status", "done")
+    .order("finished_at", { ascending: false })
+    .limit(200);
+  const latestRun = new Map<string, { rubric_version: number; per_criterion: Record<string, { status?: string }>; passed: boolean | null }>();
+  for (const r of runData ?? []) if (!latestRun.has(r.rubric_key)) latestRun.set(r.rubric_key, r);
 
   return (
     <div className="space-y-4">
@@ -46,6 +56,7 @@ export default async function AdminRubrics() {
               <th>Criteria</th>
               <th>Weights</th>
               <th>Generic baseline</th>
+              <th>Calibration</th>
               <th />
             </tr>
           </thead>
@@ -87,6 +98,21 @@ export default async function AdminRubrics() {
                     ) : (
                       <span className="muted">none</span>
                     )}
+                  </td>
+                  <td data-testid="rubric-calibration">
+                    {(() => {
+                      const run = latestRun.get(r.key);
+                      if (r.key === "interview") return <span className="muted">—</span>;
+                      if (!run) return <Link href={`/admin/calibration?rubric=${r.key}`} className="underline">not calibrated</Link>;
+                      const statuses = Object.values(run.per_criterion ?? {}).map((c) => c.status);
+                      const n = (s: string) => statuses.filter((x) => x === s).length;
+                      return (
+                        <Link href={`/admin/calibration?rubric=${r.key}`} className="underline">
+                          {run.passed ? <span className="badge">live</span> : <span className="badge-warn">{n("review")} review · {n("human_only")} human-only</span>}
+                          {run.rubric_version !== r.version && <span className="badge-bad ml-1">run was on v{run.rubric_version}</span>}
+                        </Link>
+                      );
+                    })()}
                   </td>
                   <td>{r.key !== "interview" && <GenerateBaselineButton rubricKey={r.key} version={r.version} hasBaseline={!!baseline} />}</td>
                 </tr>

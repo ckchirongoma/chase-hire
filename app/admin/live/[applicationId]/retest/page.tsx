@@ -4,7 +4,7 @@ import { z } from "zod";
 import { requireAdmin } from "@/lib/server/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { fmtDate } from "@/lib/format";
-import { deltaNeedsDiscussion, LIVE_DELTA_THRESHOLD, LIVE_ITEM_COUNT, LIVE_MINUTES, LIVE_NORM } from "@/lib/live/retest";
+import { deltaNeedsDiscussion, formCode, LIVE_DELTA_THRESHOLD, LIVE_ITEM_COUNT, LIVE_MINUTES, LIVE_NORM } from "@/lib/live/retest";
 import { chooseSeed, loadApplication, onlineReasoning, retestForm, visibleScorecards } from "@/lib/server/live";
 import { RetestKey, RetestSheet } from "@/components/admin/live-retest-form";
 import { recordRetest } from "../../actions";
@@ -61,7 +61,7 @@ export default async function RetestPage({
     visibleScorecards(supabase, app.id),
     supabase.from("profiles").select("full_name").eq("user_id", app.user_id).maybeSingle(),
   ]);
-  const reference = `${app.id.slice(0, 8)}-${seed}`;
+  const reference = `${app.id.slice(0, 8)}-${formCode(seed)}`;
   const mine = cards.find((c) => c.kind === "reasoning_retest" && c.rater === user.id && c.submitted_at);
   const retests = cards.filter((c) => c.kind === "reasoning_retest" && c.submitted_at);
   const another = Math.floor(Math.random() * 2_000_000_000) + 1;

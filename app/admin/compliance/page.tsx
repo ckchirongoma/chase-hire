@@ -16,6 +16,8 @@ import { AdverseImpactTable, CoverageTable, ReliabilityTable } from "@/component
 import { purgeNow } from "./actions";
 
 export const dynamic = "force-dynamic";
+// "Purge now" (a server action on this page) can take a while: storage and auth deletions.
+export const maxDuration = 300;
 
 /**
  * Compliance (docs/01 "Admin", docs/09 §9, docs/12): the retention queue and purge log, review

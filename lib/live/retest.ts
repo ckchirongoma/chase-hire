@@ -139,5 +139,18 @@ export function liveDelta(onlinePercentile: number | null | undefined, livePct: 
 /** Flag for discussion (never a rejection). */
 export const deltaNeedsDiscussion = (delta: number | null | undefined): boolean => typeof delta === "number" && delta > LIVE_DELTA_THRESHOLD;
 
+/**
+ * A short code that identifies the printed form on the candidate's sheet without revealing the
+ * seed (the seed regenerates the answers; only the admin's key page shows it).
+ */
+export function formCode(seed: number): string {
+  let h = 0x811c9dc5;
+  for (const ch of `live-form:${seed}`) {
+    h ^= ch.charCodeAt(0);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36).toUpperCase().padStart(7, "0").slice(-6);
+}
+
 /** "A".."E" for printed options. */
 export const optionLetter = (i: number) => String.fromCharCode(65 + i);

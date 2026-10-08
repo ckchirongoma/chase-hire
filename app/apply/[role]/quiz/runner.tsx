@@ -2,6 +2,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useIntegrity } from "@/lib/client/use-integrity";
+import { useTabRule } from "@/lib/client/use-tab-rule";
+import { LockedNotice, TabPauseOverlay } from "@/components/integrity/tab-rule";
 import { QuizScore } from "@/components/results/quiz-score";
 import { quizClock } from "@/lib/quiz/clock";
 import type { QuizState } from "@/lib/server/quiz";
@@ -64,6 +66,9 @@ export default function Runner({
     [role, apply],
   );
 
+  const refreshState = useCallback(() => void call("state"), [call]);
+  const tab = useTabRule({ kind: "quiz", id: state.status === "active" ? state.attemptId : null, active, onLocked: refreshState });
+
   // Display-only countdown; the server enforces the deadline. Once the server's grace
   // period has passed, controls are disabled and the runner asks for the final state
   // (re-asking every few seconds until the server reports it finished).
@@ -109,6 +114,7 @@ export default function Runner({
   useEffect(() => {
     if (state.status !== "active") return;
     const onKey = (e: KeyboardEvent) => {
+      if (tab.paused) return;
       if (e.ctrlKey || e.metaKey || e.altKey || timeUp) return;
       if (e.key >= "1" && e.key <= "5") {
         e.preventDefault();
@@ -120,7 +126,11 @@ export default function Runner({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state, choice, toggle, submit, timeUp]);
+  }, [state, choice, toggle, submit, timeUp, tab.paused]);
+
+  if (state.status === "locked" || tab.locked) {
+    return <LockedNotice />;
+  }
 
   if (state.status === "none") {
     return (
@@ -137,9 +147,10 @@ export default function Runner({
             </li>
             <li>The clock runs on our server. If your connection drops, come back to this page; the clock keeps running.</li>
             <li>Use keys 1–5 to choose (or tick, on select-all questions) and Enter to confirm.</li>
+            <li>Copy and paste are switched off.</li>
             <li>
-              Copy and paste are switched off. We note when you leave this tab, but that is never used on its own to judge
-              anyone.
+              Stay on this page until you finish. Leaving it once pauses the quiz; leaving it a second time locks it until our
+              team reopens it (not a rejection).
             </li>
             <li>You get one attempt. Find a quiet {minutes} minutes before you start.</li>
           </ul>
@@ -191,6 +202,7 @@ export default function Runner({
 
   return (
     <div className="card space-y-4 select-none" onContextMenu={(e) => e.preventDefault()}>
+      <TabPauseOverlay open={tab.paused} onContinue={tab.resume} />
       <div className="flex items-center justify-between text-sm">
         <span>
           Question {item.position} of {item.total}

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { AiHttpError, AiOutputError, chatJson, embed, extractJson } from "./openrouter";
+import { AiHttpError, AiOutputError, chatJson, embed, extractJson, transcribe } from "./openrouter";
 import { chatReply, mockFetch, stubAiEnv, TEST_ENV } from "./test-utils";
 
 const Schema = z.object({ name: z.string(), score: z.number() });
@@ -186,5 +186,27 @@ describe("embed", () => {
   it("rejects a vector of the wrong dimension", async () => {
     mockFetch({ json: { data: [{ embedding: [0.1, 0.2, 0.3] }] } });
     await expect(embed("text", { model: "m", dimensions: 1536 })).rejects.toBeInstanceOf(AiOutputError);
+  });
+});
+
+describe("transcribe", () => {
+  it("posts base64 audio with its format and the transcription prompt-version header", async () => {
+    const { requests } = mockFetch({ json: { text: "I built the pipeline in 2023.", model: "openai/whisper-1" } });
+    const audio = Buffer.from("fake-webm-bytes");
+
+    const res = await transcribe(audio, { model: "test/stt", format: "webm", language: "en" });
+
+    expect(res).toEqual({ text: "I built the pipeline in 2023.", model: "openai/whisper-1" });
+    expect(requests[0].url).toBe(`${TEST_ENV.OPENROUTER_BASE_URL}/audio/transcriptions`);
+    expect(requests[0].headers["x-prompt-version"]).toBe("transcription");
+    expect(requests[0].body).toMatchObject({ model: "test/stt", language: "en", input_audio: { data: audio.toString("base64"), format: "webm" } });
+  });
+
+  it("falls back to the requested model and rejects a response without text", async () => {
+    mockFetch({ json: { text: "" } });
+    expect(await transcribe(Buffer.from("x"), { model: "test/stt", format: "ogg" })).toEqual({ text: "", model: "test/stt" });
+
+    mockFetch({ json: { model: "x" } });
+    await expect(transcribe(Buffer.from("x"), { model: "test/stt", format: "ogg" })).rejects.toBeInstanceOf(AiOutputError);
   });
 });

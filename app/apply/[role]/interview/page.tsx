@@ -15,7 +15,7 @@ export default async function InterviewPage({ params }: { params: Promise<{ role
   if (!role) notFound();
   const { data: app } = await supabase
     .from("applications")
-    .select("id, stage, status")
+    .select("id, stage, status, interview_answer_mode")
     .eq("user_id", user.id)
     .eq("role_id", role.id)
     .maybeSingle();
@@ -65,20 +65,50 @@ export default async function InterviewPage({ params }: { params: Promise<{ role
     }
   }
 
+  const typed = app.interview_answer_mode === "typed";
   return (
     <div className="space-y-4">
       {header}
-      {!session && (
+      {!session && typed && (
         <div className="card space-y-2 text-sm">
           <p>
-            A short, structured text interview about the work on your CV. It checks that the claims on your CV are your own
-            work and how you approach problems in this role.
+            A typed conversation about the work on your CV (we agreed a typed interview with you). It checks that the claims
+            on your CV are your own work and how you approach problems in this role. The interviewer asks follow-up questions
+            based on what you write.
           </p>
           <ul className="list-disc space-y-1 pl-5">
-            <li>6 questions, about 20 minutes. Some answers get a short follow-up question.</li>
-            <li>There is a hard limit of 25 minutes. The clock runs on our server and keeps running if you leave.</li>
+            <li>It takes about 25 to 30 minutes. There is a hard limit of 35 minutes; the clock runs on our server.</li>
             <li>Paste is turned off, so type your answers. Notes on paper are fine.</li>
+            <li>
+              Stay on this tab. If you leave it, the interview pauses and you confirm to carry on. If you leave a second time,
+              it locks until a person on our team reopens it. A lock is never a rejection, and you keep your remaining time.
+            </li>
             <li>Be specific: say what you personally did, and name the tools, numbers and decisions.</li>
+            <li>The interviewer won&apos;t comment on your answers. People on our team review the results; nothing is decided automatically.</li>
+          </ul>
+        </div>
+      )}
+      {!session && !typed && (
+        <div className="card space-y-2 text-sm">
+          <p>
+            A spoken conversation about the work on your CV. It checks that the claims on your CV are your own work and how
+            you approach problems in this role. The interviewer asks follow-up questions based on what you say.
+          </p>
+          <ul className="list-disc space-y-1 pl-5">
+            <li>
+              You answer out loud: record each answer (up to 3 minutes), listen back if you like, then send it. You need a
+              working microphone and a quiet room.
+            </li>
+            <li>It takes about 25 to 30 minutes. There is a hard limit of 35 minutes; the clock runs on our server.</li>
+            <li>
+              Stay on this tab. If you leave it, the interview pauses and you confirm to carry on. If you leave a second time,
+              it locks until a person on our team reopens it. A lock is never a rejection, and you keep your remaining time.
+            </li>
+            <li>Be specific: say what you personally did, and name the tools, numbers and decisions.</li>
+            <li>
+              We transcribe your answers and judge what you say, never your accent or how you sound. If you can&apos;t use a
+              microphone, ask for a typed interview with &quot;Request a review&quot; on your results page before you start.
+            </li>
             <li>The interviewer won&apos;t comment on your answers. People on our team review the results; nothing is decided automatically.</li>
           </ul>
         </div>

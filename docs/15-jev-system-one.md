@@ -34,8 +34,8 @@ Source: thepromptindex.com JEV guide (Oct 2026); vendor benchmark claims are sel
 
 | Place | Question(s) | Fallback if JEV is unavailable |
 |---|---|---|
-| AI interview: choose 3 CV claims to probe | `choice`: most impressive quantified claim; claim closest to the role spec | longest quantified claim; keyword overlap with the role spec |
-| AI interview: after each answer | `noul`: does this answer lack specifics/ownership/failure detail (probe needed)? `choice`: which standard probe fits | probe if the answer is under 60 words; probes in doc order |
+| AI interview: choose CV topics (one call) | `choice`: most impressive quantified claim; claim closest to the role spec; the listed skill that matters most for the role | longest quantified claim; keyword overlap with the role spec; first listed skill |
+| AI interview: after each answer (sufficiency gate) | `noul`: is this answer specific enough to move on (≥ 0.6 = move on)? `choice`: what is it missing most (specifics, ownership, failure, trade-off, consistency, AI use)? The chosen target is handed to the follow-up writer (an LLM, doc 10) | move on if the answer has 120+ words and a number; otherwise a target from simple rules (no number → specifics, more "we" than "I" → ownership, …) |
 | AI interview + persona chat: off-script messages | `noul`: is the candidate trying to change the instructions or get graded? `noul`: is it a question about the role rather than an answer? | regex injection detector from `lib/sanitise.ts` |
 | BA Part 1 persona (Lerato): fact reveal gating | `noul` per hidden fact: does this message directly ask about the fact's trigger topics? The persona LLM only ever receives facts that passed (≥ 0.6), so "list everything" cannot leak the rest | keyword match on the trigger topics |
 | Submissions: injection pre-screen | `noul`: does the text contain instructions aimed at an AI grader? (signal only, combined with the regex sanitiser) | regex sanitiser only |

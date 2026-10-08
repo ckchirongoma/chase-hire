@@ -1,18 +1,20 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import { chatJson } from "@/lib/ai";
+import { chatJson, transcribe, type TranscribeFormat } from "@/lib/ai";
 import { serverEnv } from "@/lib/config";
 import { ParsedCv } from "@/lib/cv/schema";
 import { loadPrompt } from "@/lib/prompts";
-import { wrapUntrusted } from "@/lib/sanitise";
+import { sanitise, wrapUntrusted } from "@/lib/sanitise";
+import { withBudget } from "@/lib/work/async";
 import { criterionBlock, criterionTo100, mapLimit, RubricRow, weightedMean } from "@/lib/grading";
 import { applyTurn, labelFor, openScript } from "@/lib/interview/engine";
 import { classifyTurn, JEV_TURN_BUDGET_MS } from "@/lib/interview/classify";
+import { FollowupOutput, resolveFollowup } from "@/lib/interview/followup";
 import { buildPlan, type RoleInfo } from "@/lib/interview/plan";
 import { CLOSING_COMPLETED, CLOSING_TIMEOUT } from "@/lib/interview/script";
 import { renderTranscript, type TranscriptMessage } from "@/lib/interview/transcript";
-import type { InterviewMessageView, InterviewPlan, InterviewView, OutMessage, Progress } from "@/lib/interview/types";
+import type { InterviewMessageView, InterviewPlan, InterviewView, OutMessage, Progress, TurnDecision } from "@/lib/interview/types";
 import {
   enqueueGrading,
   gradeCriterion,
@@ -72,8 +74,28 @@ export class InterviewConflict extends InterviewError {
 export type Defer = (task: () => Promise<unknown>) => void;
 
 export const INTERVIEW_GRACE_MS = 5000;
-export const INTERVIEW_RUBRIC = { key: "interview", version: 1 } as const;
-const GRADER_PROMPT = { key: "interview-grader", version: 1 } as const;
+export const INTERVIEW_RUBRIC = { key: "interview", version: 2 } as const;
+const GRADER_PROMPT = { key: "interview-grader", version: 2 } as const;
+const FOLLOWUP_PROMPT = { key: "interviewer-followup", version: 1 } as const;
+/** Longest the candidate waits for an LLM-written follow-up before the template is used. */
+export const FOLLOWUP_BUDGET_MS = 8000;
+/** Longest a spoken answer may take to transcribe before it is stored as untranscribed. */
+export const TRANSCRIBE_BUDGET_MS = 45_000;
+/** About 3 minutes of browser-recorded speech is well under 1 MB; this is a generous cap. */
+export const MAX_AUDIO_BYTES = 4 * 1024 * 1024;
+export const TRANSCRIBING_PLACEHOLDER = "(transcribing your answer…)";
+export const NO_SPEECH_PLACEHOLDER = "(no speech was detected in this answer)";
+export const TRANSCRIPTION_FAILED_PLACEHOLDER = "(this answer could not be transcribed; our team will listen to the recording)";
+/** Browser recording MIME types → transcription format + file extension. */
+export const AUDIO_TYPES: Record<string, TranscribeFormat> = {
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/aac": "aac",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+};
 const CONCERNS_PROMPT = { key: "interview-concerns", version: 1 } as const;
 const CRITERIA_CONCURRENCY = 3;
 /** A stored answer whose turn was never moved on (a crashed request) is finished after this. */
@@ -93,10 +115,17 @@ type SessionRow = {
   deadline_at: string;
   ended_at: string | null;
   end_reason: "completed" | "timeout" | null;
+  locked_at: string | null;
+  tab_leaves: number;
+  answer_mode: "voice" | "typed";
 };
-const SESSION_COLS = "id, application_id, user_id, plan, progress, started_at, deadline_at, ended_at, end_reason";
+const SESSION_COLS =
+  "id, application_id, user_id, plan, progress, started_at, deadline_at, ended_at, end_reason, locked_at, tab_leaves, answer_mode";
 
-type ApplicationRow = { id: string; user_id: string; role_id: string; stage: string; status: string };
+type ApplicationRow = { id: string; user_id: string; role_id: string; stage: string; status: string; interview_answer_mode: "voice" | "typed" };
+
+export const LOCKED_NOTICE =
+  "This interview is locked because you left the page twice. A person on our team will review it and can reopen it, and you'll get back the time you had left. This is not a rejection.";
 
 /** Why answers are not accepted for this application right now (null = they are). */
 function statusNotice(app: Pick<ApplicationRow, "stage" | "status">): string | null {
@@ -115,7 +144,7 @@ function statusNotice(app: Pick<ApplicationRow, "stage" | "status">): string | n
 async function ownApplication(admin: SupabaseClient, userId: string, applicationId: string): Promise<ApplicationRow> {
   const { data, error } = await admin
     .from("applications")
-    .select("id, user_id, role_id, stage, status")
+    .select("id, user_id, role_id, stage, status, interview_answer_mode")
     .eq("id", applicationId)
     .maybeSingle<ApplicationRow>();
   if (error) throw new InterviewError(error.message, 500);
@@ -133,8 +162,13 @@ async function sessionFor(admin: SupabaseClient, applicationId: string): Promise
   return data;
 }
 
-function isExpired(s: Pick<SessionRow, "deadline_at">, now = Date.now()) {
-  return now > new Date(s.deadline_at).getTime() + INTERVIEW_GRACE_MS;
+/** A locked session never expires on its own: an admin reopens it with its remaining time. */
+function isExpired(s: Pick<SessionRow, "deadline_at" | "locked_at">, now = Date.now()) {
+  return !s.locked_at && now > new Date(s.deadline_at).getTime() + INTERVIEW_GRACE_MS;
+}
+
+function remainingMs(s: Pick<SessionRow, "deadline_at">, now = Date.now()): number {
+  return new Date(s.deadline_at).getTime() - now;
 }
 
 function messageRows(sessionId: string, messages: readonly OutMessage[]) {
@@ -159,6 +193,20 @@ async function loadMessages(admin: SupabaseClient, sessionId: string): Promise<M
   if (error) throw new InterviewError(error.message, 500);
   // meta.idx is the script's own order (several rows can share a created_at).
   return [...((data ?? []) as MessageRow[])].sort((a, b) => {
+    const ai = typeof a.meta?.idx === "number" ? a.meta.idx : Infinity;
+    const bi = typeof b.meta?.idx === "number" ? b.meta.idx : Infinity;
+    return ai !== bi ? ai - bi : a.created_at.localeCompare(b.created_at);
+  });
+}
+
+async function loadMessagesWithClaims(admin: SupabaseClient, sessionId: string): Promise<(MessageRow & { claim_id: string | null })[]> {
+  const { data, error } = await admin
+    .from("interview_messages")
+    .select("id, role, content, step, claim_id, meta, created_at")
+    .eq("session_id", sessionId)
+    .order("created_at", { ascending: true });
+  if (error) throw new InterviewError(error.message, 500);
+  return [...((data ?? []) as (MessageRow & { claim_id: string | null })[])].sort((a, b) => {
     const ai = typeof a.meta?.idx === "number" ? a.meta.idx : Infinity;
     const bi = typeof b.meta?.idx === "number" ? b.meta.idx : Infinity;
     return ai !== bi ? ai - bi : a.created_at.localeCompare(b.created_at);
@@ -198,12 +246,13 @@ export async function startInterview(admin: SupabaseClient, userId: string, appl
   if (roleErr || !role) throw new InterviewError("Role not found", 404);
 
   const plan = await buildPlan({ cv: parsed.success ? parsed.data : null, cvId: cv.id as string, role });
-  const { progress, messages } = openScript(plan);
+  const mode = app.interview_answer_mode === "typed" ? "typed" : "voice";
+  const { progress, messages } = openScript(plan, mode);
 
   const { data: session, error } = await admin
     .from("interview_sessions")
     // started_at/deadline_at are set by the DB trigger from the DB clock.
-    .insert({ application_id: app.id, user_id: userId, plan, progress, deadline_at: new Date().toISOString() })
+    .insert({ application_id: app.id, user_id: userId, plan, progress, answer_mode: mode, deadline_at: new Date().toISOString() })
     .select("id")
     .single();
   if (error || !session) {
@@ -255,7 +304,10 @@ function toView(app: ApplicationRow, s: SessionRow, rows: readonly MessageRow[])
     totalQuestions: total,
     turn: s.progress.turn,
     pending: !done && !!pendingAnswer(rows, s.progress),
-    notice: done ? null : statusNotice(app),
+    notice: done ? null : s.locked_at ? LOCKED_NOTICE : statusNotice(app),
+    answerMode: s.answer_mode,
+    locked: !done && !!s.locked_at,
+    tabLeaves: s.tab_leaves,
   };
 }
 
@@ -318,14 +370,10 @@ export async function postInterviewMessage(
     if (state.status !== "none" && state.endReason === "timeout") return withAnswer(state, "late");
     throw new InterviewConflict("The interview has already finished, so this answer wasn't needed.", state);
   }
-  const notice = statusNotice(app);
-  if (notice) throw new InterviewConflict(notice, await current());
-  if (input.turn !== s.progress.turn) {
-    throw new InterviewConflict(
-      "That question was already answered (perhaps in another tab, or the answer was sent twice). The conversation has been refreshed: check it before you answer again.",
-      await current(),
-    );
+  if (s.answer_mode !== "typed") {
+    throw new InterviewConflict("Answers to this interview are spoken. Use the Record button to answer.", await current());
   }
+  await assertCanAnswer(app, s, input.turn, current);
 
   // 1. Store the answer before anything slow, so the DB timestamps it against the deadline.
   const { data: row, error: insErr } = await admin
@@ -345,6 +393,7 @@ export async function postInterviewMessage(
       await endInterview(admin, s.id, "timeout", defer);
       return withAnswer(await current(), "late");
     }
+    if (insErr?.message.includes("session_locked")) throw new InterviewConflict(LOCKED_NOTICE, await current());
     if (insErr?.code === "23505") {
       throw new InterviewConflict(
         "Your answer to this question was already received. The conversation has been refreshed.",
@@ -359,19 +408,215 @@ export async function postInterviewMessage(
   return withAnswer(await current(), "saved");
 }
 
+/** Refuses an answer when the session is locked, paused for review, or the turn is stale. */
+async function assertCanAnswer(
+  app: ApplicationRow,
+  s: SessionRow,
+  turn: number,
+  current: () => Promise<InterviewView>,
+): Promise<void> {
+  if (s.locked_at) throw new InterviewConflict(LOCKED_NOTICE, await current());
+  const notice = statusNotice(app);
+  if (notice) throw new InterviewConflict(notice, await current());
+  if (turn !== s.progress.turn) {
+    throw new InterviewConflict(
+      "That question was already answered (perhaps in another tab, or the answer was sent twice). The conversation has been refreshed: check it before you answer again.",
+      await current(),
+    );
+  }
+}
+
+/**
+ * A spoken answer. The recording is stored and the answer row inserted FIRST (so the DB
+ * timestamps it against the deadline), then it is transcribed, then the conversation moves on.
+ * Typed answers are refused here unless the session is in voice mode, and vice versa.
+ */
+export async function postInterviewAudio(
+  admin: SupabaseClient,
+  userId: string,
+  applicationId: string,
+  input: { turn: number; audio: Buffer; mime: string; durationMs: number | null },
+  defer?: Defer,
+): Promise<InterviewView> {
+  const mime = input.mime.split(";")[0].trim().toLowerCase();
+  const format = AUDIO_TYPES[mime];
+  if (!format) throw new InterviewError("Unsupported audio format", 400);
+  if (input.audio.length === 0 || input.audio.length > MAX_AUDIO_BYTES) throw new InterviewError("The recording is empty or too long", 400);
+  if (!Number.isInteger(input.turn) || input.turn < 0) throw new InterviewError("Invalid request", 400);
+
+  const app = await ownApplication(admin, userId, applicationId);
+  const s = await sessionFor(admin, app.id);
+  if (!s) throw new InterviewError("Start the interview first", 409);
+  const current = () => getInterviewState(admin, userId, applicationId, defer);
+  if (s.ended_at || s.progress.done || isExpired(s)) {
+    const state = await current();
+    if (state.status !== "none" && state.endReason === "timeout") return withAnswer(state, "late");
+    throw new InterviewConflict("The interview has already finished, so this answer wasn't needed.", state);
+  }
+  if (s.answer_mode !== "voice") throw new InterviewConflict("This interview takes typed answers.", await current());
+  await assertCanAnswer(app, s, input.turn, current);
+
+  // 1. Keep the recording (with the rest of the candidate's data until the retention purge).
+  const ext = format === "m4a" ? "m4a" : format;
+  const audioPath = `${userId}/${s.id}/turn-${input.turn}-${Date.now()}.${ext}`;
+  const { error: upErr } = await admin.storage.from("interview-audio").upload(audioPath, input.audio, { contentType: mime, upsert: false });
+  if (upErr) throw new InterviewError(`Could not save the recording: ${upErr.message}`, 500);
+
+  // 2. Store the answer row now; the transcript replaces the placeholder below.
+  const { data: row, error: insErr } = await admin
+    .from("interview_messages")
+    .insert({
+      session_id: s.id,
+      role: "candidate",
+      content: TRANSCRIBING_PLACEHOLDER,
+      step: s.progress.current.step,
+      claim_id: s.progress.current.claimId,
+      meta: {
+        idx: s.progress.msgCount,
+        turn: s.progress.turn,
+        question_no: s.progress.current.questionNo,
+        audio_path: audioPath,
+        audio_mime: mime,
+        audio_bytes: input.audio.length,
+        duration_ms: input.durationMs,
+        transcribed: false,
+      },
+    })
+    .select("id, role, content, step, meta, created_at")
+    .single<MessageRow>();
+  if (insErr || !row) {
+    await admin.storage.from("interview-audio").remove([audioPath]);
+    if (insErr?.message.includes("interview_deadline_passed")) {
+      await endInterview(admin, s.id, "timeout", defer);
+      return withAnswer(await current(), "late");
+    }
+    if (insErr?.message.includes("session_locked")) throw new InterviewConflict(LOCKED_NOTICE, await current());
+    if (insErr?.code === "23505") {
+      throw new InterviewConflict("Your answer to this question was already received. The conversation has been refreshed.", await current());
+    }
+    throw new InterviewError(insErr?.message ?? "Could not save your answer", 500);
+  }
+
+  // 3. Transcribe, then move on.
+  const transcribed = await ensureTranscribed(admin, row, input.audio);
+  await processAnswer(admin, userId, s, transcribed, defer);
+  return withAnswer(await current(), "saved");
+}
+
+/** Replaces the placeholder content of a spoken answer with its transcript (once). */
+async function ensureTranscribed(admin: SupabaseClient, row: MessageRow, audio?: Buffer): Promise<MessageRow> {
+  const meta = row.meta ?? {};
+  if (!meta.audio_path || meta.transcribed === true) return row;
+  let buf = audio;
+  if (!buf) {
+    const { data } = await admin.storage.from("interview-audio").download(String(meta.audio_path));
+    buf = data ? Buffer.from(await data.arrayBuffer()) : undefined;
+  }
+  const format = AUDIO_TYPES[String(meta.audio_mime ?? "")] ?? "webm";
+  const env = serverEnv();
+  const started = Date.now();
+  let content = TRANSCRIPTION_FAILED_PLACEHOLDER;
+  let error: string | null = null;
+  let model: string | null = null;
+  if (buf) {
+    const { value, timedOut } = await withBudget(
+      transcribe(buf, { model: env.OPENROUTER_MODEL_TRANSCRIBE, format, language: "en" }).catch((e) => {
+        error = e instanceof Error ? e.message.slice(0, 300) : String(e);
+        return null;
+      }),
+      TRANSCRIBE_BUDGET_MS,
+    );
+    if (timedOut) error = "transcription timed out";
+    if (value) {
+      model = value.model;
+      const clean = sanitise(value.text).text.slice(0, 5900);
+      content = clean.trim() ? clean : NO_SPEECH_PLACEHOLDER;
+    }
+  } else {
+    error = "recording not found";
+  }
+  const newMeta = {
+    ...meta,
+    transcribed: true,
+    transcription: { model, ms: Date.now() - started, chars: content.length, error },
+  };
+  await admin.from("interview_messages").update({ content, meta: newMeta }).eq("id", row.id);
+  return { ...row, content, meta: newMeta };
+}
+
+/**
+ * Writes the follow-up question with an LLM from what the candidate said on this topic, with a
+ * time budget. Returns null (so the template is used) on any failure.
+ */
+async function generateFollowup(
+  admin: SupabaseClient,
+  s: SessionRow,
+  rows: readonly MessageRow[],
+  target: string,
+): Promise<{ output: FollowupOutput | null; model: string | null; promptVersion: string; error: string | null }> {
+  const prompt = loadPrompt(FOLLOWUP_PROMPT.key, FOLLOWUP_PROMPT.version);
+  const topic = s.plan.claims.find((c) => c.id === s.progress.current.claimId) ?? null;
+  const topicRows = rows.filter((m) => m.role === "candidate" || m.step === "claim" || m.step === "probe").filter((m) => {
+    const claimId = (m as MessageRow & { claim_id?: string | null }).claim_id;
+    return claimId === undefined || claimId === s.progress.current.claimId;
+  });
+  const conversation = topicRows.map((m) => `${m.role === "interviewer" ? "Interviewer" : "Candidate"}: ${m.content}`).join("\n\n");
+  const { data: cvRow } = s.plan.cvId ? await admin.from("cvs").select("parsed").eq("id", s.plan.cvId).maybeSingle() : { data: null };
+  const env = serverEnv();
+  const model = env.OPENROUTER_MODEL_INTERVIEWER ?? env.OPENROUTER_MODEL_PERSONA;
+  let error: string | null = null;
+  const { value, timedOut } = await withBudget(
+    chatJson({
+      model,
+      system: prompt.system,
+      user: [
+        `ROLE: ${s.plan.role.title}`,
+        `TOPIC: ${topic ? `${topic.kind}: ${topic.text}` : s.progress.current.text}`,
+        `TARGET: ${target}`,
+        `CV:\n${wrapUntrusted("cv", JSON.stringify(cvRow?.parsed ?? {}))}`,
+        `CONVERSATION:\n${wrapUntrusted("conversation", conversation.slice(-12_000))}`,
+      ].join("\n\n"),
+      schema: FollowupOutput,
+      promptVersion: prompt.promptVersion,
+      temperature: 0.4,
+    }).catch((e) => {
+      error = e instanceof Error ? e.message.slice(0, 300) : String(e);
+      return null;
+    }),
+    FOLLOWUP_BUDGET_MS,
+  );
+  if (timedOut) error = "follow-up timed out";
+  return { output: value?.data ?? null, model: value?.model ?? null, promptVersion: prompt.promptVersion, error };
+}
+
 /**
  * Classifies a stored answer and moves the script on: the cursor (compare-and-set on
  * progress.turn), the answer's classification meta and the interviewer's reply are written in
  * one transaction. Losing the compare-and-set means another request already did this turn.
  */
-async function processAnswer(admin: SupabaseClient, userId: string, s: SessionRow, answer: MessageRow, defer?: Defer): Promise<void> {
-  const { decision, meta } = await classifyTurn({
+async function processAnswer(admin: SupabaseClient, userId: string, s: SessionRow, rawAnswer: MessageRow, defer?: Defer): Promise<void> {
+  const answer = await ensureTranscribed(admin, rawAnswer);
+  const classification = await classifyTurn({
     plan: s.plan,
     progress: s.progress,
     message: answer.content,
+    remainingMs: remainingMs(s),
     jevBudgetMs: JEV_TURN_BUDGET_MS,
   });
-  const turn = applyTurn(s.plan, s.progress, decision);
+  const meta: Record<string, unknown> & typeof classification.meta = { ...classification.meta };
+
+  let decision: TurnDecision;
+  if (classification.kind !== "answer") decision = { kind: classification.kind };
+  else if (classification.followupTarget) {
+    const rows = await loadMessagesWithClaims(admin, s.id);
+    const previous = rows.filter((m) => m.role === "interviewer" && m.claim_id === s.progress.current.claimId).map((m) => m.content);
+    const gen = await generateFollowup(admin, s, rows, classification.followupTarget);
+    const followup = resolveFollowup(gen.output, classification.followupTarget, previous);
+    decision = { kind: "answer", followup: { text: followup.text, target: followup.target, via: followup.via } };
+    meta.followup = { via: followup.via, rejected: followup.rejected, model: gen.model, prompt_version: gen.promptVersion, error: gen.error };
+  } else decision = { kind: "answer", followup: null };
+
+  const turn = applyTurn(s.plan, s.progress, decision, { remainingMs: remainingMs(s) });
 
   if (!turn.done && isExpired(s)) {
     // Time ran out while deciding. The answer is already saved; record the decision and end.
@@ -483,6 +728,7 @@ export async function endExpiredInterviews(admin: SupabaseClient, defer?: Defer)
     .from("interview_sessions")
     .select("id, progress")
     .is("ended_at", null)
+    .is("locked_at", null)
     .lt("deadline_at", cutoff)
     .limit(200);
   if (error) throw new InterviewError(error.message, 500);

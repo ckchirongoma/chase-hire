@@ -7,6 +7,7 @@ import InterviewPanel from "@/components/admin/interview-panel";
 import { QuizPanel } from "@/components/admin/quiz-panel";
 import WorkPanel from "@/components/admin/work-panel";
 import WorkGrades from "@/components/admin/work-grades";
+import SessionControls from "@/components/admin/session-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -64,7 +65,7 @@ export default async function CandidateDetail({
     supabase.from("profiles").select("*").eq("user_id", id).maybeSingle(),
     supabase.from("consents").select("*").eq("user_id", id).order("accepted_at", { ascending: false }),
     supabase.from("cvs").select("id, storage_path, file_name, status, error, parsed, parse_model, prompt_version, injection_flags, created_at").eq("user_id", id).order("created_at", { ascending: false }),
-    supabase.from("reasoning_attempts").select("id, form, started_at, deadline_at, submitted_at, raw_score, percentile, stars, norm_version").eq("user_id", id).order("started_at", { ascending: false }),
+    supabase.from("reasoning_attempts").select("id, form, started_at, deadline_at, submitted_at, raw_score, percentile, stars, norm_version, locked_at, tab_leaves").eq("user_id", id).order("started_at", { ascending: false }),
     supabase.from("dedupe_flags").select("*").or(`user_id.eq.${id},matched_user_id.eq.${id}`).order("created_at", { ascending: false }),
     supabase.from("signals").select("context, kind, payload, created_at").eq("user_id", id).order("created_at", { ascending: false }).limit(200),
     supabase.from("applications").select("id, stage, status, below_hurdle, reasoning_stars, created_at, roles(title), decisions(decision, reason, decided_at, stage)").eq("user_id", id),
@@ -129,6 +130,8 @@ export default async function CandidateDetail({
         {!applications.data?.length && <p className="muted">No applications yet.</p>}
       </section>
 
+      <SessionControls userId={id} />
+
       {applications.data?.map((a) => (
         <section key={`detail-${a.id}`} className="space-y-4">
           <h2 className="h2">{(a.roles as unknown as { title: string } | null)?.title}: assessment detail</h2>
@@ -167,7 +170,8 @@ export default async function CandidateDetail({
         {attempts.data?.map((a) => (
           <p key={a.id} className="text-sm">
             {fmtDate(a.started_at)} · {a.form} ·{" "}
-            {a.submitted_at ? <>{a.raw_score}/30 · P{Math.round(Number(a.percentile))} · {a.stars}★ ({a.norm_version})</> : "in progress"}
+            {a.submitted_at ? <>{a.raw_score}/30 · P{Math.round(Number(a.percentile))} · {a.stars}★ ({a.norm_version})</> : a.locked_at ? <span className="badge-warn">locked</span> : "in progress"}
+            {a.tab_leaves > 0 && <span className="muted"> · tab leaves {a.tab_leaves}</span>}
           </p>
         ))}
         {!!responses?.length && (

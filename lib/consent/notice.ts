@@ -3,7 +3,7 @@
  * employment/privacy lawyer before launch (docs/12-compliance.md). Changing the text
  * means bumping NOTICE_VERSION so we know which version each candidate accepted.
  */
-export const NOTICE_VERSION = "2026-10-07.v1-draft";
+export const NOTICE_VERSION = "2026-10-08.v2-draft";
 
 export const NOTICE_SECTIONS: { title: string; body: string[] }[] = [
   {
@@ -16,6 +16,7 @@ export const NOTICE_SECTIONS: { title: string; body: string[] }[] = [
     title: "What we collect",
     body: [
       "Your identity and contact details, your CV, your answers to our assessments, transcripts of AI-run chats, and interaction signals such as when you leave a timed assessment's browser tab or try to paste text.",
+      "Voice recordings of your spoken answers in the AI screening interview. We turn them into text automatically and judge only what you say, never your accent or how you sound. People on our team can listen to them while reviewing your application, and they are deleted with the rest of your information.",
       "We do not ask for your race, religion, health, age or marital status, and our CV parser is told not to extract them.",
     ],
   },
@@ -29,6 +30,7 @@ export const NOTICE_SECTIONS: { title: string; body: string[] }[] = [
     title: "How we use AI, and who decides",
     body: [
       "We use AI models to read your CV, run a structured screening interview and give advisory scores on your work. A person at Chase Agents makes every decision to advance or reject a candidate. No decision is made by automated processing alone.",
+      "In the timed assessments, leaving the browser tab pauses the assessment and you confirm to carry on; leaving a second time locks it until a person on our team reopens it with the time you had left. A lock is never a rejection.",
       "How we score you: a 15-minute reasoning assessment (10% of the pre-interview score, used as a minimum hurdle, never as an automatic rejection), an AI screening interview (15%), a role quiz (15%) and two work assessments (60% together). The live stage with our team decides the outcome.",
     ],
   },

@@ -54,7 +54,7 @@ export function jev(body) {
   const qs = body?.questions ?? {};
   const answers = {};
 
-  if (typeof state.task === "string" && state.task.startsWith("Choose which CV claims")) {
+  if (typeof state.task === "string" && state.task.startsWith("Choose which parts of a CV")) {
     for (const [id, q] of Object.entries(qs)) {
       const keys = Object.keys(q.criteria ?? {});
       let choice = keys[0];
@@ -69,14 +69,15 @@ export function jev(body) {
     return { model: "jev-stub", answers, usage: { input_tokens: 1, output_tokens: 1 } };
   }
 
-  if (typeof state.context === "string" && state.context.startsWith("Structured job-screening interview")) {
-    const msg = String(state.candidate_message ?? "");
+  if (typeof state.context === "string" && state.context.startsWith("Structured job-screening conversation")) {
+    const msg = String(state.candidate_answer ?? "");
     for (const [id, q] of Object.entries(qs)) {
       if (id === "off_script") answers[id] = { type: "noul", noul: /ignore (all|previous|your)|grade me|scor(e|ed|ing)|your instructions|full marks/i.test(msg) ? 0.95 : 0.05 };
       else if (id === "role_question")
         answers[id] = { type: "noul", noul: /\?\s*$/.test(msg) && /\b(role|company|team|salary|pay|clients?|office|benefits|leave)\b/i.test(msg) ? 0.9 : 0.05 };
-      else if (id === "probe_needed") answers[id] = { type: "noul", noul: words(msg) < 60 ? 0.8 : 0.1 };
-      else if (id === "which_probe") {
+      // Thin (under 25 words) or marked "[needs-followup]" → not sufficient, so a follow-up is asked.
+      else if (id === "sufficient") answers[id] = { type: "noul", noul: words(msg) < 25 || msg.includes("[needs-followup]") ? 0.1 : 0.9 };
+      else if (id === "missing") {
         const keys = Object.keys(q.criteria ?? {});
         const choice = keys[keys.length - 1]; // the last option, so tests can tell JEV from the doc-order fallback
         answers[id] = { type: "choice", choice, confidence: 0.7, probabilities: Object.fromEntries(keys.map((k) => [k, k === choice ? 0.7 : 0.3 / Math.max(1, keys.length - 1)])) };

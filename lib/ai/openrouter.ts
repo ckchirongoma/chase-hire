@@ -247,3 +247,23 @@ export async function embed(
   }
   return embedding as number[];
 }
+
+/** Audio formats the transcription endpoint accepts (browser recordings are webm/ogg/m4a). */
+export const TRANSCRIBE_FORMATS = ["webm", "ogg", "m4a", "mp3", "wav", "flac", "aac"] as const;
+export type TranscribeFormat = (typeof TRANSCRIBE_FORMATS)[number];
+
+/**
+ * Speech-to-text via OpenRouter's /audio/transcriptions (raw base64 audio, no data URI).
+ * Returns the transcript text (possibly empty when there was no speech).
+ */
+export async function transcribe(audio: Buffer, opts: { model: string; format: TranscribeFormat; language?: string }): Promise<{ text: string; model: string }> {
+  const json = (await postJson("/audio/transcriptions", {
+    model: opts.model,
+    input_audio: { data: audio.toString("base64"), format: opts.format },
+    ...(opts.language ? { language: opts.language } : {}),
+  }, { "X-Prompt-Version": "transcription" })) as { text?: unknown; model?: unknown };
+  if (typeof json?.text !== "string") {
+    throw new AiOutputError("Transcription response has no text", JSON.stringify(json).slice(0, MAX_ERROR_CHARS));
+  }
+  return { text: json.text, model: typeof json.model === "string" ? json.model : opts.model };
+}

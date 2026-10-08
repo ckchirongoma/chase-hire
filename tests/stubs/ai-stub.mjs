@@ -13,6 +13,10 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PORT = Number(process.env.STUB_PORT ?? 4010);
+export const STUB_TRANSCRIPT =
+  "I personally built the nightly reporting job in Python and SQL on Postgres. I chose incremental loads over full reloads, " +
+  "and measured run time before and after: it went from 40 minutes to 6. The hardest part was duplicate customers, which I fixed " +
+  "with a unique key and a quarantine table. Next time I would add alerting earlier.";
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 const handlers = {};
@@ -71,6 +75,14 @@ const server = http.createServer((req, res) => {
         const system = body.messages.find((m) => m.role === "system")?.content ?? "";
         const out = handler(body, { text, system, version });
         return res.end(JSON.stringify({ model: body.model, choices: [{ message: { role: "assistant", content: JSON.stringify(out) } }] }));
+      }
+      if (req.url.endsWith("/audio/transcriptions")) {
+        // Tests can send fake "audio" whose bytes are UTF-8 "TEXT:<transcript>"; anything else
+        // (e.g. a real browser recording from a fake microphone) gets a fixed, specific answer.
+        const bytes = Buffer.from(String(body?.input_audio?.data ?? ""), "base64");
+        const asText = bytes.toString("utf8");
+        const text = asText.startsWith("TEXT:") ? asText.slice(5) : STUB_TRANSCRIPT;
+        return res.end(JSON.stringify({ text, model: body.model }));
       }
       if (req.url.endsWith("/embeddings")) {
         return res.end(JSON.stringify({ model: body.model, data: [{ embedding: embedding(String(body.input), body.dimensions ?? 1536) }] }));

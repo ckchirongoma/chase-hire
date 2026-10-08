@@ -13,7 +13,8 @@ Based on research done on 7 Oct 2026. This is not legal advice; have an employme
 **Lawful basis and notice (s18)**
 - The basis is steps towards a contract at the candidate's request, with consent as a backup.
 - The consent screen at `/consent` (versioned, stored in `consents`) must state:
-  - what we collect: identity, contact details, CV, assessment responses, chat transcripts, interaction signals
+  - what we collect: identity, contact details, CV, assessment responses, chat transcripts, interaction signals, and **voice recordings** of spoken interview answers (transcribed automatically; only the content is judged, never accent or voice; people can listen to them during review)
+  - the tab rule in timed stages: a first leave pauses, a second locks until a person reopens it; a lock is never a rejection
   - why we collect it: assessing suitability for the role applied for
   - **that AI is used** to parse CVs, run the screening interview and grade work, **and that humans make every decision**
   - **offshore processing (s72):** LLM providers via OpenRouter, and where they are located. Get consent and use providers with adequate safeguards; prefer zero-retention routing.
@@ -28,11 +29,12 @@ Based on research done on 7 Oct 2026. This is not legal advice; have an employme
   - batch-advance requires explicit admin confirmation
   - there are **no automated rejections**
 - Candidates receive the scored factors (results page) and can make representations (`review_requests`).
+- **Accommodation (EEA s6, reasonable accommodation):** a candidate who can't use a microphone asks through "Request a review"; an admin switches that application's interview to typed answers before it starts (`admin_set_interview_mode`, reason stored). A locked timed stage is reopened by an admin with the remaining time (`admin_reopen_session`, reason stored).
 - The notice explains "the underlying logic" in plain language: which stages are scored, how, and how much each one weighs.
 
 **Retention automation**
 - A nightly job moves closed applications into `retention_queue`.
-- Purged data covers CVs, transcripts, submissions and snapshots.
+- Purged data covers CVs, transcripts, interview voice recordings (`interview-audio` bucket), submissions and snapshots.
 - **Keep:** anonymised item-level statistics, plus aggregated validation and adverse-impact data. Advisers suggest keeping selection decision records for about 3 years in case of disputes; keep a minimal decision log keyed by a hashed ID.
 
 **Operators**

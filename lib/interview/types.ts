@@ -3,7 +3,10 @@
  * No runtime imports here, so client components can import it safely.
  */
 
-export type ProbeKey = "hardest_decision" | "what_broke" | "differently" | "ai_tools";
+/** What a follow-up question tries to draw out of an answer. */
+export type FollowupTarget = "specifics" | "ownership" | "failure" | "tradeoff" | "consistency" | "ai_use";
+/** Kept for older call sites: a follow-up is identified by its target. */
+export type ProbeKey = FollowupTarget;
 
 /** Main (counted) question steps. */
 export type QuestionStep = "warmup" | "claim" | "situational" | "logistics";
@@ -16,13 +19,15 @@ export type ClaimReason =
   | "closest_to_role"
   | "filler"
   | "role_title"
-  | "generic";
+  | "generic"
+  | "skill_unevidenced"
+  | "cv_consistency";
 
 export interface PlanClaim {
   /** CV claim id (c1…), or r1… for a role-title stand-in, or g1… for a generic stand-in. */
   id: string;
   text: string;
-  kind: "claim" | "role" | "generic";
+  kind: "claim" | "role" | "generic" | "skill" | "consistency";
   why: ClaimReason;
   roleTitle: string | null;
   employer: string | null;
@@ -37,7 +42,7 @@ export interface PlanQuestion {
 }
 
 export interface ProbeDef {
-  key: ProbeKey;
+  key: FollowupTarget;
   text: string;
 }
 
@@ -50,11 +55,12 @@ export interface PlanSelection {
 }
 
 export interface InterviewPlan {
-  v: 1;
+  v: 2;
   cvId: string | null;
   role: { slug: string; title: string };
   claims: PlanClaim[];
   questions: PlanQuestion[];
+  /** Template follow-ups, one per target (used when the LLM follow-up is unavailable). */
   probes: ProbeDef[];
   selection: PlanSelection;
 }
@@ -65,16 +71,16 @@ export interface CurrentQuestion {
   text: string;
   /** Number of the main question this belongs to (a probe keeps its claim question's number). */
   questionNo: number;
-  probeKey?: ProbeKey;
+  probeKey?: FollowupTarget;
 }
 
 /** Server-side cursor stored in interview_sessions.progress. */
 export interface Progress {
-  v: 1;
+  v: 2;
   /** Index into plan.questions of the current main question. */
   qIdx: number;
-  /** Probes already asked for the current claim. */
-  probesAsked: ProbeKey[];
+  /** Targets of the follow-ups already asked on the current topic (one entry per follow-up). */
+  probesAsked: FollowupTarget[];
   current: CurrentQuestion;
   /** Candidate messages accepted so far (optimistic-lock token). */
   turn: number;
@@ -85,7 +91,7 @@ export interface Progress {
 
 /** What the server decided about one candidate message. */
 export type TurnDecision =
-  | { kind: "answer"; probeKey: ProbeKey | null }
+  | { kind: "answer"; followup: { text: string; target: FollowupTarget; via: "llm" | "template" } | null }
   | { kind: "off_script" }
   | { kind: "role_question" };
 
@@ -131,4 +137,10 @@ export type InterviewView =
       notice: string | null;
       /** Set on a message response: whether the answer just sent was stored ("late" = after the deadline). */
       lastAnswer?: "saved" | "late";
+      /** "voice" (default): answers are spoken; "typed": an admin-approved accommodation. */
+      answerMode: "voice" | "typed";
+      /** Locked after leaving the page twice; an admin must reopen it. */
+      locked: boolean;
+      /** Times the candidate has left the page (the first one pauses, the second locks). */
+      tabLeaves: number;
     };

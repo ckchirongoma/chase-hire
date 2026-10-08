@@ -43,6 +43,7 @@ export default async function ReasoningPage() {
             <li>The clock runs on our server. If your connection drops, log back in; the clock keeps running.</li>
             <li>Use keys 1–5 to choose and Enter to confirm. Paper and a calculator are fine.</li>
             <li>You can take it once every 90 days. Find a quiet 15 minutes before you start.</li>
+            <li>Stay on this page until you finish. Leaving it once pauses the test; leaving it a second time locks it until our team reopens it (not a rejection).</li>
           </ul>
         </div>
       )}

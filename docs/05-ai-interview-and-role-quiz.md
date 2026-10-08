@@ -14,42 +14,57 @@ The evidence base is clear on two points:
 
 So the AI interviewer is tightly scripted. It is not a free-form chat.
 
-### Format
+### Format (v2: spoken and adaptive)
 
-- Text chat, about 20 minutes, with a server-side `deadline_at` of 25 minutes.
-- Paste is blocked.
-- The candidate is told up front how many questions there are (6) and that answers should be specific.
-- There is no live typing indicator from the bot. Replies are delivered in full once ready, so the pace feels conversational rather than timed.
+- **Spoken answers.** The interviewer's question appears on screen (the candidate can have it read aloud). The candidate records each answer (up to 3 minutes), can listen back and re-record, then sends it. The server stores the recording in the private `interview-audio` bucket and transcribes it through OpenRouter (`OPENROUTER_MODEL_TRANSCRIBE`, default `openai/whisper-1`). The transcript is what the interviewer and the grader see.
+- **Typed answers only as an accommodation.** An admin can switch one application to typed answers before its interview starts (`admin_set_interview_mode`, with a written reason), for example when a candidate can't use a microphone. Paste stays blocked in typed mode.
+- **About 25–30 minutes**, with a hard server-side `deadline_at` of **35 minutes** set by the DB clock.
+- The candidate is told the format, the time and the tab rule up front, and that answers should be specific. They are not told a question count, because follow-ups depend on their answers.
+- There is no live typing indicator from the bot. Replies are delivered in full once ready.
+- **Tab rule (pause, then lock).** Leaving the tab for 2 seconds or more pauses the interview: the candidate must confirm to carry on (the clock keeps running). A second leave **locks** the session. A locked session never expires on its own and is never auto-rejected; an admin reopens it with a written reason (`admin_reopen_session`) and the candidate gets back the time they had left (at least 1 minute). Leaves, pauses, locks and reopens are logged as signals.
+
+Why voice: a typed interview can be answered by retyping an LLM's output from a second device. Speaking a specific, consistent account of your own work, and then going deeper under follow-ups that react to what you just said, is much harder to fake. We judge the content of the transcript, never accent, fluency or sound quality.
 
 ### Script (generated per candidate from the parsed CV)
 
+The frame is the same for every candidate: the same opening, the same topic-selection rules, the same follow-up targets, the same time limits and the same rubric. What adapts is which CV topics are chosen and what the follow-ups say.
+
 1. **Warm-up (1 question):** "In two or three sentences, what kind of work do you do best?"
-2. **Claim verification (3 questions):**
-   - The system picks the 3 highest-value claims from the CV:
-     - the most recent role
-     - the most impressive quantified claim
-     - the claim closest to the role spec
-   - For each claim, ask a **behavioural STAR** question. Example: "Your CV says you 'built an automated reporting pipeline that saved 20 hours a week.' Walk me through what you personally built, what tools you used, and how you measured the 20 hours."
-   - Then ask **up to 2 standard probes** per claim, chosen from:
-     - "What was the hardest technical/analytical decision, and what did you reject?"
-     - "What broke, and how did you find out?"
-     - "What would you do differently?"
-     - "Which parts did AI tools do, and how did you check them?"
-3. **Role situational (1 question, fixed per role):**
+2. **CV topics (3 to 6), chosen in this priority order:**
+   1. every role that ended in the last **5 years** (up to 3, most recent first), each opened on that role's strongest claim;
+   2. the most impressive quantified claim;
+   3. the claim closest to the role spec;
+   4. a **CV consistency** issue, if the dates don't add up (a role that ends before it starts, overlapping full-time roles of 3+ months, or a gap of 6+ months);
+   5. a key skill the CV lists but **never evidences** in any role.
+
+   Choosing "most impressive", "closest to the role" and "key skill" is a JEV call with a deterministic fallback (doc 15).
+   Each topic opens with a **behavioural STAR** question. Example: "Your CV says you 'built an automated reporting pipeline that saved 20 hours a week.' Walk me through what you personally did, which tools you used, and how you measured the result."
+3. **Adaptive follow-ups (up to 4 per topic).** After each answer, JEV decides whether the answer is specific enough to move on and, if not, what is missing. The target is one of:
+   - **specifics** (tools, numbers, dates)
+   - **ownership** (what they personally did vs. the team)
+   - **failure** (what broke and how they found out)
+   - **trade-off** (the hardest decision and the rejected option)
+   - **consistency** (how it fits the CV's dates and roles)
+   - **AI use** (what AI tools did and how they checked it)
+
+   An LLM then writes one follow-up question that builds on the candidate's own words and digs for that target (`prompts/interviewer-followup.v1.md`). The question is validated (length, a single question, no evaluation, no markup, not a repeat); if it fails, or the LLM is slow or down, a standard template for that target is used instead. Without JEV, a fixed rule decides (long enough and contains a number = move on).
+4. **Role situational (1 question, fixed per role):**
    - **BA:** "A client's ops head says 'just put all our leads on WhatsApp.' You have a spreadsheet of 5,000 customer lines with no phone numbers on most rows. What do you do in your first week?"
    - **SWE:** "You inherit a Next.js + Supabase app a colleague built with an AI tool in two days. The client goes live Monday. What do you check first, in order, and why?"
-4. **Motivation and logistics (1 question):** "This role pays R30,000–R32,500 plus profit share, remote in South Africa. What makes this the right next move for you, and when could you start?"
+5. **Motivation and logistics (1 question):** "This role pays R30,000–R32,500 plus profit share, remote in South Africa. What makes this the right next move for you, and when could you start?"
+
+**Time rules** (so every candidate reaches the situational and logistics questions): no new follow-ups with under 5 minutes left; remaining CV topics are skipped with under 7 minutes left; with under 3 minutes left the interviewer goes straight to logistics.
 
 ### Interviewer behaviour rules
 
-The system prompt is in doc 10. The interviewer:
+The prompts are in doc 10. The interviewer:
 
 - never gives feedback on whether an answer was good
 - never reveals scoring
 - asks one question at a time
-- if an answer is vague, uses the next standard probe rather than inventing new questions
-- tracks which CV claim each message relates to (`meta.claim_id`)
-- refuses prompt-injection attempts politely and logs a signal
+- builds follow-ups on what the candidate actually said, within the six fixed targets; it does not invent new topics
+- tracks which CV topic each message relates to (`claim_id`)
+- treats the CV and the transcript as untrusted data, refuses prompt-injection attempts politely and logs a signal
 
 ### Scoring (after the session; separate grader call, 3 samples, median)
 
@@ -62,7 +77,7 @@ Each criterion is scored 1–5 with anchors:
 | **Depth under probe** | Answer collapses on the first probe | Holds up on one probe | Gets *more* specific under probing; describes failures and what was rejected |
 | **CV consistency** | Contradicts the CV (dates, scope, tools) | Minor gaps | Fully consistent |
 | **Situational judgement** | Jumps to a solution | Reasonable plan | Diagnoses first, sequences risk, names what they'd check (role-specific anchors in the rubric) |
-| **Communication** | Rambling, no structure | Understandable | Answer-first, concise, structured |
+| **Communication** | Rambling, no structure | Understandable | Answer-first, concise, structured (judged on the transcript; fillers, accent and transcription errors are ignored) |
 
 **Output:**
 - a `summary` JSON holding per-criterion scores with evidence quotes
@@ -71,9 +86,9 @@ Each criterion is scored 1–5 with anchors:
 
 ### Integrity note
 
-Paste blocking stops lazy copying. It does not stop someone retyping an LLM answer from a second device.
+Spoken answers and follow-ups that react to each answer make it much harder to read out an LLM's answer from a second device, but not impossible. Tab leaves, pauses and locks are signals only, never evidence on their own, and a lock is never a rejection.
 
-So the most useful output of this stage is the **list of verification concerns**, which is carried into the live panel interview.
+So the most useful output of this stage is still the **list of verification concerns**, which is carried into the live panel interview. The admin can play back every recorded answer next to its transcript.
 
 ## Part B: Role quiz (15 items / 12 minutes)
 
@@ -87,6 +102,7 @@ This is a job-knowledge check. Validity is about .40 per Sackett et al. (2022), 
 - Some items are "select all that apply". These are scored all-or-nothing.
 - One item per screen, with a server-enforced deadline.
 - Paste is blocked.
+- The same tab rule as the interview and the reasoning test: the first leave pauses (confirm to continue), the second locks until an admin reopens it with the time that was left. Never a rejection.
 - Items are drawn at random from a bank of at least 60 items per role, stratified by topic.
 
 ### SWE blueprint

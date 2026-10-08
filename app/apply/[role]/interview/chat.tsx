@@ -2,7 +2,10 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { burstGuard, useIntegrity } from "@/lib/client/use-integrity";
+import { useTabRule } from "@/lib/client/use-tab-rule";
+import { LockedNotice, TabPauseOverlay } from "@/components/integrity/tab-rule";
 import type { InterviewView } from "@/lib/interview/types";
+import { VoiceRecorder, type Recording } from "./voice-recorder";
 
 const CONTEXT = "interview";
 const MAX_CHARS = 4000;
@@ -22,7 +25,8 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
   const base = `/api/interview/${applicationId}`;
 
   const active = state?.status === "active";
-  useIntegrity(CONTEXT, { active, blockPaste: true });
+  const typed = state?.status === "active" && state.answerMode === "typed";
+  useIntegrity(CONTEXT, { active, blockPaste: typed });
 
   const apply = useCallback((s: InterviewView) => {
     if (s.status !== "none") offset.current = new Date(s.serverNow).getTime() - Date.now();
@@ -63,6 +67,14 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
     if (resume) call("state");
   }, [resume, call]);
 
+  const refresh = useCallback(() => void call("state", undefined, true), [call]);
+  const tab = useTabRule({
+    kind: "interview",
+    id: state?.status === "active" ? state.sessionId : null,
+    active: state?.status === "active" && !state.done && !state.locked,
+    onLocked: refresh,
+  });
+
   // Display-only countdown; the server enforces the deadline.
   useEffect(() => {
     if (state?.status !== "active") return;
@@ -93,6 +105,48 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
     bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [count]);
 
+  /** A spoken answer: multipart upload, then the server transcribes it and asks the next question. */
+  const sendVoice = useCallback(
+    async (r: Recording): Promise<boolean> => {
+      if (busy || state?.status !== "active" || state.pending || state.notice) return false;
+      setBusy(true);
+      setError(null);
+      try {
+        const form = new FormData();
+        form.append("audio", new File([r.blob], `answer.${r.mime.includes("mp4") ? "m4a" : r.mime.split("/")[1] ?? "webm"}`, { type: r.mime }));
+        form.append("turn", String(state.turn));
+        form.append("durationMs", String(Math.round(r.durationMs)));
+        const res = await fetch(`${base}/answer`, { method: "POST", body: form });
+        const json = await res.json();
+        if (res.status === 409 && json.state) {
+          apply(json.state as InterviewView);
+          setError(json.error ?? "The conversation has been refreshed.");
+          return false;
+        }
+        if (!res.ok) throw new Error(json.error ?? "Something went wrong");
+        const next = json as InterviewView;
+        apply(next);
+        if (next.status !== "none" && next.lastAnswer === "late") setLateAnswer(true);
+        return true;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Something went wrong");
+        return false;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy, state, base, apply],
+  );
+
+  const readAloud = useCallback((text: string) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-ZA";
+    u.rate = 0.95;
+    window.speechSynthesis.speak(u);
+  }, []);
+
   const send = useCallback(async () => {
     const content = text.trim();
     if (!content || busy || state?.status !== "active" || state.pending || state.notice) return;
@@ -120,8 +174,13 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
     .padStart(2, "0");
   const words = text.trim() ? text.trim().split(/\s+/).length : 0;
 
+  if (state.locked || tab.locked) {
+    return <LockedNotice />;
+  }
+
   return (
     <div className="space-y-4">
+      <TabPauseOverlay open={tab.paused} onContinue={tab.resume} />
       <div className="card space-y-3">
         <div className="flex items-center justify-between text-sm">
           <span className="muted">{state.done ? "Interview finished" : state.current?.label}</span>
@@ -167,13 +226,31 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
         <p className="notice">{state.notice}</p>
       ) : (
         <div className="card space-y-2">
-          {state.pending && <p className="notice">Your answer is saved. Preparing the next question…</p>}
+          {(state.pending || (busy && !typed)) && (
+            <p className="notice">Your answer is saved. {typed ? "" : "Transcribing it and "}preparing the next question…</p>
+          )}
           {state.current && (
             <div className="rounded-md bg-slate-50 p-3 text-sm" data-testid="current-question">
-              <p className="mb-1 text-xs font-medium text-slate-500">{state.current.label}</p>
+              <div className="mb-1 flex items-center justify-between">
+                <p className="text-xs font-medium text-slate-500">{state.current.label}</p>
+                <button type="button" className="text-xs underline" onClick={() => readAloud(state.current!.text)}>
+                  Read aloud
+                </button>
+              </div>
               <p className="whitespace-pre-line">{state.current.text}</p>
             </div>
           )}
+          {!typed ? (
+            <>
+              <VoiceRecorder disabled={state.pending || !!state.notice} sending={busy} onSend={sendVoice} />
+              <p className="muted">
+                Answer out loud, up to 3 minutes. You can listen back and record again before you send. We transcribe your
+                answer; we never judge your accent or how you sound.
+              </p>
+              {error && <p className="error">{error}</p>}
+            </>
+          ) : (
+          <>
           <label htmlFor="answer" className="label">Your answer</label>
           <textarea
             id="answer"
@@ -205,6 +282,8 @@ export default function InterviewChat({ applicationId, roleSlug, resume }: { app
             </button>
           </div>
           {error && <p className="error">{error}</p>}
+          </>
+          )}
         </div>
       )}
     </div>

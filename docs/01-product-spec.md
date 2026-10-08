@@ -8,7 +8,7 @@ Sign up (email+password, verify email)
   → Profile + CV upload → CV parsed → dedupe check
   → Reasoning Assessment (30 Q / 15 min, once; retake after 90 days)      [platform-wide]
   → Apply to role(s): BA and/or SWE
-      → AI CV-verification interview (~20 min, text, paste blocked)
+      → AI CV-verification interview (~25–30 min, spoken answers, adaptive follow-ups; 35-min hard limit)
       → Role quiz (15 Q / 12 min, timed, paste blocked)
       → Work assessments
            BA:  Part 1 Discovery & Spiky POV → Part 2 Build & Handoff
@@ -87,6 +87,7 @@ They also see a **"Request a review"** button on every scored stage. It creates 
 |---|---|---|
 | `paste_attempt` | interview, quiz, persona chat | `onPaste` preventDefault + log |
 | `blur` / `focus` | all timed stages | `visibilitychange` events with timestamps |
+| `tab_pause` / `session_locked` / `session_reopened` | reasoning, quiz, interview | a leave of 2 s or more: the first pauses the stage (the candidate confirms to continue), the second locks it until an admin reopens it with the remaining time. A procedural pause, never a rejection |
 | `burst_input` | text inputs | more than 150 characters arriving within 500 ms without key events |
 | `answer_time` | reasoning, quiz | per-item server timestamps; flag a correct answer under 4 s on a hard item, or a long stall followed by a correct answer |
 | `live_delta` | live retest | online percentile minus live percentile > 25 points → flag for discussion |
@@ -98,6 +99,7 @@ The **real** controls are design choices, not these signals:
 - server-side timers
 - parallel-form live retest
 - live defence of submitted work with unseen follow-up questions
+- spoken AI-interview answers with follow-ups that react to what the candidate just said
 
 ## 5. Timed work windows
 

@@ -23,7 +23,8 @@ export type Result = { rawScore: number; percentile: number; stars: number; norm
 export type ReasoningState =
   | { status: "none" }
   | { status: "active"; attemptId: string; deadlineAt: string; serverNow: string; item: ServedItem }
-  | { status: "done"; attemptId: string; result: Result };
+  | { status: "done"; attemptId: string; result: Result }
+  | { status: "locked"; attemptId: string };
 
 type AttemptRow = {
   id: string;
@@ -35,12 +36,14 @@ type AttemptRow = {
   stars: number | null;
   norm_version: string | null;
   item_count: number;
+  locked_at: string | null;
 };
 
-const ATTEMPT_COLS = "id, user_id, deadline_at, submitted_at, raw_score, percentile, stars, norm_version, item_count";
+const ATTEMPT_COLS = "id, user_id, deadline_at, submitted_at, raw_score, percentile, stars, norm_version, item_count, locked_at";
 
+/** A locked attempt never expires on its own: an admin reopens it with its remaining time. */
 function isExpired(a: AttemptRow, now = Date.now()) {
-  return now > new Date(a.deadline_at).getTime() + GRACE_MS;
+  return !a.locked_at && now > new Date(a.deadline_at).getTime() + GRACE_MS;
 }
 
 async function latestAttempt(admin: SupabaseClient, userId: string): Promise<AttemptRow | null> {
@@ -111,6 +114,7 @@ export async function getState(admin: SupabaseClient, userId: string): Promise<R
   const attempt = await latestAttempt(admin, userId);
   if (!attempt) return { status: "none" };
   if (attempt.submitted_at) return done(attempt);
+  if (attempt.locked_at) return { status: "locked", attemptId: attempt.id };
   if (isExpired(attempt)) return done(await finalise(admin, attempt.id));
 
   const item = await currentOrNextItem(admin, attempt);
@@ -134,7 +138,7 @@ export async function answer(
 ): Promise<ReasoningState> {
   const attempt = await latestAttempt(admin, userId);
   if (!attempt || attempt.id !== attemptId) throw new ReasoningError("Attempt not found", 404);
-  if (attempt.submitted_at || isExpired(attempt)) return getState(admin, userId);
+  if (attempt.submitted_at || attempt.locked_at || isExpired(attempt)) return getState(admin, userId);
 
   // Only the currently served, unanswered item can be answered. Anything else
   // (a double-click or a retried request) is ignored and the current state returned.
@@ -147,7 +151,7 @@ export async function answer(
     .is("answered_at", null)
     .select("tier, served_at, answered_at, correct");
   if (error) {
-    if (error.message.includes("reasoning_deadline_passed")) return getState(admin, userId);
+    if (error.message.includes("reasoning_deadline_passed") || error.message.includes("session_locked")) return getState(admin, userId);
     throw new ReasoningError(error.message, 500);
   }
 
@@ -234,6 +238,7 @@ export async function finaliseExpired(admin: SupabaseClient): Promise<number> {
     .from("reasoning_attempts")
     .select("id")
     .is("submitted_at", null)
+    .is("locked_at", null)
     .lt("deadline_at", cutoff)
     .limit(500);
   for (const a of data ?? []) await finalise(admin, a.id);

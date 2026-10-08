@@ -50,7 +50,7 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
   const supabase = await createClient();
   const { data: session } = await supabase
     .from("interview_sessions")
-    .select("id, plan, started_at, deadline_at, ended_at, end_reason, summary, score, model, prompt_version")
+    .select("id, plan, started_at, deadline_at, ended_at, end_reason, summary, score, model, prompt_version, answer_mode, tab_leaves, locked_at, reopen_count")
     .eq("application_id", applicationId)
     .maybeSingle();
 
@@ -67,7 +67,7 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
     supabase.from("interview_messages").select("id, role, content, step, claim_id, meta, created_at").eq("session_id", session.id).order("created_at"),
     supabase.from("grade_summaries").select("criterion_key, weight, median_score, spread, needs_human_review, review_reason, human_score, human_reason, final_score, feedback").eq("subject_type", "interview").eq("subject_id", session.id),
     supabase.from("grades").select("criterion_key, sample_idx, score, evidence, rationale, extra, model, prompt_version, temperature").eq("subject_type", "interview").eq("subject_id", session.id).order("sample_idx"),
-    supabase.from("rubrics").select("criteria").eq("key", "interview").eq("version", 1).maybeSingle(),
+    supabase.from("rubrics").select("criteria").eq("key", "interview").eq("active", true).order("version", { ascending: false }).limit(1).maybeSingle(),
     supabase.from("grading_jobs").select("status, attempts, last_error, updated_at").eq("subject_type", "interview").eq("subject_id", session.id).maybeSingle(),
   ]);
 
@@ -84,6 +84,13 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
   const plan = session.plan as { claims?: { id: string; text: string; why: string }[]; selection?: { via: string; model: string | null } };
   const flagged = [...byKey.values()].filter((s) => s.needs_human_review && s.human_score === null).length;
   const sampleMeta = (samples.data as Sample[] | null)?.[0];
+
+  // Spoken answers: short-lived signed links to the original recordings (admin read policy on the bucket).
+  const audioPaths = msgs.map((m) => m.meta?.audio_path).filter((p): p is string => typeof p === "string");
+  const { data: signedAudio } = audioPaths.length
+    ? await supabase.storage.from("interview-audio").createSignedUrls(audioPaths, 900)
+    : { data: [] as { path: string | null; signedUrl: string }[] };
+  const audioUrl = new Map((signedAudio ?? []).filter((a) => a.path && a.signedUrl).map((a) => [a.path as string, a.signedUrl]));
 
   return (
     <section className="card space-y-4">
@@ -104,6 +111,11 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
         {sampleMeta && <> · T={sampleMeta.temperature} · 3 samples, median</>}
         {summary.concerns_prompt_version && <> · concerns {summary.concerns_prompt_version}</>}
         {plan.selection && <> · claim selection via {plan.selection.via}{plan.selection.model ? ` (${plan.selection.model})` : ""}</>}
+      </p>
+      <p className="muted">
+        Answers: {session.answer_mode === "typed" ? "typed (accommodation)" : "spoken, transcribed"} · tab leaves {session.tab_leaves}
+        {session.reopen_count > 0 && <> · reopened {session.reopen_count}×</>}
+        {session.locked_at && <span className="badge-warn ml-1">locked {fmtDate(session.locked_at)}: reopen it under Locked sessions</span>}
       </p>
       {summary.no_answers && <p className="notice">The candidate gave no answers before the interview ended.</p>}
       {!!summary.transcript_flags?.length && <p className="badge-bad">Sanitiser flags in answers: {summary.transcript_flags.join(", ")}</p>}
@@ -212,7 +224,10 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
         <summary className="cursor-pointer text-sm underline">Transcript ({msgs.length} messages)</summary>
         <div className="mt-2 space-y-2">
           {msgs.map((m, i) => {
-            const jev = (m.meta?.jev ?? null) as { off_script?: number; role_question?: number; probe_needed?: number | null; model?: string } | null;
+            const jev = (m.meta?.jev ?? null) as { off_script?: number; role_question?: number; sufficient?: number | null; model?: string } | null;
+            const followup = (m.meta?.followup ?? null) as { via?: string; rejected?: string | null; model?: string | null; error?: string | null } | null;
+            const transcription = (m.meta?.transcription ?? null) as { model?: string; ms?: number; error?: string | null } | null;
+            const audio = typeof m.meta?.audio_path === "string" ? audioUrl.get(m.meta.audio_path) : undefined;
             return (
               <div key={m.id} className={`rounded p-2 text-sm ${m.role === "candidate" ? "bg-slate-50" : ""}`}>
                 <p className="text-xs text-slate-500">
@@ -220,7 +235,21 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
                   {m.role === "candidate" && m.meta && (
                     <span className="ml-1">
                       · decision {String(m.meta.decision ?? "—")} via {String(m.meta.via ?? "—")}
-                      {jev && <> (JEV {jev.model}: probe {jev.probe_needed ?? "—"}, off-script {jev.off_script}, role-q {jev.role_question})</>}
+                      {jev && <> (JEV {jev.model}: sufficient {jev.sufficient ?? "—"}, off-script {jev.off_script}, role-q {jev.role_question})</>}
+                      {typeof m.meta.probe_key === "string" && <span className="badge ml-1">follow-up: {m.meta.probe_key}</span>}
+                      {followup && (
+                        <span className="ml-1">
+                          · follow-up via {followup.via}
+                          {followup.rejected && <span className="badge-warn ml-1">generated question rejected: {followup.rejected}</span>}
+                          {followup.error && <span className="badge-warn ml-1">{followup.error.slice(0, 80)}</span>}
+                        </span>
+                      )}
+                      {transcription && (
+                        <span className="ml-1">
+                          · transcribed by {transcription.model} in {transcription.ms} ms
+                          {transcription.error && <span className="badge-bad ml-1">{transcription.error.slice(0, 80)}</span>}
+                        </span>
+                      )}
                       {m.meta.regex_injection === true && <span className="badge-bad ml-1">injection pattern</span>}
                       {m.meta.off_script_via === "jev" && <span className="badge ml-1">off-script (JEV only, not an injection signal)</span>}
                       {m.meta.jev_timeout === true && <span className="badge ml-1">JEV timed out</span>}
@@ -229,6 +258,7 @@ export default async function InterviewPanel({ applicationId }: { applicationId:
                   )}
                 </p>
                 <p className="whitespace-pre-line">{m.content}</p>
+                {audio && <audio controls preload="none" src={audio} className="mt-1 h-8 w-full" aria-label={`Recording for message ${i}`} />}
               </div>
             );
           })}

@@ -31,7 +31,9 @@ export type QuizState =
   | { status: "active"; attemptId: string; deadlineAt: string; serverNow: string; item: QuizServedItem }
   | { status: "done"; attemptId: string; result: QuizResult }
   /** The application is closed (rejected, withdrawn or lapsed); results are on /me/results. */
-  | { status: "closed" };
+  | { status: "closed" }
+  /** Locked after the candidate left the page twice; an admin reopens it with its remaining time. */
+  | { status: "locked"; attemptId: string };
 
 type AppRow = { id: string; stage: string; status: string };
 type Ctx = { roleSlug: string; flagPct: number; app: AppRow };
@@ -45,9 +47,10 @@ type AttemptRow = {
   pct: number | null;
   topic_scores: TopicScores | null;
   item_count: number;
+  locked_at: string | null;
 };
 
-const ATTEMPT_COLS = "id, application_id, started_at, deadline_at, submitted_at, raw_score, pct, topic_scores, item_count";
+const ATTEMPT_COLS = "id, application_id, started_at, deadline_at, submitted_at, raw_score, pct, topic_scores, item_count, locked_at";
 const STARTABLE_STATUSES = ["in_progress", "advanced"];
 /** No further items are served once an application is closed. */
 const CLOSED_STATUSES = ["rejected", "withdrawn", "lapsed"];
@@ -60,8 +63,9 @@ const SETTLE_STATUSES = ["in_progress", "advanced"];
  */
 const EMPTY_ATTEMPT_STALE_MS = 30_000;
 
+/** A locked attempt never expires on its own: an admin reopens it with its remaining time. */
 function isExpired(a: AttemptRow, now = Date.now()) {
-  return now > new Date(a.deadline_at).getTime() + QUIZ_GRACE_MS;
+  return !a.locked_at && now > new Date(a.deadline_at).getTime() + QUIZ_GRACE_MS;
 }
 
 function canStart(app: AppRow) {
@@ -171,6 +175,7 @@ async function stateFor(admin: SupabaseClient, ctx: Ctx, attempt: AttemptRow): P
     await settleApplication(admin, ctx.app);
     return done(attempt);
   }
+  if (attempt.locked_at) return { status: "locked", attemptId: attempt.id };
   if (isExpired(attempt)) {
     const finished = await finaliseQuiz(admin, attempt.id);
     return finished ? done(finished) : null;
@@ -213,7 +218,7 @@ export async function answerQuiz(
   if (!ctx) throw new QuizError("Attempt not found", 404);
   const attempt = await attemptFor(admin, ctx.app.id);
   if (!attempt || attempt.id !== attemptId) throw new QuizError("Attempt not found", 404);
-  if (isClosed(ctx.app) || attempt.submitted_at || isExpired(attempt)) {
+  if (isClosed(ctx.app) || attempt.submitted_at || attempt.locked_at || isExpired(attempt)) {
     return (await stateFor(admin, ctx, attempt)) ?? noAttempt(ctx);
   }
 
@@ -245,7 +250,7 @@ export async function answerQuiz(
     .is("answered_at", null)
     .select("served_at, answered_at, correct");
   if (error) {
-    if (error.message.includes("quiz_deadline_passed") || error.message.includes("quiz_attempt_already_submitted")) {
+    if (error.message.includes("quiz_deadline_passed") || error.message.includes("quiz_attempt_already_submitted") || error.message.includes("session_locked")) {
       return getQuizState(admin, userId, roleSlug);
     }
     throw new QuizError(error.message, 500);
@@ -378,7 +383,7 @@ export async function finaliseExpiredQuizzes(
   scope: { userId?: string; applicationId?: string } = {},
 ): Promise<number> {
   const cutoff = new Date(Date.now() - QUIZ_GRACE_MS).toISOString();
-  let query = admin.from("quiz_attempts").select("id").is("submitted_at", null).lt("deadline_at", cutoff);
+  let query = admin.from("quiz_attempts").select("id").is("submitted_at", null).is("locked_at", null).lt("deadline_at", cutoff);
   if (scope.userId) query = query.eq("user_id", scope.userId);
   if (scope.applicationId) query = query.eq("application_id", scope.applicationId);
   const { data, error } = await query.limit(500);

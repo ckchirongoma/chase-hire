@@ -3,12 +3,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { logSignal } from "@/lib/client/signals";
 import { quizClock } from "@/lib/quiz/clock";
+import { useTabRule } from "@/lib/client/use-tab-rule";
+import { LockedNotice, TabPauseOverlay } from "@/components/integrity/tab-rule";
 
 type Stem = { prompt: string; table?: { columns: string[]; rows: (string | number)[][] }; footnote?: string };
 type State =
   | { status: "none" }
   | { status: "active"; attemptId: string; deadlineAt: string; serverNow: string; item: { position: number; total: number; stem: Stem; options: string[] } }
-  | { status: "done"; attemptId: string; result: { rawScore: number; percentile: number; stars: number } };
+  | { status: "done"; attemptId: string; result: { rawScore: number; percentile: number; stars: number } }
+  | { status: "locked"; attemptId: string };
 
 export default function Runner({ resume }: { resume: boolean }) {
   const router = useRouter();
@@ -49,6 +52,14 @@ export default function Runner({ resume }: { resume: boolean }) {
   useEffect(() => {
     if (resume) call("/api/reasoning/state");
   }, [resume, call]);
+
+  const refresh = useCallback(() => void call("/api/reasoning/state"), [call]);
+  const tab = useTabRule({
+    kind: "reasoning",
+    id: state?.status === "active" ? state.attemptId : null,
+    active: state?.status === "active",
+    onLocked: refresh,
+  });
 
   // Display-only countdown; the server enforces the deadline.
   useEffect(() => {
@@ -94,12 +105,13 @@ export default function Runner({ resume }: { resume: boolean }) {
   useEffect(() => {
     if (state?.status !== "active") return;
     const onKey = (e: KeyboardEvent) => {
+      if (tab.paused) return;
       if (e.key >= "1" && e.key <= "5") setChoice(Number(e.key) - 1);
       else if (e.key === "Enter" && choice !== null) submit(choice);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state, choice, submit]);
+  }, [state, choice, submit, tab.paused]);
 
   if (!state || state.status === "none") {
     return (
@@ -116,12 +128,17 @@ export default function Runner({ resume }: { resume: boolean }) {
     return <p className="notice">Finished. Loading your result…</p>;
   }
 
+  if (state.status === "locked" || tab.locked) {
+    return <LockedNotice />;
+  }
+
   const { item } = state;
   const mins = Math.floor(remaining / 60000);
   const secs = Math.floor((remaining % 60000) / 1000).toString().padStart(2, "0");
 
   return (
     <div className="card space-y-4 select-none" onContextMenu={(e) => e.preventDefault()}>
+      <TabPauseOverlay open={tab.paused} onContinue={tab.resume} />
       <div className="flex items-center justify-between text-sm">
         <span>
           Question {item.position} of {item.total}

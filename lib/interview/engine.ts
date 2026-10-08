@@ -1,10 +1,19 @@
-import { introMessage, MAX_PROBES_PER_CLAIM, OFF_SCRIPT_REPLY, ROLE_QUESTION_REPLY } from "./script";
-import type { CurrentQuestion, InterviewPlan, OutMessage, ProbeDef, ProbeKey, Progress, TurnDecision } from "./types";
+import {
+  introMessage,
+  MAX_FOLLOWUPS_PER_TOPIC,
+  NO_FOLLOWUP_MS,
+  OFF_SCRIPT_REPLY,
+  ROLE_QUESTION_REPLY,
+  SKIP_TO_LOGISTICS_MS,
+  SKIP_TO_SITUATIONAL_MS,
+} from "./script";
+import type { CurrentQuestion, FollowupTarget, InterviewPlan, OutMessage, ProbeDef, Progress, TurnDecision } from "./types";
 
 /**
- * The deterministic script engine. Pure: given the plan, the cursor and a decision about the
+ * The conversation engine. Pure: given the plan, the cursor and a decision about the
  * candidate's latest message, it returns the next cursor and the interviewer's next message(s).
- * It never evaluates or praises an answer; it only moves through fixed questions.
+ * Opening questions per topic are fixed by the plan; follow-up text is supplied in the decision
+ * (an LLM-written, validated follow-up or a template). It never evaluates or praises an answer.
  */
 
 function questionAt(plan: InterviewPlan, qIdx: number): CurrentQuestion {
@@ -17,7 +26,10 @@ function questionMessage(current: CurrentQuestion, total: number): OutMessage {
     step: current.step,
     claimId: current.claimId,
     content: current.text,
-    meta: current.step === "probe" ? { probe_key: current.probeKey, question_no: current.questionNo } : { question_no: current.questionNo, total },
+    meta:
+      current.step === "probe"
+        ? { probe_key: current.probeKey, question_no: current.questionNo }
+        : { question_no: current.questionNo, total },
   };
 }
 
@@ -26,59 +38,81 @@ function withIdx(messages: OutMessage[], start: number): OutMessage[] {
 }
 
 /** Opening: intro + question 1. */
-export function openScript(plan: InterviewPlan): { progress: Progress; messages: OutMessage[] } {
+export function openScript(plan: InterviewPlan, mode: "voice" | "typed" = "voice"): { progress: Progress; messages: OutMessage[] } {
   const current = questionAt(plan, 0);
   const messages = withIdx(
     [
-      { step: "intro", claimId: null, content: introMessage(plan.role.title), meta: {} },
+      { step: "intro", claimId: null, content: introMessage(plan.role.title, mode), meta: {} },
       questionMessage(current, plan.questions.length),
     ],
     0,
   );
   return {
-    progress: { v: 1, qIdx: 0, probesAsked: [], current, turn: 0, msgCount: messages.length, done: false },
+    progress: { v: 2, qIdx: 0, probesAsked: [], current, turn: 0, msgCount: messages.length, done: false },
     messages,
   };
 }
 
-/** Probes not yet used on the current claim, in doc order. */
+/** Follow-up targets not yet used on the current topic, in template order. */
 export function unusedProbes(plan: InterviewPlan, progress: Progress): ProbeDef[] {
   return plan.probes.filter((p) => !progress.probesAsked.includes(p.key));
 }
 
-/** A probe may follow answers to a claim question or a probe, up to 2 per claim. */
-export function canProbe(plan: InterviewPlan, progress: Progress): boolean {
+/**
+ * A follow-up may come after an answer to a topic question or a follow-up, up to
+ * MAX_FOLLOWUPS_PER_TOPIC per topic, and only while enough time is left.
+ */
+export function canProbe(plan: InterviewPlan, progress: Progress, remainingMs?: number): boolean {
   if (progress.done) return false;
   if (progress.current.step !== "claim" && progress.current.step !== "probe") return false;
-  return progress.probesAsked.length < MAX_PROBES_PER_CLAIM && unusedProbes(plan, progress).length > 0;
+  if (remainingMs !== undefined && remainingMs < NO_FOLLOWUP_MS) return false;
+  return progress.probesAsked.length < MAX_FOLLOWUPS_PER_TOPIC;
+}
+
+/**
+ * The next main question index after `qIdx`, skipping ahead when time is short: below
+ * SKIP_TO_SITUATIONAL_MS remaining topics are skipped; below SKIP_TO_LOGISTICS_MS everything but
+ * the logistics question is skipped.
+ */
+export function nextQuestionIndex(plan: InterviewPlan, qIdx: number, remainingMs?: number): number {
+  const next = qIdx + 1;
+  if (next >= plan.questions.length || remainingMs === undefined) return next;
+  const logistics = plan.questions.findIndex((q) => q.step === "logistics");
+  const situational = plan.questions.findIndex((q) => q.step === "situational");
+  if (remainingMs < SKIP_TO_LOGISTICS_MS && logistics > next) return logistics;
+  if (remainingMs < SKIP_TO_SITUATIONAL_MS && plan.questions[next].step === "claim" && situational > next) return situational;
+  return next;
 }
 
 export interface TurnResult {
   progress: Progress;
   /** Interviewer messages to store after the candidate's message (idx already assigned). */
   messages: OutMessage[];
-  /** True when the script is finished (the server then ends the session). */
+  /** True when the conversation is finished (the server then ends the session). */
   done: boolean;
   /** Order index for the candidate's own message. */
   candidateIdx: number;
+  /** Main questions skipped because time was short. */
+  skipped: number;
 }
 
 /**
  * Applies one candidate message. Off-script messages (instruction changes, asking to be graded,
- * questions about the role) get a fixed reply and the current question again; the cursor
- * does not move. Answers move to a probe (if one was chosen and allowed) or the next question.
+ * questions about the role) get a fixed reply and the current question again; the cursor does
+ * not move. Answers move to the supplied follow-up (if allowed) or the next question.
  */
-export function applyTurn(plan: InterviewPlan, progress: Progress, decision: TurnDecision): TurnResult {
+export function applyTurn(plan: InterviewPlan, progress: Progress, decision: TurnDecision, opts: { remainingMs?: number } = {}): TurnResult {
   if (progress.done) throw new Error("interview_script_finished");
   const candidateIdx = progress.msgCount;
   const total = plan.questions.length;
-  const next = (p: Omit<Progress, "turn" | "msgCount">, out: OutMessage[]): TurnResult => {
+  const next = (p: Omit<Progress, "turn" | "msgCount">, out: OutMessage[], skipped = 0): TurnResult => {
     const messages = withIdx(out, candidateIdx + 1);
     return {
       progress: { ...p, turn: progress.turn + 1, msgCount: candidateIdx + 1 + messages.length },
       messages,
       done: p.done,
       candidateIdx,
+      skipped,
     };
   };
 
@@ -94,26 +128,33 @@ export function applyTurn(plan: InterviewPlan, progress: Progress, decision: Tur
     ]);
   }
 
-  if (decision.probeKey && canProbe(plan, progress)) {
-    const probe = unusedProbes(plan, progress).find((p) => p.key === decision.probeKey);
-    if (probe) {
-      const current: CurrentQuestion = {
-        step: "probe",
-        claimId: progress.current.claimId,
-        text: probe.text,
-        questionNo: progress.current.questionNo,
-        probeKey: probe.key as ProbeKey,
-      };
-      return next({ ...progress, probesAsked: [...progress.probesAsked, probe.key], current }, [questionMessage(current, total)]);
-    }
+  if (decision.followup && canProbe(plan, progress, opts.remainingMs)) {
+    const target: FollowupTarget = decision.followup.target;
+    const current: CurrentQuestion = {
+      step: "probe",
+      claimId: progress.current.claimId,
+      text: decision.followup.text,
+      questionNo: progress.current.questionNo,
+      probeKey: target,
+    };
+    const msg = questionMessage(current, total);
+    return next({ ...progress, probesAsked: [...progress.probesAsked, target], current }, [
+      { ...msg, meta: { ...msg.meta, followup_via: decision.followup.via } },
+    ]);
   }
 
-  const qIdx = progress.qIdx + 1;
+  const qIdx = nextQuestionIndex(plan, progress.qIdx, opts.remainingMs);
+  const skipped = Math.max(0, qIdx - progress.qIdx - 1);
   if (qIdx >= plan.questions.length) {
-    return next({ ...progress, qIdx: plan.questions.length, probesAsked: [], done: true }, []);
+    return next({ ...progress, qIdx: plan.questions.length, probesAsked: [], done: true }, [], skipped);
   }
   const current = questionAt(plan, qIdx);
-  return next({ ...progress, qIdx, probesAsked: [], current, done: false }, [questionMessage(current, total)]);
+  const msg = questionMessage(current, total);
+  return next(
+    { ...progress, qIdx, probesAsked: [], current, done: false },
+    [skipped ? { ...msg, meta: { ...msg.meta, skipped_for_time: skipped } } : msg],
+    skipped,
+  );
 }
 
 /** UI label for an interviewer message. */

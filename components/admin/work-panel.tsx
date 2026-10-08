@@ -55,6 +55,7 @@ type Submission = {
   repo_commit_sha: string | null;
   deployed_url: string | null;
   mvp_url: string | null;
+  doc_url: string | null;
   loom_url: string | null;
   loom_transcript: string | null;
   test_logins: string | null;
@@ -72,7 +73,7 @@ type PersonaMessage = { id: string; role: "candidate" | "persona"; content: stri
 type Fact = { id: string; fact: string; weight: number };
 
 const SUB_COLS =
-  "id, attempt_id, stage_key, files, repo_url, repo_commit_sha, deployed_url, mvp_url, loom_url, loom_transcript, test_logins, snapshot, word_count, word_count_total, page_count, injection_flags, review_flags, score, grading_status, created_at";
+  "id, attempt_id, stage_key, files, repo_url, repo_commit_sha, deployed_url, mvp_url, doc_url, loom_url, loom_transcript, test_logins, snapshot, word_count, word_count_total, page_count, injection_flags, review_flags, score, grading_status, created_at";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -233,6 +234,12 @@ export default async function WorkPanel({ applicationId }: { applicationId: stri
                   {sub.deployed_url && (
                     <Row label="Deployed URL">
                       <ExternalLink url={sub.deployed_url} />
+                    </Row>
+                  )}
+                  {sub.doc_url && (
+                    <Row label="Google Doc (live)">
+                      <ExternalLink url={sub.doc_url} />{" "}
+                      <span className="muted">The graded copy is the file saved at submission.</span>
                     </Row>
                   )}
                   {sub.mvp_url && (

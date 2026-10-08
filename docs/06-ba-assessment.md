@@ -7,50 +7,63 @@ There are two online parts and one live part. All data is **synthetic**: see doc
 
 The scenario mirrors a real engagement. No real names, numbers or brands are shown to candidates.
 
-## Part 1: Discovery, gaps and Spiky POV
+## How BA answers are submitted: a copy of our Google Doc template
 
-**Work window:** 4 hours from Start, intended effort about 3 hours. The open window is 7 days.
+Both BA parts are answered in a **Google Doc template** (migration 0022). For each part there are two Google Docs, built from the Word files in `assessment-kits/ba-docs/` (`python3 scripts/ba-docs/build_docs.py` regenerates them):
 
-### Candidate brief (render verbatim in the platform)
+| Part | Instructions | Answer template | Marker in the template's first line |
+|---|---|---|---|
+| 1 | `BA1-instructions.docx` | `BA1-answer-template.docx` | `CHASE-BA1` |
+| 2 | `BA2-instructions.docx` | `BA2-handoff-template.docx` | `CHASE-BA2` |
 
-> **Client:** Kopano Connect, a mobile network dealer. Their Virtual Sales team phones existing business customers to renew and upgrade contracts.
->
-> **The ask, from their GM Virtual Sales:** *"Automate our renewal outreach. WhatsApp, SMS and email, starting three months before each contract ends, and give my agents one view per customer."*
->
-> **You have:**
-> 1. `kopano_vsam_extract.xlsx`, containing four sheets:
->    - the monthly customer base export
->    - one agent's working sheet
->    - telephony stats for last month
->    - the team's daily activity log
-> 2. **A 25-minute chat with Lerato Dube, GM Virtual Sales** (the "Interview the client" tab). She is busy and answers what you ask, not what you should have asked. You can send up to 25 messages. The chat is logged and assessed.
-> 3. The open internet. AI tools are allowed and expected.
->
-> **Deliver one document (PDF or DOCX, max 1,500 words excluding appendices):**
-> 1. **Executive summary** (≤150 words): your recommendation and the decision you need from Lerato.
-> 2. **Purpose:** the business question, and what is in and out of scope.
-> 3. **Facts:** the specific, verifiable things you found, each cited to sheet/column or to the interview.
-> 4. **Insights:** the patterns that are *not* obvious. Each one should connect two or more facts or sources.
-> 5. **Spiky POV:** one to three positions a reasonable person could disagree with. For each:
->    - the evidence
->    - the strongest counter-argument
->    - why it loses here
-> 6. **Solution:** what to build first, what to fix before building, and what *not* to build.
-> 7. **Success criteria:** for each, give the metric, the baseline from the data, the target, the timeframe, and **the result that would prove you wrong**.
-> 8. **AI-use note** (≤100 words): what AI did for you, and what you did yourself.
->
-> **Appendix A: Gap log.** A table with these columns: Gap | Evidence (sheet/column/row count) | What it blocks | Severity (Critical/High/Medium/Low) | Proposed fix.
->
-> **Appendix B: Questions.** The questions you would still ask, and who you would ask.
->
-> **How you'll be assessed:**
-> - what you found
-> - what you got out of the client
-> - how well your point of view is argued and evidenced
-> - whether your success criteria are measurable
-> - how clearly you write for an executive
->
-> **Note:** we will not use your work commercially, and you keep copyright.
+**Setup (once):** upload the four files to Google Drive, open each with Google Docs, set sharing to "Anyone with the link → Viewer", and paste the links in **Admin → Work stages**. A stage answered in a template can't be started until its template link is set (the Start check refuses and the candidate's window is unchanged).
+
+**Candidate flow:** the work page shows the instructions link and a **Make a copy of the template** button (Google's `/copy` link). The candidate writes in their own copy, shares it as "Anyone with the link → Viewer" and submits the link.
+
+**At submission** the server (`lib/server/gdoc.ts`, `snapshotGoogleDoc` in `lib/server/work.ts`):
+1. takes only `docs.google.com/document/d/<id>` links, and refuses the template itself;
+2. downloads the DOCX export (only works when shared; a sign-in page or a 404 gets "share it as Anyone with the link");
+3. checks the copy still contains the template marker (refuses a document written elsewhere, or the other part's template);
+4. stores the DOCX in the candidate's submission folder. **That frozen copy is what is graded**; later edits to the live doc are never assessed. The live link is kept (`submissions.doc_url`) for reviewers.
+
+Word limits, the appendix rule, sanitising and injection screening work exactly as for an uploaded document.
+
+## Part 1: Solution and Spiky POV
+
+**Work window:** 3 hours from Start, intended effort about 2 hours. The open window is 7 days.
+
+**Why it exists:** it is the job in miniature: data from systems that don't share a key (a portal export, an agent's own sheet, a telephony platform that only exports, an activity log), a client who has asked for the wrong thing, and not much time. It tests how the candidate gets from the mess to a defensible solution, including the architecture and tech stack, and explains it to an executive.
+
+### Candidate brief
+
+The live brief is `work_stages.brief_md` for `ba_part1` (set by migration 0022) and is the same content as `BA1-instructions.docx`. In short:
+
+- **The ask (Lerato Dube, GM Virtual Sales):** "Automate our renewal outreach. WhatsApp, SMS and email, starting three months before each contract ends, and give my agents one view per customer."
+- **They have:** `kopano_vsam_extract.xlsx` (four sheets: base export, one agent's working sheet, telephony stats, activity log), a 25-minute chat with Lerato (assessed), the internet and AI tools.
+- **The template's sections:**
+  1. Executive summary (≤150 words)
+  2. The problem
+  3. What the data shows (facts table + insights)
+  4. Spiky POV (position / evidence / counter-argument / why it loses)
+  5. **Solution: architecture and tech stack**
+     - fix before building
+     - what to build first and later
+     - systems and data flow (a table per system: what it holds, how data gets in/out, how often, source of truth)
+     - tech stack and why, with rough monthly cost in rands
+     - what not to build
+  6. Success criteria (metric, baseline, target, by when, result that would prove you wrong)
+  7. Risks and open questions
+  8. AI-use note (≤100 words)
+  - Appendix A: gap log
+  - Appendix B: questions
+- **Limit:** 1,500 words before Appendix A (guidance text left in counts).
+- **What we look for:**
+  - what they found and how they prove it
+  - what they got out of Lerato
+  - a debatable, evidenced POV with the counter-argument answered
+  - a practical, phased architecture for disconnected systems and messy data
+  - measurable success criteria
+  - executive writing
 
 ### The stakeholder persona (AI, OpenRouter)
 
@@ -123,17 +136,18 @@ The grader maps each gap-log row and memo claim to these IDs. Partial credit app
 
 **What "great" looks like.** The candidate realises that the client's ask, *automated omnichannel outreach*, is **blocked** by D01 + D02 + D05 + D23 + H03 + H04 + H11. Automating outreach to an uncontactable, consent-unclear base risks the sender account and the dealer agreement. A great memo reframes the problem as **contactability + next-action discipline first, channels second**. See doc 13.
 
-### Rubric: Part 1
+### Rubric: Part 1 (version 2, live from migration 0022)
 
-Full anchors are in doc 09.
+Full anchors are in doc 09 and `lib/grading/rubrics/ba-part1.ts` (`BA_PART1_V2`). Version 1 (without the architecture criterion) is retired but kept for history. **Re-run the gold set before relying on v2 grades** (CLAUDE.md).
 
 | Criterion | Weight |
 |---|---|
-| Gap recall (weighted, from the key above) | 25% |
-| Elicitation yield (weighted hidden facts, plus quality of questioning) | 20% |
+| Gap recall (weighted, from the key above) | 20% |
+| Elicitation yield (weighted hidden facts, plus quality of questioning) | 15% |
 | Spiky POV quality (7 sub-criteria, doc 09 §3) | 25% |
+| **Solution, architecture and tech stack** (fix first, build first, data flow across exports/no-API systems, justified low-cost stack, what not to build, each choice traced to a finding) | 15% |
 | Success criteria (baseline, target, timeframe, kill condition) | 10% |
-| Research quality and relevance (POPIA s69, WhatsApp rules, CPA opt-out registry, benchmarks; sourced; filtered) | 10% |
+| Research quality and relevance (POPIA s69, WhatsApp rules, CPA opt-out registry, benchmarks; sourced; filtered) | 5% |
 | Executive communication (doc 09 §4) | 10% |
 
 ## Part 2: Build and handoff
@@ -161,7 +175,7 @@ Full anchors are in doc 09.
 >    - **Log outcome:** a callback date is **required** for "Call back"; quote, sale and not-interested outcomes all available
 >    - **Message:** compose from an approved template, blocked if there's no consent or the customer has opted out; queued, not actually sent
 >    - **Manager exceptions view:** missing next actions, overdue callbacks, customers with no valid contact point
-> 3. **Handoff pack for the engineer** (DOCX/PDF/MD) using our template:
+> 3. **Handoff pack for the engineer**, written in **your own copy** of our handoff template (Google Doc, `BA2-handoff-template.docx`; submitted as a link, frozen at submission):
 >    - the problem and the POV in 5 lines
 >    - user stories with Given/When/Then acceptance criteria
 >    - business rules (eligibility, consent, allocation, deduplication)

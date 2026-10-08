@@ -60,12 +60,14 @@ export type FileField = {
 };
 
 export type TextField = {
-  kind: "url" | "repo" | "text" | "transcript";
-  name: "mvp_url" | "repo_url" | "deployed_url" | "loom_url" | "loom_transcript" | "test_logins";
+  kind: "url" | "repo" | "text" | "transcript" | "gdoc";
+  name: "mvp_url" | "repo_url" | "deployed_url" | "loom_url" | "loom_transcript" | "test_logins" | "doc_url";
   label: string;
   help?: string;
   required: boolean;
   placeholder?: string;
+  /** A Google Doc link whose copy (downloaded at submission) is the stage's main document. */
+  main?: boolean;
 };
 
 export type FieldDef = FileField | TextField;
@@ -91,12 +93,12 @@ const LOOM: TextField[] = [
 export const STAGE_FIELDS: Record<StageKey, readonly FieldDef[]> = {
   ba_part1: [
     {
-      kind: "file",
-      name: "memo",
-      label: "Your memo",
-      help: "One PDF or DOCX, at most 1,500 words before your first “Appendix” heading (a contents list doesn't count as one).",
-      exts: ["pdf", "docx"],
+      kind: "gdoc",
+      name: "doc_url",
+      label: "Link to your copy of the answer template",
+      help: "Your own copy (Make a copy), shared as “Anyone with the link → Viewer”. At most 1,500 words before Appendix A. We save a copy of it when you submit.",
       required: true,
+      placeholder: "https://docs.google.com/document/d/…",
       main: true,
     },
   ],
@@ -110,12 +112,12 @@ export const STAGE_FIELDS: Record<StageKey, readonly FieldDef[]> = {
       placeholder: "https://…",
     },
     {
-      kind: "file",
-      name: "handoff",
-      label: "Handoff pack",
-      help: "DOCX, PDF or Markdown. Include the data model (table definitions and grain) here or as an extra file.",
-      exts: ["pdf", "docx", "md"],
+      kind: "gdoc",
+      name: "doc_url",
+      label: "Link to your copy of the handoff template",
+      help: "Your own copy (Make a copy), shared as “Anyone with the link → Viewer”. Put the data model (table definitions and grain) in it, or add the ERD as an extra file. We save a copy of it when you submit.",
       required: true,
+      placeholder: "https://docs.google.com/document/d/…",
       main: true,
     },
     {
@@ -208,4 +210,13 @@ export function displayName(path: string): string {
 /** Where the browser uploads a work file: submissions/{userId}/{attemptId}/{timestamp}-{safe name}. */
 export function uploadPath(userId: string, attemptId: string, fileName: string, now = Date.now()): string {
   return `${userId}/${attemptId}/${now}-${safeFileName(fileName)}`;
+}
+
+/** The field holding the stage's main document (a file upload or a Google Doc link), if any. */
+export function mainFieldName(key: StageKey): string | null {
+  return STAGE_FIELDS[key].find((f) => f.main)?.name ?? null;
+}
+
+export function gdocField(key: StageKey): TextField | null {
+  return textFields(key).find((f) => f.kind === "gdoc") ?? null;
 }

@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { RubricCriterion } from "@/lib/grading/schema";
-import { rubricProblems, WORK_RUBRICS } from "@/lib/grading/rubrics";
-import { renderRubricInserts } from "@/lib/grading/rubrics/sql";
-import { BA_PART1, GAP_KEY, HIDDEN_FACTS } from "@/lib/grading/rubrics/ba-part1";
+import { ACTIVE_WORK_RUBRICS, rubricProblems, WORK_RUBRICS } from "@/lib/grading/rubrics";
+import { renderRubricInsert, renderRubricInserts } from "@/lib/grading/rubrics/sql";
+import { BA_PART1, BA_PART1_V2, GAP_KEY, HIDDEN_FACTS } from "@/lib/grading/rubrics/ba-part1";
 import { FAULT_KEY } from "@/lib/grading/rubrics/swe-test1";
 import { ARCH_KEY, RED_FLAGS, SWE_TEST2 } from "@/lib/grading/rubrics/swe-test2";
 import { loadPrompt } from "@/lib/prompts";
@@ -13,6 +13,33 @@ import { fillFigures } from "@/lib/synth/answer-key";
 const MIGRATION = fs.readFileSync(path.join(process.cwd(), "supabase/migrations/20261007000012_wave3_rubrics_seed.sql"), "utf8");
 const sum = (xs: readonly { weight: number }[]) => xs.reduce((s, x) => s + x.weight, 0);
 const byKey = Object.fromEntries(WORK_RUBRICS.map((r) => [r.key, r]));
+
+describe("BA Part 1 rubric v2 (migration 0022)", () => {
+  const M22 = fs.readFileSync(path.join(process.cwd(), "supabase/migrations/20261007000022_ba_google_doc_answers.sql"), "utf8");
+
+  it("adds the solution/architecture criterion and re-weights to 100; everything else is v1", () => {
+    expect(rubricProblems(BA_PART1_V2)).toEqual([]);
+    expect(Object.fromEntries(BA_PART1_V2.criteria.map((c) => [c.key, c.weight]))).toEqual({
+      gap_recall: 20,
+      elicitation: 15,
+      spiky_pov: 25,
+      solution_architecture: 15,
+      success_criteria: 10,
+      research: 5,
+      exec_comms: 10,
+    });
+    expect(BA_PART1_V2.reference).toBe(BA_PART1.reference);
+    for (const c of BA_PART1.criteria) {
+      expect({ ...BA_PART1_V2.criteria.find((x) => x.key === c.key), weight: c.weight }).toEqual(c);
+    }
+    expect(ACTIVE_WORK_RUBRICS.map((r) => `${r.key}@${r.version}`)).toEqual(["ba_part1@2", "ba_part2@1", "swe_test1@1", "swe_test2@1"]);
+  });
+
+  it("the migration seeds exactly the TS definition and retires v1", () => {
+    expect(M22).toContain(renderRubricInsert(BA_PART1_V2));
+    expect(M22).toMatch(/update public\.rubrics set active = false where key = 'ba_part1' and version = 1;/);
+  });
+});
 
 describe("work rubrics (migration 0012 seed)", () => {
   it("defines the four stage rubrics, version 1, with valid shapes", () => {

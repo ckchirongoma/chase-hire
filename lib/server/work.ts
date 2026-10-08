@@ -11,16 +11,23 @@ import { DraftSchema, parseSubmission, type Draft } from "@/lib/work/schema";
 import {
   DATASET_URL_TTL_S,
   displayName,
+  EXT_MIME,
   extOf,
   fileFields,
+  gdocField,
   isStageKey,
+  mainFieldName,
   TEXT_EXTS,
+  uploadPath,
   WORK_GRACE_MS,
   type AppStage,
   type FileExt,
   type FileField,
   type StageKey,
+  type TextField,
 } from "@/lib/work/stages";
+import { parseGoogleDocUrl, parseMaterials, TEMPLATE_MARKERS } from "@/lib/work/gdoc";
+import { downloadGoogleDoc, GoogleDocError } from "@/lib/server/gdoc";
 import { storableText } from "@/lib/work/text";
 import { intervalToMs } from "@/lib/work/time";
 import type { DatasetFile, WorkStatus, WorkView } from "@/lib/work/types";
@@ -92,9 +99,10 @@ type StageRow = {
   word_limit: number | null;
   page_limit: number | null;
   active: boolean;
+  materials: Record<string, unknown> | null;
 };
 const STAGE_COLS =
-  "id, role_slug, key, app_stage, title, brief_md, intended_effort, open_window, work_window, dataset_bundle, rubric_key, word_limit, page_limit, active";
+  "id, role_slug, key, app_stage, title, brief_md, intended_effort, open_window, work_window, dataset_bundle, rubric_key, word_limit, page_limit, active, materials";
 
 type AppRow = { id: string; user_id: string; role_id: string; stage: string; status: string };
 const APP_COLS = "id, user_id, role_id, stage, status";
@@ -124,12 +132,14 @@ type SubmissionRow = {
   deployed_url: string | null;
   mvp_url: string | null;
   loom_url: string | null;
+  doc_url: string | null;
   word_count: number | null;
   page_count: number | null;
   grading_status: string;
   created_at: string;
 };
-const SUBMISSION_COLS = "id, attempt_id, user_id, stage_key, files, repo_url, deployed_url, mvp_url, loom_url, word_count, page_count, grading_status, created_at";
+const SUBMISSION_COLS =
+  "id, attempt_id, user_id, stage_key, files, repo_url, deployed_url, mvp_url, loom_url, doc_url, word_count, page_count, grading_status, created_at";
 
 type Ctx = { stage: StageRow; app: AppRow | null; attempt: AttemptRow | null; submission: SubmissionRow | null };
 type LiveCtx = Ctx & { app: AppRow; attempt: AttemptRow };
@@ -215,6 +225,7 @@ function toView(ctx: Ctx, now = Date.now()): WorkView {
   if (submission) {
     if (submission.repo_url) links.push({ name: "Repository", url: submission.repo_url });
     if (submission.deployed_url) links.push({ name: "Deployed URL", url: submission.deployed_url });
+    if (submission.doc_url) links.push({ name: "Google Doc", url: submission.doc_url });
     if (submission.mvp_url) links.push({ name: "MVP", url: submission.mvp_url });
     if (submission.loom_url) links.push({ name: "Loom", url: submission.loom_url });
   }
@@ -236,6 +247,7 @@ function toView(ctx: Ctx, now = Date.now()): WorkView {
       pageLimit: stage.page_limit,
       hasPersona: key === "ba_part1",
       hasDatasets: !!stage.dataset_bundle,
+      materials: parseMaterials(stage.materials),
     },
     attempt: attempt
       ? {
@@ -389,7 +401,14 @@ async function listFolder(admin: SupabaseClient, prefix: string, depth: number):
  * an empty {bundle}/candidate/ folder, or a README there that still holds a generator placeholder
  * (e.g. the SWE Test 1 starter-repo link). Start is refused until it is fixed.
  */
-export async function stageMaterialsProblem(admin: SupabaseClient, stage: Pick<StageRow, "dataset_bundle">): Promise<string | null> {
+export async function stageMaterialsProblem(
+  admin: SupabaseClient,
+  stage: Pick<StageRow, "dataset_bundle"> & Partial<Pick<StageRow, "key" | "materials">>,
+): Promise<string | null> {
+  // A stage answered in a Google Doc needs its template link (admin → Work stages).
+  if (stage.key && isStageKey(stage.key) && gdocField(stage.key) && !parseMaterials(stage.materials).templateCopyUrl) {
+    return `no answer template link set for ${stage.key}`;
+  }
   const bundle = stage.dataset_bundle;
   if (!bundle) return null;
   if (!BUNDLE_RE.test(bundle)) return `invalid dataset bundle ${bundle}`;
@@ -526,6 +545,65 @@ async function readUploads(admin: SupabaseClient, userId: string, attemptId: str
   return out;
 }
 
+/** How long the Google Doc download may take; it never runs past the deadline (plus grace). */
+const GDOC_BUDGET_MS = 20_000;
+
+/**
+ * Downloads the candidate's copy of the answer template (DOCX export) into their submission
+ * folder: that frozen copy is what we grade, whatever happens to the doc later. Refuses the
+ * template itself, a doc that isn't shared, and a doc that isn't a copy of our template.
+ */
+async function snapshotGoogleDoc(
+  admin: SupabaseClient,
+  userId: string,
+  attemptId: string,
+  ctx: Ctx,
+  field: TextField,
+  link: string,
+): Promise<{ url: string; file: ReadFile }> {
+  const doc = parseGoogleDocUrl(link);
+  if (!doc) throw new WorkError("Use the link to your Google Doc, like https://docs.google.com/document/d/…/edit", 400, { field: field.name });
+  const template = parseGoogleDocUrl(parseMaterials(ctx.stage.materials).templateUrl);
+  if (template && template.id === doc.id) {
+    throw new WorkError("That's the link to our template, not your copy. Use Make a copy, write your answers in the copy, and submit its link.", 400, {
+      field: field.name,
+    });
+  }
+  const deadline = ctx.attempt?.deadline_at;
+  const left = deadline ? new Date(deadline).getTime() + WORK_GRACE_MS - Date.now() : GDOC_BUDGET_MS;
+  let buf: Buffer;
+  try {
+    buf = await downloadGoogleDoc(doc.id, Math.max(1000, Math.min(GDOC_BUDGET_MS, left)));
+  } catch (e) {
+    const kind = e instanceof GoogleDocError ? e.kind : "unavailable";
+    const msg =
+      kind === "not_shared"
+        ? "We couldn't open your document. In Google Docs press Share, set General access to “Anyone with the link” (Viewer), then submit again."
+        : kind === "too_large"
+          ? "Your document is larger than 20 MB. Remove large images and submit again."
+          : "We couldn't download your document from Google just now. Please try again in a moment.";
+    throw new WorkError(msg, kind === "not_shared" || kind === "too_large" ? 422 : 503, { field: field.name });
+  }
+  let text: string;
+  try {
+    text = (await readDocument(buf, "docx")).text;
+  } catch {
+    throw new WorkError("We couldn't read your Google Doc. Check it opens normally and submit again.", 422, { field: field.name });
+  }
+  const marker = TEMPLATE_MARKERS[ctx.stage.key as StageKey];
+  if (marker && !text.includes(marker)) {
+    throw new WorkError(
+      `This document isn't a copy of our template (its first line, with “${marker}”, is missing). Use Make a copy on the template, write your answers there, and keep that first line.`,
+      422,
+      { field: field.name },
+    );
+  }
+  const path = uploadPath(userId, attemptId, `${field.name.replace(/_url$/, "")}-google-doc.docx`);
+  const { error } = await admin.storage.from("submissions").upload(path, buf, { contentType: EXT_MIME.docx, upsert: false });
+  if (error) throw new WorkError("We couldn't save a copy of your document. Please try again.", 503, { field: field.name });
+  return { url: doc.url, file: { slot: field.name, path, name: "Google Doc (copy at submission).docx", ext: "docx", text, pdfPages: null } };
+}
+
 /**
  * Submits the stage: validates per stage, checks the uploads (own prefix, type, readable),
  * enforces the word/page limit, sanitises, then freezes the submission in one transaction
@@ -545,8 +623,15 @@ export async function submitWork(admin: SupabaseClient, userId: string, attemptI
   const data = parsed.data as Record<string, unknown>;
 
   const files = await readUploads(admin, userId, attemptId, key, data);
-  const mainField = fileFields(key).find((f) => f.main);
-  const main = mainField ? files.find((f) => f.slot === mainField.name) : undefined;
+  const gdoc = gdocField(key);
+  let docUrl: string | null = null;
+  if (gdoc && typeof data[gdoc.name] === "string") {
+    const copy = await snapshotGoogleDoc(admin, userId, attemptId, ctx, gdoc, data[gdoc.name] as string);
+    docUrl = copy.url;
+    files.unshift(copy.file);
+  }
+  const mainName = mainFieldName(key);
+  const main = mainName ? files.find((f) => f.slot === mainName) : undefined;
 
   const flags: InjectionFlag[] = [];
   const rawSections: string[] = [];
@@ -582,7 +667,7 @@ export async function submitWork(admin: SupabaseClient, userId: string, attemptI
     pageCount = main.pdfPages ?? estimatePages(split.totalWords);
     if (wordLimit !== null && wordCount > wordLimit) {
       throw new WorkError(
-        `Your memo body is ${formatCount(wordCount)} words. The limit is ${formatCount(wordLimit)} words, not counting appendices (everything from your first “Appendix” heading; a contents list doesn't count as one). Shorten it and upload it again.`,
+        `Your memo body is ${formatCount(wordCount)} words. The limit is ${formatCount(wordLimit)} words, not counting appendices (everything from your first “Appendix” heading; a contents list doesn't count as one). Shorten it and submit it again.`,
         422,
         { field: main.slot, word_count: wordCount, word_limit: wordLimit },
       );
@@ -629,6 +714,7 @@ export async function submitWork(admin: SupabaseClient, userId: string, attemptI
     deployed_url: (data.deployed_url as string | undefined) ?? null,
     mvp_url: (data.mvp_url as string | undefined) ?? null,
     loom_url: (data.loom_url as string | undefined) ?? null,
+    doc_url: docUrl,
     loom_transcript: sanitisedText(data.loom_transcript, "loom_transcript"),
     test_logins: sanitisedText(data.test_logins, "test_logins"),
     extracted_text: docs.length ? rawSections.join("\n\n") : null,

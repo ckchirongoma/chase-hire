@@ -6,6 +6,7 @@ vi.mock("@/lib/supabase/server", () => ({ createClient: async () => h.client }))
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getPersonaState, loadPersonaEvidence, PersonaConflict, postPersonaMessage, startPersona } from "@/lib/server/persona";
+import { gdoc, startGoogleDocs, stopGoogleDocs, templateCopy } from "../helpers/gdocs";
 import { getWorkState, startWork, submitWork } from "@/lib/server/work";
 import { CLOSING_CAP, CLOSING_TIMEOUT, OFF_SCRIPT_REPLY, OPENING_LINE, RETRY_REPLY } from "@/lib/persona/facts";
 import type { PersonaView } from "@/lib/persona/types";
@@ -35,8 +36,12 @@ async function ensureCandidateFiles() {
     bundlePlaceholders.push(path);
   }
 }
-beforeAll(ensureCandidateFiles);
+beforeAll(async () => {
+  await ensureCandidateFiles();
+  await startGoogleDocs();
+});
 afterAll(async () => {
+  await stopGoogleDocs();
   if (bundlePlaceholders.length) await admin.storage.from("datasets").remove(bundlePlaceholders.splice(0));
 });
 
@@ -195,17 +200,9 @@ describe("BA Part 1 persona chat (local DB + AI/JEV stubs)", () => {
   });
 
   it("submitting the assessment closes the chat", async () => {
-    const memo = `${c.id}/${c.attemptId}/1-memo.md`;
-    await admin.storage.from("submissions").upload(memo, Buffer.from("# memo"), { contentType: "text/markdown" });
     const d = await candidate("persona-submit");
     await startPersona(admin, d.id, d.attemptId);
-    const path = `${d.id}/${d.attemptId}/1-memo.pdf`;
-    const pdf = Buffer.from(
-      "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n5 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf 50 800 Td (My memo text) Tj ET\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n",
-      "latin1",
-    );
-    await admin.storage.from("submissions").upload(path, pdf, { contentType: "application/pdf" });
-    await submitWork(admin, d.id, d.attemptId, { memo: path });
+    await submitWork(admin, d.id, d.attemptId, { doc_url: gdoc(templateCopy("ba_part1")) });
     const state = (await getPersonaState(admin, d.id, d.attemptId)) as Live;
     expect(state).toMatchObject({ status: "closed", closedReason: "submitted" });
     await expect(postPersonaMessage(admin, d.id, d.attemptId, "one more?")).rejects.toBeInstanceOf(PersonaConflict);

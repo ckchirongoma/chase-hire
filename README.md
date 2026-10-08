@@ -65,6 +65,10 @@ A lock is never a rejection.
    `assessment-kits/README.md` (internal; never shown to candidates).
 7. **Assessment data.** Generate and upload the synthetic datasets with `scripts/synth/` (see
    `docs/11`). Real client material in `context/` never reaches candidates.
+8. **BA Google Docs.** Upload the four Word files in `assessment-kits/ba-docs/` to Google Drive, open
+   each with Google Docs, share as "Anyone with the link → Viewer", and paste the links in
+   **Admin → Work stages**. BA candidates answer in their own copy of the template and submit its
+   link; the platform saves a copy at submission and grades that (docs/06).
 
 ## Local development
 

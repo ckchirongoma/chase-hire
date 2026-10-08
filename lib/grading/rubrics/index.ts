@@ -1,5 +1,5 @@
 import { GRADER_PROMPTS, RUBRIC_METHODS, RubricCriterion, type RubricSubcriterion } from "../schema";
-import { BA_PART1 } from "./ba-part1";
+import { BA_PART1, BA_PART1_V2 } from "./ba-part1";
 import { BA_PART2 } from "./ba-part2";
 import { SWE_TEST1 } from "./swe-test1";
 import { SWE_TEST2 } from "./swe-test2";
@@ -12,6 +12,9 @@ import type { RubricDefinition } from "./types";
  */
 
 export const WORK_RUBRICS: readonly RubricDefinition[] = [BA_PART1, BA_PART2, SWE_TEST1, SWE_TEST2];
+
+/** The rubric versions graders use now (later versions arrive in later migrations: BA Part 1 v2 in 0022). */
+export const ACTIVE_WORK_RUBRICS: readonly RubricDefinition[] = [BA_PART1_V2, BA_PART2, SWE_TEST1, SWE_TEST2];
 export type { RubricDefinition };
 
 /** Reference blocks built at grading time from the stage's dataset bundle, not stored in the rubric. */

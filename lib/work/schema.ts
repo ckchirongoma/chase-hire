@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DRAFT_MAX_BYTES, MAX_EXTRA_FILES, MAX_TRANSCRIPT_CHARS, type StageKey } from "./stages";
+import { parseGoogleDocUrl } from "./gdoc";
 import { parseGithubRepo, parseHttpsUrl } from "./url";
 
 /**
@@ -36,6 +37,14 @@ const FilePath = z
   .max(500)
   .refine((v) => !v.includes("..") && !v.startsWith("/") && !v.includes("\\"), "Invalid file path");
 
+const GoogleDocUrl = z
+  .string()
+  .trim()
+  .min(1, "Add the link to your copy of the template")
+  .max(2048, "That link is too long")
+  .refine((v) => parseGoogleDocUrl(v) !== null, "Use the link to your Google Doc, like https://docs.google.com/document/d/…/edit")
+  .transform((v) => parseGoogleDocUrl(v)!.url);
+
 const TestLogins = z
   .string()
   .trim()
@@ -43,10 +52,10 @@ const TestLogins = z
   .max(4000, "Keep the test logins under 4,000 characters");
 
 export const SubmissionSchemas = {
-  ba_part1: z.strictObject({ memo: FilePath }),
+  ba_part1: z.strictObject({ doc_url: GoogleDocUrl }),
   ba_part2: z.strictObject({
     mvp_url: HttpsUrl,
-    handoff: FilePath,
+    doc_url: GoogleDocUrl,
     extras: z.array(FilePath).max(MAX_EXTRA_FILES, `At most ${MAX_EXTRA_FILES} extra files`).default([]),
     loom_url: HttpsUrl,
     loom_transcript: Transcript,

@@ -4,7 +4,7 @@ import { gradeSubmission } from "@/lib/server/grade-submission";
 import { generateBaseline } from "@/lib/server/baseline";
 import { aggregateParent, answerKeyCoverage, gapRecall, shareToScore, stageScore, type RedFlagRule } from "@/lib/grading";
 import { buildBundleA } from "@/lib/synth/bundle-a";
-import { BA_PART1 } from "@/lib/grading/rubrics/ba-part1";
+import { BA_PART1, BA_PART1_V2 } from "@/lib/grading/rubrics/ba-part1";
 import { ARCH_KEY, RED_FLAGS } from "@/lib/grading/rubrics/swe-test2";
 import { consent, fakeFinishedAttempt, fakeParsedCv, makeAdmin, newUser, psql, service } from "../helpers/local";
 
@@ -151,13 +151,13 @@ beforeAll(async () => {
   await ensureAnswerKey(stages.get("ba_part1")!.dataset_bundle ?? "v1/bundle_a");
   boss = await newUser("subgrade-admin");
   await makeAdmin(boss.id);
-  const { data: r } = await admin.from("rubrics").select("generic_baseline").eq("key", "ba_part1").eq("version", 1).single();
+  const { data: r } = await admin.from("rubrics").select("generic_baseline").eq("key", "ba_part1").eq("version", 2).single();
   savedBaseline = r?.generic_baseline ?? null;
-  await admin.from("rubrics").update({ generic_baseline: null }).eq("key", "ba_part1").eq("version", 1);
+  await admin.from("rubrics").update({ generic_baseline: null }).eq("key", "ba_part1").eq("version", 2);
 }, 60_000);
 
 afterAll(async () => {
-  await admin.from("rubrics").update({ generic_baseline: savedBaseline }).eq("key", "ba_part1").eq("version", 1);
+  await admin.from("rubrics").update({ generic_baseline: savedBaseline }).eq("key", "ba_part1").eq("version", 2);
 });
 
 // ───────────────────────── BA Part 1 ─────────────────────────
@@ -235,7 +235,7 @@ describe("BA Part 1 submission grading", () => {
     expect(expected.points).toBe(17);
     expect(num(first.summary("gap_recall").median_score)).toBeCloseTo(expected.score, 2);
     expect(perSample[0]).toBeCloseTo(gapRecall({ ...credits, D04: 0 }, items.items, 40).score, 2);
-    expect(first.summary("gap_recall")).toMatchObject({ needs_human_review: false, weight: 25 });
+    expect(first.summary("gap_recall")).toMatchObject({ needs_human_review: false, weight: 20 });
   });
 
   it("computes elicitation yield from the revealed facts (/30) and averages it with question quality", () => {
@@ -261,7 +261,7 @@ describe("BA Part 1 submission grading", () => {
     expect(num(parent.median_score)).toBeCloseTo((2 + 3 * 6) / 7, 2);
     expect(num(first.summary("exec_comms").median_score)).toBe(3);
 
-    const top = BA_PART1.criteria.map((c) => ({ weight: c.weight, final: num(first.summary(c.key).final_score) }));
+    const top = BA_PART1_V2.criteria.map((c) => ({ weight: c.weight, final: num(first.summary(c.key).final_score) }));
     expect(top.every((t) => t.final !== null)).toBe(true);
     expect(num(first.sub.score)).toBeCloseTo(stageScore(top)!, 1);
     expect(first.sub.grading_status).toBe("needs_review");
@@ -290,7 +290,7 @@ describe("BA Part 1 submission grading", () => {
     expect(get("spiky_pov").needs_human_review).toBe(false);
 
     const { data: sub } = await admin.from("submissions").select("score, grading_status").eq("id", subId).single();
-    const top = BA_PART1.criteria.map((c) => ({ weight: c.weight, final: num(get(c.key).final_score) }));
+    const top = BA_PART1_V2.criteria.map((c) => ({ weight: c.weight, final: num(get(c.key).final_score) }));
     expect(num(sub!.score)).toBeCloseTo(stageScore(top)!, 1);
     expect(num(sub!.score)).toBeGreaterThan(num(first.sub.score)!);
     expect(sub!.grading_status).toBe("done");

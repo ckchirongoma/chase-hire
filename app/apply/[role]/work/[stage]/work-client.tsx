@@ -202,6 +202,7 @@ export default function WorkClient({ initial, userId, brief }: { initial: WorkVi
           <h2 className="h2">The brief</h2>
           {brief}
         </section>
+        {view.stage.materials.templateCopyUrl && <Materials materials={view.stage.materials} />}
         {view.stage.hasDatasets && <Downloads attemptId={attemptId} />}
         <SubmissionForm view={view} userId={userId} attemptId={attemptId} pastDeadline={pastDeadline} onSubmitted={apply} busy={busy} setBusy={setBusy} />
       </div>
@@ -531,6 +532,41 @@ function FieldInput({
         />
       )}
     </div>
+  );
+}
+
+// ───────────────────────── Google Doc materials ─────────────────────────
+
+function Materials({ materials }: { materials: WorkView["stage"]["materials"] }) {
+  return (
+    <section className="card space-y-3" data-testid="materials">
+      <h2 className="h2">Your answer document</h2>
+      <ol className="list-decimal space-y-2 pl-5 text-sm">
+        {materials.instructionsUrl && (
+          <li>
+            Read the instructions:{" "}
+            <a href={materials.instructionsUrl} target="_blank" rel="noopener noreferrer" className="underline">
+              open the instructions (Google Doc)
+            </a>
+            .
+          </li>
+        )}
+        <li>
+          Make your own copy of the answer template and write in it. Only your copy is assessed.
+          <div className="mt-2">
+            <a href={materials.templateCopyUrl!} target="_blank" rel="noopener noreferrer" className="btn">
+              Make a copy of the template
+            </a>
+          </div>
+        </li>
+        <li>Replace the grey guidance text as you go, and keep the template&apos;s first line.</li>
+        <li>
+          When you&apos;re done: in Google Docs press <strong>Share</strong>, set General access to{" "}
+          <strong>Anyone with the link</strong> (Viewer), copy the link and paste it below. We save a copy of your document
+          when you submit; later edits aren&apos;t assessed.
+        </li>
+      </ol>
+    </section>
   );
 }
 

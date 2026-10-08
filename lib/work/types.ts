@@ -1,3 +1,4 @@
+import type { StageMaterials } from "./gdoc";
 import type { Draft } from "./schema";
 import type { AppStage, StageKey } from "./stages";
 
@@ -30,6 +31,8 @@ export interface WorkStageView {
   pageLimit: number | null;
   hasPersona: boolean;
   hasDatasets: boolean;
+  /** Instructions and answer-template links (Google Docs), for stages answered in a template copy. */
+  materials: StageMaterials;
 }
 
 export interface WorkAttemptView {

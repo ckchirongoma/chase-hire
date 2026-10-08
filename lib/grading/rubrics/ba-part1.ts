@@ -240,3 +240,48 @@ export const BA_PART1: RubricDefinition = {
     gold_source: GOLD.source,
   },
 };
+
+/**
+ * BA Part 1, version 2 (live from migration 0022): the answer is written in a copy of our Google
+ * Doc template and adds a "Solution: architecture and tech stack" section, graded on its own.
+ * Weights move to make room for it; everything else is version 1 unchanged. A gold-set re-run is
+ * due before relying on these grades (CLAUDE.md).
+ */
+const V2_WEIGHTS: Record<string, number> = {
+  gap_recall: 20,
+  elicitation: 15,
+  spiky_pov: 25,
+  solution_architecture: 15,
+  success_criteria: 10,
+  research: 5,
+  exec_comms: 10,
+};
+
+const SOLUTION_ARCHITECTURE: RubricDefinition["criteria"][number] = {
+  key: "solution_architecture",
+  title: "Solution, architecture and tech stack",
+  weight: 15,
+  method: "llm",
+  prompt: "grader-criterion",
+  evidence_required: true,
+  sources: ["memo"],
+  reference_keys: ["gold_solution", "bundle_figures"],
+  description:
+    "Whether the proposed solution and architecture fit this client's reality: disconnected systems (the telephony platform only exports, it has no API), messy data, unclear requirements and messy operations. Covers what to fix before building, what to build first, how data moves between the systems, the stack and why, phasing, and what not to build.",
+  anchors: {
+    "1": "A generic tool list or \"buy an omnichannel platform\"; ignores the data and integration constraints; no phasing; builds what the client asked for without question",
+    "3": "A sensible first build and a stack choice, but the integration constraints (exports instead of APIs, no customer key, consent per contact point) are only partly handled, or the phasing and what-not-to-build are thin",
+    "5": "A phased, buildable design that starts from the data: one customer record and verified contact points before channels; realistic integration given exports and no API (scheduled imports, reconciliation, a single place for outcomes); a justified, low-cost stack; explicit what to fix first and what not to build; every choice traced to a finding or a POV",
+  },
+};
+
+export const BA_PART1_V2: RubricDefinition = {
+  ...BA_PART1,
+  version: 2,
+  title: "BA Part 1: solution and Spiky POV (Google Doc template)",
+  criteria: [
+    ...BA_PART1.criteria.slice(0, 3),
+    SOLUTION_ARCHITECTURE,
+    ...BA_PART1.criteria.slice(3),
+  ].map((c) => ({ ...c, weight: V2_WEIGHTS[c.key] ?? c.weight })),
+};

@@ -50,6 +50,7 @@ export async function buildBundles(opts: BuildOptions): Promise<BuiltFile[]> {
     { path: `bundle_c/candidate/${C_FILES.contacts}`, content: await workbookBuffer(c.contacts) },
     { path: `bundle_c/candidate/${C_FILES.optouts}`, content: await workbookBuffer(c.optouts) },
     { path: "bundle_c/candidate/README.md", content: text(opts.starterRepoUrl ? fillStarterRepoUrl(c.readme, opts.starterRepoUrl) : c.readme) },
+    { path: `bundle_c/candidate/${C_FILES.handoff}`, content: text(c.handoff) },
     { path: `bundle_c/internal/${C_FILES.month2}`, content: await workbookBuffer(c.month2) },
     { path: `bundle_c/internal/${C_FILES.drift}`, content: await workbookBuffer(c.drift) },
     { path: `bundle_c/internal/${C_FILES.expected}`, content: json(c.expected) },

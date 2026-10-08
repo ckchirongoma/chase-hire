@@ -3,7 +3,7 @@ import { PRICE_PLANS } from "@/lib/synth/base";
 import { normaliseCompanyName } from "@/lib/synth/names";
 import { fail, inconclusive, pass, snippet, type CheckKey, type CheckResult, type Evidence } from "./checks";
 import type { HarnessExpected } from "./expected";
-import { crawlPublic, findSupabase, newFrontEnd, signInAll, type SupabaseTarget } from "./frontend";
+import { connect, type SupabaseTarget } from "./frontend";
 import { BudgetExceeded, describeError, multipartFile, SsrfError, type Http } from "./http";
 import { describeLogins, type ParsedLogins } from "./logins";
 import { appAuthHeaders, inList, type Session } from "./supabase";
@@ -31,6 +31,8 @@ export interface ImportCheckInput {
   files: { month2: Buffer; drift: Buffer; month2Name?: string; driftName?: string };
   overrides?: { supabaseUrl?: string | null; anonKey?: string | null };
   uploadTimeoutMs?: number;
+  /** How often to re-count while waiting for an import to settle (tests use a short one). */
+  settlePollMs?: number;
   now?: Date;
 }
 
@@ -61,6 +63,23 @@ function msisdnOf(r: Row): string | null {
   return null;
 }
 
+/** The spellings a South African number may be stored in: +27…, 27…, 0… and the bare 9 digits (a number column). */
+export function zaVariants(e164: string): string[] {
+  const m = e164.match(/^\+27(\d{9})$/);
+  return m ? [e164, `27${m[1]}`, `0${m[1]}`, m[1]] : [e164];
+}
+
+/** Any stored spelling of a South African number, as E.164 (so M3/M4 judge identity, D-a the format). */
+export function looseE164(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  const raw = String(v).trim();
+  const d = raw.replace(/\D/g, "");
+  if (/^\d{9}$/.test(d)) return `+27${d}`;
+  if (/^0\d{9}$/.test(d)) return `+27${d.slice(1)}`;
+  if (/^27\d{9}$/.test(d)) return `+${d}`;
+  return raw.startsWith("+") ? `+${d}` : raw;
+}
+
 function pickKey(r: Row | undefined, preferred: string, re: RegExp): string | null {
   if (!r) return null;
   if (preferred in r) return preferred;
@@ -79,7 +98,7 @@ class Probe {
 
   async linesFor(msisdns: string[]): Promise<Row[] | null> {
     if (!msisdns.length) return [];
-    const r = await this.sb.probe.select("lines", { select: "*", msisdn_e164: inList(msisdns), limit: "500" }, this.s);
+    const r = await this.sb.probe.select("lines", { select: "*", msisdn_e164: inList(msisdns.flatMap(zaVariants)), limit: "1000" }, this.s);
     return r.rows;
   }
 
@@ -119,6 +138,56 @@ async function snapshot(p: Probe, expected: HarnessExpected): Promise<State> {
   ]);
   const sentinelIds = sentinels.map((s) => s.id).filter((x): x is string => !!x);
   return { customers, lines, activeLines, sentinels, interactions: await p.interactionsOf(sentinelIds), sample: { changed: c, removed: r, added: a } };
+}
+
+// ───────────────────────── Waiting for the import to finish ─────────────────────────
+
+const SETTLE_MAX_MS = 60_000;
+
+interface Pulse {
+  customers: number | null;
+  lines: number | null;
+  active: number | null;
+  running: boolean;
+}
+
+async function pulse(p: Probe): Promise<Pulse> {
+  const [customers, lines, active, runs] = await Promise.all([
+    p.count("customers"),
+    p.count("lines"),
+    p.count("lines", { active: "is.true" }),
+    p.sb.probe.select("import_runs", { select: "status", order: "created_at.desc", limit: "1" }, p.s),
+  ]);
+  const status = String(runs.rows?.[0]?.status ?? "");
+  return { customers, lines, active, running: /running|pending|processing|queued|started|in[\s_-]?progress/i.test(status) };
+}
+
+/** Does the upload's answer say the import carries on in the background? */
+export const looksAsync = (u: { status: number | null; body: string }) => u.status === 202 || /\b(started|queued|processing|in the background|refresh)\b/i.test(u.body);
+
+/**
+ * Waits until the candidate's data stops changing, then snapshots. Imports that answer before
+ * they finish (F14-style "Import started") would otherwise be judged half-way. Settled means the
+ * counts did not move between polls (two quiet polls when the upload said it runs in the
+ * background) and no import run is still marked running.
+ */
+async function settledSnapshot(p: Probe, exp: HarnessExpected, http: Http, opts: { pollMs: number; quietPolls: number }): Promise<{ state: State; settled: boolean; waitedMs: number }> {
+  const started = Date.now();
+  let prev = await pulse(p);
+  let quiet = 0;
+  let settled = false;
+  while (Date.now() - started < SETTLE_MAX_MS && http.budget.remaining() > opts.pollMs + 30_000) {
+    await new Promise((r) => setTimeout(r, opts.pollMs));
+    const cur = await pulse(p);
+    const same = cur.customers === prev.customers && cur.lines === prev.lines && cur.active === prev.active;
+    quiet = same && !cur.running ? quiet + 1 : 0;
+    prev = cur;
+    if (quiet >= opts.quietPolls) {
+      settled = true;
+      break;
+    }
+  }
+  return { state: await snapshot(p, exp), settled, waitedMs: Date.now() - started };
 }
 
 async function upload(http: Http, base: URL, sb: SupabaseTarget, s: Session, name: string, data: Buffer, timeoutMs: number): Promise<Upload> {
@@ -250,26 +319,36 @@ export async function runImportChecks(input: ImportCheckInput): Promise<ImportRu
   }
   if (!input.logins.manager) return allInconclusive("no manager login in the submitted test logins", { logins: describeLogins(input.logins) });
 
-  const fe = newFrontEnd(base);
+  let conn: Awaited<ReturnType<typeof connect>>;
   try {
-    await crawlPublic(http, fe);
+    // Manager only; with no key in the public bundle, the manager signs in through the login form
+    // and the signed-in pages are searched for the key.
+    conn = await connect(http, base, { ...input.logins, agents: [] }, { supabaseUrl: input.overrides?.supabaseUrl ?? null, anonKey: input.overrides?.anonKey ?? null }, { includeB: false });
   } catch (err) {
     if (err instanceof BudgetExceeded) return allInconclusive("ran out of time while reading the front end");
+    throw err;
   }
-  const found = await findSupabase(http, fe, input.overrides);
-  if (!found.target) return allInconclusive(found.problem ?? "the Supabase project could not be identified", { candidates: found.candidates });
-  const sb = found.target;
-  const sessions = await signInAll(sb, { ...input.logins, agents: [] });
-  const manager = sessions.manager;
-  if (!manager) return allInconclusive(`the manager could not sign in (${sessions.errors.filter((e) => !/agent/.test(e)).join("; ")})`, { supabase_url: sb.url });
+  if (!conn.sb) {
+    return allInconclusive(`${conn.sbProblem ?? "the Supabase project could not be identified"}. The import checks read counts through the REST API, so they need it`, {
+      candidates: conn.sbCandidates.slice(0, 8),
+      manager_signed_in: !!conn.sessions.manager,
+    });
+  }
+  const sb = conn.sb;
+  const manager = conn.sessions.manager;
+  if (!manager) return allInconclusive(`the manager could not sign in (${conn.sessions.errors.filter((e) => !/agent/.test(e)).join("; ")})`, { supabase_url: sb.url });
   const p = new Probe(sb, manager);
   const timeout = input.uploadTimeoutMs ?? 100_000;
+  const pollMs = input.settlePollMs ?? 2500;
   const results: CheckResult[] = [];
   const skipped: CheckKey[] = [];
   const context: Evidence = { supabase_url: sb.url, manager: manager.email };
 
   try {
     const before = await snapshot(p, exp);
+    // The data as the candidate deployed it (their own seed of month 1, or month 2 on a re-run).
+    const dataBefore = await dataChecks(p, input.now ?? new Date());
+    let dataAfter: CheckResult[] | null = null;
     context.baseline = stateEvidence(before);
     if (before.customers === null || before.lines === null) {
       return allInconclusive("the manager cannot read customer/line counts via the REST API (renamed tables, or no read access): check by hand", { ...context, baseline: stateEvidence(before) });
@@ -279,6 +358,8 @@ export async function runImportChecks(input: ImportCheckInput): Promise<ImportRu
     context.already_imported = alreadyImported;
 
     let afterFirst: State = before;
+    /** False when the month-2 import may still be running: M6/M7 would compare against moving data. */
+    let firstSettled = true;
     if (!alreadyImported) {
       // Give the sentinels history to follow (M2) if they have none.
       let probes = 0;
@@ -308,52 +389,70 @@ export async function runImportChecks(input: ImportCheckInput): Promise<ImportRu
       } else if (up.status === null) {
         // A time-out may leave the import still running on their side: counts now would mislead.
         for (const k of ["M1", "M2", "M3", "M4", "M5"] as const) results.push(inconclusive(k, `the month-2 upload did not complete (${up.error}): the import may still be running, so the result is unknown`, { upload: uploadEvidence(up) }));
+        firstSettled = false;
         afterFirst = await snapshot(p, exp);
       } else {
-        afterFirst = await snapshot(p, exp);
-        results.push(...judgeImport(exp, before, afterFirst, up));
-        results.push(await judgeQuarantine(p, exp, up));
+        const st = await settledSnapshot(p, exp, http, { pollMs, quietPolls: looksAsync(up) ? 2 : 1 });
+        afterFirst = st.state;
+        context.month2_settle = { settled: st.settled, waited_ms: st.waitedMs, background: looksAsync(up) };
+        if (!st.settled) {
+          firstSettled = false;
+          for (const k of ["M1", "M2", "M3", "M4", "M5"] as const)
+            results.push(inconclusive(k, `the month-2 import was still changing data ${Math.round(st.waitedMs / 1000)} s after the upload, so it was not judged half-way: run the import checks again later`, { upload: uploadEvidence(up), now: stateEvidence(st.state) }));
+        } else {
+          results.push(...judgeImport(exp, before, afterFirst, up));
+          results.push(await judgeQuarantine(p, exp, up));
+          // The data as their import left it (before the re-upload and the drift file).
+          dataAfter = await dataChecks(p, input.now ?? new Date());
+        }
       }
     } else {
       skipped.push("M1", "M2", "M3", "M4", "M5");
     }
 
-    // M6: the same file again changes nothing.
-    const before6 = afterFirst;
-    const up6 = await upload(http, base, sb, manager, input.files.month2Name ?? "base_month2.xlsx", input.files.month2, timeout);
-    const after6 = await snapshot(p, exp);
-    {
-      const diffs = stateDiff(before6, after6);
-      const ev: Evidence = { upload: uploadEvidence(up6), before: stateEvidence(before6), after: stateEvidence(after6), differences: diffs };
-      const said = /already|duplicate|no changes|unchanged|nothing to/i.test(up6.body);
-      if (up6.status === 401 || up6.status === 403) results.push(inconclusive("M6", `POST /api/import refused the manager (HTTP ${up6.status})`, ev));
-      else if (up6.status === 404) results.push(inconclusive("M6", "POST /api/import is not found (route renamed?)", ev));
-      else if (diffs.length) results.push(fail("M6", `Re-uploading the same month-2 file changed data: ${diffs.join("; ")}`, ev));
-      else if (up6.status === null) results.push(inconclusive("M6", `the re-upload did not complete (${up6.error})`, ev));
-      else if (up6.status >= 500) results.push(fail("M6", `Re-uploading the same file crashed (HTTP ${up6.status}), even though nothing changed`, ev));
-      else if (!is2xx(up6.status) && !said) results.push(fail("M6", `Re-uploading the same file was rejected with HTTP ${up6.status} without saying it was already imported`, ev));
-      else results.push(pass("M6", `Re-uploading the same month-2 file changed nothing (HTTP ${up6.status}${said ? ", reported as already imported" : ""})`, ev));
-    }
+    if (!firstSettled) {
+      const why = "the month-2 import had not finished, so a re-upload or the drift file would be judged against data that is still changing: run the import checks again later";
+      results.push(inconclusive("M6", why), inconclusive("M7", why));
+    } else {
+      // M6: the same file again changes nothing.
+      const before6 = afterFirst;
+      const up6 = await upload(http, base, sb, manager, input.files.month2Name ?? "base_month2.xlsx", input.files.month2, timeout);
+      const st6 = await settledSnapshot(p, exp, http, { pollMs, quietPolls: looksAsync(up6) ? 2 : 1 });
+      const after6 = st6.state;
+      {
+        const diffs = stateDiff(before6, after6);
+        const ev: Evidence = { upload: uploadEvidence(up6), before: stateEvidence(before6), after: stateEvidence(after6), differences: diffs, settled: st6.settled };
+        const said = /already|duplicate|no changes|unchanged|nothing to/i.test(up6.body);
+        if (up6.status === 401 || up6.status === 403) results.push(inconclusive("M6", `POST /api/import refused the manager (HTTP ${up6.status})`, ev));
+        else if (up6.status === 404) results.push(inconclusive("M6", "POST /api/import is not found (route renamed?)", ev));
+        else if (diffs.length && !st6.settled) results.push(inconclusive("M6", `data was still changing ${Math.round(st6.waitedMs / 1000)} s after the re-upload (${diffs.join("; ")}): run the import checks again later`, ev));
+        else if (diffs.length) results.push(fail("M6", `Re-uploading the same month-2 file changed data: ${diffs.join("; ")}`, ev));
+        else if (up6.status === null) results.push(inconclusive("M6", `the re-upload did not complete (${up6.error})`, ev));
+        else if (up6.status >= 500) results.push(fail("M6", `Re-uploading the same file crashed (HTTP ${up6.status}), even though nothing changed`, ev));
+        else if (!is2xx(up6.status) && !said) results.push(fail("M6", `Re-uploading the same file was rejected with HTTP ${up6.status} without saying it was already imported`, ev));
+        else results.push(pass("M6", `Re-uploading the same month-2 file changed nothing (HTTP ${up6.status}${said ? ", reported as already imported" : ""})`, ev));
+      }
 
-    // M7: the drift file fails loudly, names the column, writes nothing.
-    const up7 = await upload(http, base, sb, manager, input.files.driftName ?? "base_month2_drift.xlsx", input.files.drift, timeout);
-    const after7 = await snapshot(p, exp);
-    {
-      const diffs = stateDiff(after6, after7);
-      const names = [exp.drift.renamed.from, exp.drift.renamed.to, ...exp.drift.added];
-      const named = names.filter((n) => up7.body.toLowerCase().includes(n.toLowerCase()));
-      const ev: Evidence = { upload: uploadEvidence(up7), columns_named: named, differences: diffs };
-      if (up7.status === 401 || up7.status === 403) results.push(inconclusive("M7", `POST /api/import refused the manager (HTTP ${up7.status})`, ev));
-      else if (up7.status === null) results.push(inconclusive("M7", `the drift upload did not complete (${up7.error})`, ev));
-      else if (is2xx(up7.status)) results.push(fail("M7", `The drift file (renamed ${exp.drift.renamed.from} → ${exp.drift.renamed.to}) was accepted with HTTP ${up7.status}${diffs.length ? ` and changed data: ${diffs.join("; ")}` : ""}`, ev));
-      else if (diffs.length) results.push(fail("M7", `The drift file was rejected (HTTP ${up7.status}) but data changed: ${diffs.join("; ")}`, ev));
-      else if (up7.status >= 500) results.push(fail("M7", `The drift file crashed the import (HTTP ${up7.status}) instead of a clear 4xx error`, ev));
-      else if (!named.length) results.push(fail("M7", `The drift file was rejected (HTTP ${up7.status}) but the error does not name the changed column`, ev));
-      else results.push(pass("M7", `The drift file was rejected with HTTP ${up7.status} naming ${named.join(", ")}, and nothing changed`, ev));
+      // M7: the drift file fails loudly, names the column, writes nothing.
+      const up7 = await upload(http, base, sb, manager, input.files.driftName ?? "base_month2_drift.xlsx", input.files.drift, timeout);
+      const st7 = await settledSnapshot(p, exp, http, { pollMs, quietPolls: looksAsync(up7) ? 2 : 1 });
+      const after7 = st7.state;
+      {
+        const diffs = stateDiff(after6, after7);
+        const names = [exp.drift.renamed.from, exp.drift.renamed.to, ...exp.drift.added];
+        const named = names.filter((n) => up7.body.toLowerCase().includes(n.toLowerCase()));
+        const ev: Evidence = { upload: uploadEvidence(up7), columns_named: named, differences: diffs };
+        if (up7.status === 401 || up7.status === 403) results.push(inconclusive("M7", `POST /api/import refused the manager (HTTP ${up7.status})`, ev));
+        else if (up7.status === null) results.push(inconclusive("M7", `the drift upload did not complete (${up7.error})`, ev));
+        else if (is2xx(up7.status)) results.push(fail("M7", `The drift file (renamed ${exp.drift.renamed.from} → ${exp.drift.renamed.to}) was accepted with HTTP ${up7.status}${diffs.length ? ` and changed data: ${diffs.join("; ")}` : ""}`, ev));
+        else if (diffs.length) results.push(fail("M7", `The drift file was rejected (HTTP ${up7.status}) but data changed: ${diffs.join("; ")}`, ev));
+        else if (up7.status >= 500) results.push(fail("M7", `The drift file crashed the import (HTTP ${up7.status}) instead of a clear 4xx error`, ev));
+        else if (!named.length) results.push(fail("M7", `The drift file was rejected (HTTP ${up7.status}) but the error does not name the changed column`, ev));
+        else results.push(pass("M7", `The drift file was rejected with HTTP ${up7.status} naming ${named.join(", ")}, and nothing changed`, ev));
+      }
+      context.final = stateEvidence(after7);
     }
-
-    results.push(...(await dataChecks(p, input.now ?? new Date())));
-    context.final = stateEvidence(after7);
+    results.push(...mergeDataChecks(dataBefore, dataAfter));
   } catch (err) {
     // Out of time (or an unexpected error) part-way: what ran stands, the rest is inconclusive.
     const reason = err instanceof BudgetExceeded ? "the run's time budget ran out before this check: run the import checks again" : `the run stopped unexpectedly: ${describeError(err)}`;
@@ -402,7 +501,7 @@ function judgeImport(exp: HarnessExpected, before: State, after: State, up: Uplo
       const dup: string[] = [];
       const stale: string[] = [];
       for (const c of expectedChanges) {
-        const mine = rows.filter((r) => msisdnOf(r) === c.msisdn_e164);
+        const mine = rows.filter((r) => looseE164(msisdnOf(r)) === c.msisdn_e164);
         if (mine.length > 1) dup.push(c.msisdn_e164);
         const r = mine[0];
         if (!r) {
@@ -420,7 +519,11 @@ function judgeImport(exp: HarnessExpected, before: State, after: State, up: Uplo
       const ev: Evidence = { sampled: expectedChanges.length, duplicated: dup, not_updated: stale.slice(0, 15), lines_before: before.lines, lines_after: after.lines, line_delta: delta, allowed_delta: allowed };
       const deltaOk = delta !== null && allowed.includes(delta);
       if (dup.length) out.push(fail("M3", `${dup.length} changed lines are duplicated`, ev));
-      else if (stale.length) out.push(fail("M3", `${stale.length} of ${expectedChanges.length} sampled changed lines were not updated`, ev));
+      else if (stale.length) {
+        const missing = stale.filter((x) => x.endsWith(" missing")).length;
+        const parts = [stale.length - missing ? `${stale.length - missing} not updated` : null, missing ? `${missing} missing after the import (deleted, or stored under another number)` : null].filter(Boolean);
+        out.push(fail("M3", `Of ${expectedChanges.length} sampled changed lines, ${parts.join(" and ")}`, ev));
+      }
       else if (!deltaOk) out.push(fail("M3", `Line count changed by ${delta}; expected ${exp.month2.lines_new} new lines (duplicates or reformatted numbers created extra lines?)`, ev));
       else out.push(pass("M3", `${expectedChanges.length} sampled changed line${expectedChanges.length === 1 ? "" : "s"} updated in place; line count rose by ${delta}`, ev));
     }
@@ -432,8 +535,8 @@ function judgeImport(exp: HarnessExpected, before: State, after: State, up: Uplo
     const removed = exp.month2.removed_msisdns.slice(0, SAMPLE);
     if (!rows) out.push(inconclusive("M4", "removed lines could not be read"));
     else {
-      const gone = removed.filter((m) => !rows.some((r) => msisdnOf(r) === m));
-      const stillActive = removed.filter((m) => rows.some((r) => msisdnOf(r) === m && !isInactive(r)));
+      const gone = removed.filter((m) => !rows.some((r) => looseE164(msisdnOf(r)) === m));
+      const stillActive = removed.filter((m) => rows.some((r) => looseE164(msisdnOf(r)) === m && !isInactive(r)));
       const ev: Evidence = { sampled: removed.length, deleted: gone.length, still_active: stillActive.slice(0, 10), active_before: before.activeLines, active_after: after.activeLines };
       if (gone.length === removed.length && removed.length)
         out.push(fail("M4", `Removed (ported) lines were hard-deleted (${gone.length} of ${removed.length} sampled)`, ev, "hard delete earns partial credit if the README documents why"));
@@ -487,11 +590,40 @@ function landlineMarked(r: Row, key: string): boolean | null {
   return null;
 }
 
+/**
+ * D-a..D-c judged on the deployed data and again after the month-2 import: a problem at either
+ * point fails the check (the summary says when). The final state after the drift upload is not
+ * used: a drift file wrongly accepted (M7) would confound it.
+ */
+export function mergeDataChecks(before: CheckResult[], after: CheckResult[] | null): CheckResult[] {
+  return before.map((b) => {
+    const a = after?.find((x) => x.key === b.key) ?? null;
+    const evidence: Evidence = { before_import: (b.detail.evidence ?? {}) as Evidence, ...(a ? { after_import: (a.detail.evidence ?? {}) as Evidence } : {}) };
+    const label = (r: CheckResult, when: string) => `${when}: ${r.detail.summary}`;
+    if (b.passed === false || a?.passed === false) {
+      const parts = [b.passed === false ? label(b, "As deployed") : null, a?.passed === false ? label(a, "After the month-2 import") : null].filter(Boolean);
+      return fail(b.key, parts.join(" | "), evidence);
+    }
+    const notes = [b.detail.reviewer_note, a?.detail.reviewer_note].filter((x): x is string => typeof x === "string");
+    if (b.passed === true || a?.passed === true) {
+      const both = b.passed === true && a?.passed === true;
+      const r = a?.passed === true ? a : b;
+      return pass(b.key, `${r.detail.summary}${both ? " (as deployed and after the month-2 import)" : a ? "" : " (as deployed)"}`, evidence, notes.length ? [...new Set(notes)].join("; ") : undefined);
+    }
+    const r = a ?? b;
+    return inconclusive(b.key, String(r.detail.reason ?? r.detail.summary), evidence);
+  });
+}
+
 async function dataChecks(p: Probe, now: Date): Promise<CheckResult[]> {
   const all = await p.sb.probe.selectAll<Row>("lines", { select: "*" }, p.s, 5000);
   const rows = all.rows;
   if (!rows) {
     const why = `the manager cannot read lines via REST (HTTP ${all.status}${all.code ? ` ${all.code}` : ""})`;
+    return [inconclusive("D-a", why), inconclusive("D-b", why), inconclusive("D-c", why)];
+  }
+  if (!rows.length) {
+    const why = "the lines table is empty after the imports (nothing to check)";
     return [inconclusive("D-a", why), inconclusive("D-b", why), inconclusive("D-c", why)];
   }
   const out: CheckResult[] = [];

@@ -78,6 +78,13 @@ export function findJwts(text: string): FoundJwt[] {
 
 export const isServiceRoleJwt = (j: { role: string | null }) => j.role === "service_role" || j.role === "supabase_admin";
 
+/** A key that bypasses RLS (an sb_secret_ key, or a JWT whose role is not anon): never used for probes. */
+export function isPrivilegedKey(key: string): boolean {
+  if (/^sb_secret_/i.test(key.trim())) return true;
+  const claims = key.startsWith("eyJ") ? decodeJwt(key.trim()) : null;
+  return !!claims && claims.role !== "anon";
+}
+
 export interface SecretScan {
   serviceRoleJwts: { preview: string; role: string | null }[];
   secretKeys: string[];

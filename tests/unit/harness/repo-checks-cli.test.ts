@@ -96,3 +96,33 @@ describe("repo-checks.ts (static)", () => {
     expect(checks[0].detail.summary).toMatch(/not in the repository/);
   }, 60_000);
 });
+
+// Runs only where the pinned gitleaks image is already present (never pulls it in a unit run).
+const gitleaksImage = (() => {
+  try {
+    execFileSync("docker", ["image", "inspect", "zricethezav/gitleaks:v8.24.2"], { stdio: "ignore", timeout: 15_000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+describe("repo-checks.ts gitleaks rules", () => {
+  it.skipIf(!gitleaksImage)("finds the committed .env.local but not blank or placeholder .env.example values", async () => {
+    const r = repo([
+      { "package.json": PKG, ".env.local": `OPENROUTER_API_KEY=${fakeSecret()}\n` },
+      {
+        ".env.local": null,
+        // Blank values used to swallow the next line as the "secret" (\s* crossed the newline).
+        ".env.example": "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=\nNEXT_PUBLIC_SUPABASE_SERVICE_KEY=\nSUPABASE_SECRET_KEY=your-secret-key-goes-here\n",
+      },
+    ]);
+    const { checks, tools } = await repoChecks({ ...args(r), noDocker: false });
+    expect(tools.gitleaks).toMatch(/gitleaks/);
+    const r1 = byKey(checks).R1;
+    expect(r1.passed).toBe(false);
+    const examples = (r1.detail.evidence as { examples: string[] }).examples;
+    expect(examples.length).toBeGreaterThan(0);
+    expect(examples.every((e) => /\.env\.local/.test(e))).toBe(true);
+  }, 120_000);
+});

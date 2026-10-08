@@ -48,6 +48,8 @@ export const BUNDLE_FILES = {
   expected: "internal/expected_month2.json",
   month2: "internal/base_month2.xlsx",
   drift: "internal/base_month2_drift.xlsx",
+  /** The list the candidate got (company names only): what U7 matches against. */
+  optouts: "candidate/optouts_legal.xlsx",
 } as const;
 
 export interface OptoutEntry {
@@ -67,6 +69,34 @@ export function optoutEntries(expected: HarnessExpected | null): OptoutEntry[] {
     regNo: m.customer_reg_no,
     accountNos: m.account_nos,
   }));
+}
+
+/**
+ * Opt-out entries from the candidate's optouts_legal.xlsx (first sheet, a "Company" column and
+ * optionally "Status"), with the registration number from the answer key when the listed name
+ * is one it knows. Null when the sheet has no company column.
+ */
+export function optoutEntriesFromSheet(rows: string[][], expected: HarnessExpected | null): OptoutEntry[] | null {
+  const headerAt = rows.findIndex((r) => r.some((c) => /^\s*(company|company name|customer|customer name|name)\s*$/i.test(c)));
+  if (headerAt < 0) return null;
+  const header = rows[headerAt].map((c) => c.trim().toLowerCase());
+  const nameCol = header.findIndex((c) => /^(company|company name|customer|customer name|name)$/.test(c));
+  const statusCol = header.findIndex((c) => /status/.test(c));
+  const known = new Map((expected?.optouts.matches ?? []).map((m) => [m.listed_name.trim(), m]));
+  const out: OptoutEntry[] = [];
+  for (const r of rows.slice(headerAt + 1)) {
+    const listedName = (r[nameCol] ?? "").trim();
+    if (!listedName) continue;
+    const k = known.get(listedName);
+    out.push({
+      listedName,
+      normalised: normaliseCompanyName(listedName),
+      status: (statusCol >= 0 ? r[statusCol]?.trim() : "") || k?.status || "Opted out",
+      regNo: k?.customer_reg_no ?? null,
+      accountNos: k?.account_nos ?? [],
+    });
+  }
+  return out;
 }
 
 export interface CustomerLite {

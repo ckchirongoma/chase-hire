@@ -64,7 +64,7 @@ async function latest(subId: string): Promise<Map<string, { passed: boolean | nu
   return m;
 }
 
-const opts = () => ({ ranBy: boss.id, bundlePrefix: BUNDLE, budgetMs: 120_000, observatoryUrl: undefined as string | undefined });
+const opts = () => ({ ranBy: boss.id, bundlePrefix: BUNDLE, budgetMs: 120_000, observatoryUrl: undefined as string | undefined, settlePollMs: 100 });
 
 beforeAll(async () => {
   process.env.SNAPSHOT_ALLOW_PRIVATE = "1";
@@ -162,15 +162,63 @@ describe("Month-2 import checks M1–M7 and data checks D-a..D-c", () => {
     expect(after.get("M6")?.detail.harness_run).toBe(s.runId);
   }, 120_000);
 
-  it("fail on the planted-fault app", async () => {
-    await runImportHarness(admin, badSub, opts());
+  it("fail on the planted-fault app, judged after its background import settles", async () => {
+    const s = await runImportHarness(admin, badSub, opts());
     const rows = await latest(badSub);
     for (const k of MD) expect({ k, passed: rows.get(k)?.passed, summary: rows.get(k)?.detail.summary }).toMatchObject({ k, passed: false });
+    // "Import started": the harness waited for the data to stop changing before judging M1–M5.
+    const { data: run } = await admin.from("harness_runs").select("summary").eq("id", s.runId).single();
+    expect((run!.summary as { context: { month2_settle: unknown } }).context.month2_settle).toMatchObject({ settled: true, background: true });
+    expect(String(rows.get("M2")!.detail.summary)).toMatch(/new IDs/);
+    expect(String(rows.get("D-b")!.detail.summary)).toMatch(/After the month-2 import/);
   }, 120_000);
 
   it("refuses to run without the bundle files (a platform problem, so no rows)", async () => {
     await expect(runImportHarness(admin, goodSub, { ...opts(), bundlePrefix: "test-harness-missing/bundle_c" })).rejects.toBeInstanceOf(HarnessError);
   });
+});
+
+describe("apps that keep Supabase server-side (no publishable key in the bundle)", () => {
+  let goodKeyless: FakeTarget;
+  let badKeyless: FakeTarget;
+  beforeAll(async () => {
+    [goodKeyless, badKeyless] = await Promise.all([startFakeTarget("good", { keyInBundle: false }), startFakeTarget("bad", { keyInBundle: false })]);
+  });
+  afterAll(async () => {
+    await Promise.all([goodKeyless?.close(), badKeyless?.close()]);
+  });
+
+  it("sign in through the login form and still catch the planted faults through the app", async () => {
+    const sub = await swe1Submission(badKeyless);
+    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: badKeyless.observatoryUrl });
+    const rows = await latest(sub);
+    // F04 ships only on a signed-in page: the form sign-in is what lets U2 see it.
+    for (const k of ["U2", "U4", "U5", "U6", "U7"]) expect({ k, passed: rows.get(k)?.passed, summary: rows.get(k)?.detail.summary }).toMatchObject({ k, passed: false });
+    expect((rows.get("U4")!.detail.evidence as Record<string, unknown>).signed_in_via).toBe("app-login-form");
+    expect(rows.get("U3")).toMatchObject({ passed: null, detail: { inconclusive: true } });
+    expect(String(rows.get("U3")!.detail.reason)).toMatch(/publishable/);
+  }, 120_000);
+
+  it("leave the database halves inconclusive on a hardened app, and pass once the candidate supplies the key", async () => {
+    const sub = await swe1Submission(goodKeyless);
+    await runUrlHarness(admin, sub, { ...opts(), observatoryUrl: goodKeyless.observatoryUrl });
+    let rows = await latest(sub);
+    for (const k of ["U1", "U2", "U5"]) expect({ k, passed: rows.get(k)?.passed, summary: rows.get(k)?.detail.summary }).toMatchObject({ k, passed: true });
+    for (const k of ["U3", "U4", "U6", "U7"]) expect({ k, passed: rows.get(k)?.passed, inconclusive: rows.get(k)?.detail.inconclusive }).toMatchObject({ k, passed: null, inconclusive: true });
+    expect(String(rows.get("U6")!.detail.reason)).toMatch(/refuses a call_back without a date .* database was not probed/);
+
+    // Import checks count through REST: without the key they cannot run, and say why.
+    await runImportHarness(admin, sub, opts());
+    rows = await latest(sub);
+    for (const k of MD) expect(rows.get(k)?.passed).toBeNull();
+    expect(String(rows.get("M1")!.detail.reason)).toMatch(/publishable key/);
+
+    // The candidate adds "supabase: <url> / <publishable key>" to the logins.
+    const withKey = await swe1Submission(goodKeyless, `${goodKeyless.testLogins}\nsupabase: ${goodKeyless.supabaseUrl} / ${goodKeyless.publishableKey}\n`);
+    await runUrlHarness(admin, withKey, { ...opts(), observatoryUrl: goodKeyless.observatoryUrl });
+    rows = await latest(withKey);
+    for (const k of U) expect({ k, passed: rows.get(k)?.passed, summary: rows.get(k)?.detail.summary }).toMatchObject({ k, passed: true });
+  }, 180_000);
 });
 
 describe("Manual results and the CI report job", () => {

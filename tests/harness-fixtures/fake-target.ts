@@ -1,6 +1,11 @@
 /**
  * Fake SWE Test 1 deployments for the harness integration test (tests/integration/harness.test.ts).
  *
+ * Options: keyInBundle=false emulates an app that keeps Supabase server-side (no publishable key
+ * in any chunk; the harness signs in through the login form, a Next.js-style progressive
+ * enhancement form that sets the @supabase/ssr cookie). The bad app's import runs in the
+ * background ("Import started"), so the harness has to wait for it to settle.
+ *
  * startFakeTarget("good") emulates a hardened Kopano Renewal Desk; startFakeTarget("bad") the
  * planted-fault starter (F01–F05, F08–F12, F14). Each is two local HTTP servers:
  *   app      the Next.js app: pages + JS chunks, /api/health, /api/summary, /api/outcomes,
@@ -179,8 +184,15 @@ function normaliseMsisdn(raw: string): string | null {
 
 // ───────────────────────── Servers ─────────────────────────
 
+export interface FakeOptions {
+  /** false: no publishable key in the front end (the app keeps Supabase server-side). Default true. */
+  keyInBundle?: boolean;
+}
+
 export interface FakeTarget {
   mode: Mode;
+  /** The project's publishable key (to hand to the harness as a candidate would). */
+  publishableKey: string;
   appUrl: string;
   supabaseUrl: string;
   observatoryUrl: string;
@@ -211,6 +223,22 @@ function send(res: http.ServerResponse, status: number, body: unknown, headers: 
   res.end(text);
 }
 
+/** The text fields of a multipart/form-data body. */
+function multipartFields(body: Buffer, contentType: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const m = contentType.match(/boundary=([^;]+)/);
+  if (!m) return out;
+  for (const part of body.toString("utf8").split(`--${m[1]}`)) {
+    const name = part.match(/name="([^"]*)"/)?.[1];
+    const start = part.indexOf("\r\n\r\n");
+    if (name !== undefined && start >= 0) out.set(name, part.slice(start + 4, part.lastIndexOf("\r\n")));
+  }
+  return out;
+}
+
+/** The login page's form as Next.js renders a server action for browsers without JavaScript. */
+const LOGIN_FORM = `<form class="card" action="" encType="multipart/form-data" method="POST"><input type="hidden" name="$ACTION_REF_1"/><input type="hidden" name="$ACTION_1:0" value="{&quot;id&quot;:&quot;6081&quot;,&quot;bound&quot;:&quot;$@1&quot;}"/><input type="hidden" name="$ACTION_KEY" value="k-fake-action"/><label for="email">Email</label><input id="email" type="email" autoComplete="username" required="" name="email"/><label for="password">Password</label><input id="password" type="password" required="" name="password"/><button type="submit">Sign in</button></form>`;
+
 /** The file part of a multipart/form-data body. */
 function multipartFile(body: Buffer, contentType: string): Buffer | null {
   const m = contentType.match(/boundary=([^;]+)/);
@@ -224,8 +252,9 @@ function multipartFile(body: Buffer, contentType: string): Buffer | null {
   return null;
 }
 
-export async function startFakeTarget(mode: Mode): Promise<FakeTarget> {
+export async function startFakeTarget(mode: Mode, opts: FakeOptions = {}): Promise<FakeTarget> {
   const good = mode === "good";
+  const keyInBundle = opts.keyInBundle ?? true;
   const s = seed();
   const users = {
     a: { id: randomUUID(), email: `agent.a.${rand(3)}@example.co.za`, password: `pw-${rand(6)}`, role: "agent" as const },
@@ -449,7 +478,9 @@ export async function startFakeTarget(mode: Mode): Promise<FakeTarget> {
   const anonJwt = fakeJwt({ iss: "supabase-test", role: "anon", ref: "fakeproject" });
   const chunks: Record<string, string> = {
     "/_next/static/chunks/main-app.js": `(()=>{console.log("app shell");var t=${JSON.stringify(anonJwt.slice(0, 8))};})();`,
-    "/_next/static/chunks/app/login/page.js": `(self.webpackChunk=self.webpackChunk||[]).push([[1],{9:(e,t,n)=>{let a=(0,n.createBrowserClient)("${supabaseUrl}","${publishable}");fetch("https://openrouter.ai/api/v1")}}]);`,
+    "/_next/static/chunks/app/login/page.js": keyInBundle
+      ? `(self.webpackChunk=self.webpackChunk||[]).push([[1],{9:(e,t,n)=>{let a=(0,n.createBrowserClient)("${supabaseUrl}","${publishable}");fetch("https://openrouter.ai/api/v1")}}]);`
+      : `(self.webpackChunk=self.webpackChunk||[]).push([[1],{9:(e,t,n)=>{let a="sign in";fetch("https://a")}}]);`,
     "/_next/static/chunks/app/queue/page.js": `(self.webpackChunk=self.webpackChunk||[]).push([[2],{3:()=>{let q="renewal queue"}}]);`,
     // F04: the service-role key shipped in a client component (only on a signed-in page).
     "/_next/static/chunks/app/queue/admin-panel.js": `(self.webpackChunk=self.webpackChunk||[]).push([[3],{4:()=>{let k="${serviceJwt}"}}]);`,
@@ -465,17 +496,38 @@ export async function startFakeTarget(mode: Mode): Promise<FakeTarget> {
     const p = url.pathname;
     if (chunks[p]) return send(res, 200, chunks[p], { "content-type": "application/javascript" });
     if (req.method === "GET" && p === "/") return send(res, 200, page("Kopano Renewal Desk", ["/_next/static/chunks/main-app.js"]));
-    if (req.method === "GET" && p === "/login") return send(res, 200, page("Log in", ["/_next/static/chunks/main-app.js", "/_next/static/chunks/app/login/page.js"]));
+    if (req.method === "GET" && p === "/login") return send(res, 200, page("Log in", ["/_next/static/chunks/main-app.js", "/_next/static/chunks/app/login/page.js"], LOGIN_FORM));
+    if (req.method === "POST" && p === "/login") {
+      // A server action submitted without JavaScript: multipart, hidden $ACTION fields, Origin checked.
+      const fields = multipartFields(body, String(req.headers["content-type"] ?? ""));
+      if (fields.get("$ACTION_KEY") !== "k-fake-action" || req.headers.origin !== appUrl) return send(res, 400, "<html>Bad action</html>");
+      const user = all.find((x) => x.email === fields.get("email") && x.password === fields.get("password"));
+      if (!user) return send(res, 200, page("Log in", [], `<p class="error">That email and password do not match.</p>${LOGIN_FORM}`));
+      const token = `tok-${rand(24)}`;
+      tokens.set(token, user);
+      // @supabase/ssr: "base64-" + base64url(session JSON), chunked into .0/.1 above 3180 characters.
+      const value = `base64-${Buffer.from(JSON.stringify({ access_token: token, token_type: "bearer", refresh_token: rand(12), user: { id: user.id, email: user.email, user_metadata: { pad: "x".repeat(3000) } } })).toString("base64url")}`;
+      const cookies = [];
+      for (let i = 0, n = 0; i < value.length; i += 3180, n++) cookies.push(`sb-127-auth-token.${n}=${value.slice(i, i + 3180)}; Path=/; HttpOnly; SameSite=Lax`);
+      res.writeHead(303, { location: "/queue", "set-cookie": [...cookies, "stale=1; Path=/; Max-Age=0"] });
+      return res.end();
+    }
     if (req.method === "GET" && p === "/queue") {
       if (!u) return send(res, 307, "", { location: "/login" });
-      return send(res, 200, page("Queue", ["/_next/static/chunks/main-app.js", "/_next/static/chunks/app/queue/page.js", ...(good ? [] : ["/_next/static/chunks/app/queue/admin-panel.js"])]));
+      // The queue lists the caller's own customers (manager: everyone), linked to their pages.
+      const mine = isManager(u) ? db.customers : db.customers.filter((c) => allocatedTo(u).includes(c.id as string));
+      const rows = mine.map((c) => `<tr><td><a href="/customers/${String(c.id)}">${String(c.legal_name).replace(/&/g, "&amp;")}</a></td></tr>`).join("");
+      return send(res, 200, page("Queue", ["/_next/static/chunks/main-app.js", "/_next/static/chunks/app/queue/page.js", ...(good ? [] : ["/_next/static/chunks/app/queue/admin-panel.js"])], `<table>${rows}</table>`));
     }
     const cm = p.match(/^\/customers\/([0-9a-f-]{36})$/);
     if (req.method === "GET" && cm) {
       if (!u) return send(res, 307, "", { location: "/login" });
       const c = db.customers.find((x) => x.id === cm[1]);
       if (!c || (good && !canSeeCustomer(u, cm[1]))) return send(res, 404, "<html>Not found</html>");
-      return send(res, 200, `<html><body><h1>${String(c.legal_name)}</h1></body></html>`);
+      // The message form as React renders it (text split by <!-- --> markers), plus the RSC props.
+      const options = db.templates.map((t) => `<option value="${String(t.id)}">${String(t.name)}<!-- --> (<!-- -->${String(t.category)}<!-- -->)</option>`).join("");
+      const props = JSON.stringify({ customerId: c.id, templates: db.templates.map((t) => ({ id: t.id, name: t.name, category: t.category, body: t.body })) }).replace(/"/g, '\\"');
+      return send(res, 200, `<html><body><h1>${String(c.legal_name)}</h1><select class="input">${options}</select><script>self.__next_f.push([1,"5:[\\"$\\",\\"$L6\\",null,${props}]"])</script></body></html>`);
     }
     if (req.method === "GET" && p === "/api/health") return send(res, 200, good ? { ok: true, db: "ok" } : { ok: true });
     if (req.method === "POST" && p === "/__observatory/api/v2/scan") return send(res, 200, { id: 1, grade: good ? "B+" : "F", score: good ? 80 : 0, tests_passed: good ? 9 : 3, tests_failed: good ? 1 : 7, tests_quantity: 10, details_url: "https://developer.mozilla.org/en-US/observatory/analyze?host=example", scanned_at: new Date().toISOString() });
@@ -520,7 +572,10 @@ export async function startFakeTarget(mode: Mode): Promise<FakeTarget> {
       if (!file) return send(res, 400, { error: "No file" });
       counters.imports++;
       const doc = JSON.parse(file.toString("utf8")) as { headers: string[]; rows: FileRow[] };
-      return good ? goodImport(doc, res) : badImport(doc, res);
+      if (good) return goodImport(doc, res);
+      // F14: the import "starts" and runs in the background, failing silently.
+      setTimeout(() => badImport(doc), 20);
+      return send(res, 200, { ok: true, message: "Import started. Refresh the queue in a minute." });
     }
     return send(res, 404, "<html>404</html>");
   });
@@ -564,7 +619,7 @@ export async function startFakeTarget(mode: Mode): Promise<FakeTarget> {
 
   // F08 (delete all, insert again: new IDs, orphaned history), F09 (phones as numbers),
   // F11 (stale status copied), F14 (no validation; a bad file crashes half-way).
-  function badImport(doc: { headers: string[]; rows: FileRow[] }, res: http.ServerResponse) {
+  function badImport(doc: { headers: string[]; rows: FileRow[] }) {
     db.customers.length = 0;
     db.lines.length = 0;
     db.allocations.length = 0;
@@ -573,14 +628,14 @@ export async function startFakeTarget(mode: Mode): Promise<FakeTarget> {
       db.customers.push(c);
       db.lines.push({ id: randomUUID(), customer_id: c.id, msisdn_e164: Number(r.msisdn.replace(/\D/g, "")), priceplan: r.priceplan, contract_end_date: r.end, contract_status: r.status, active: true, ported_out_at: null });
     }
-    // The renamed column is only noticed after everything was written.
-    if (!doc.headers.includes("Contract End Date")) return send(res, 500, { error: "Internal Server Error" });
-    return send(res, 200, { imported: doc.rows.length });
+    // The renamed column is never noticed: end dates just go missing (F14, silently).
+    if (!doc.headers.includes("Contract End Date")) for (const l of db.lines) l.contract_end_date = null;
   }
 
   const appUrl = await listen(app);
   return {
     mode,
+    publishableKey: publishable,
     appUrl,
     supabaseUrl,
     observatoryUrl: `${appUrl}/__observatory`,

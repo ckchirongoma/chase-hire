@@ -44,6 +44,8 @@ export interface HttpResponse {
   url: string;
   status: number;
   headers: Record<string, string>;
+  /** Raw Set-Cookie values (the flattened header joins them with ", ", which Expires breaks). */
+  setCookies: string[];
   body: Buffer;
   truncated: boolean;
   ms: number;
@@ -80,7 +82,7 @@ function flatHeaders(h: http.IncomingHttpHeaders): Record<string, string> {
 function once(
   url: URL,
   opts: { method: string; headers: Record<string, string>; body?: Buffer; timeoutMs: number; maxBytes: number; allowPrivate: boolean },
-): Promise<{ status: number; headers: Record<string, string>; body: Buffer; truncated: boolean }> {
+): Promise<{ status: number; headers: Record<string, string>; setCookies: string[]; body: Buffer; truncated: boolean }> {
   return new Promise((resolve, reject) => {
     const mod = url.protocol === "https:" ? https : http;
     const signal = AbortSignal.timeout(opts.timeoutMs);
@@ -111,7 +113,7 @@ function once(
         const finish = (truncated: boolean) => {
           if (done) return;
           done = true;
-          resolve({ status, headers: flatHeaders(res.headers), body: Buffer.concat(chunks, size), truncated });
+          resolve({ status, headers: flatHeaders(res.headers), setCookies: res.headers["set-cookie"] ?? [], body: Buffer.concat(chunks, size), truncated });
         };
         stream.on("data", (chunk: Buffer) => {
           if (done) return;
@@ -173,6 +175,7 @@ export function createHttp(opts: { budget: Budget; allowPrivate?: boolean; defau
           url: final,
           status: res.status,
           headers: res.headers,
+          setCookies: res.setCookies,
           body: res.body,
           truncated: res.truncated,
           ms: Date.now() - started,
@@ -199,6 +202,14 @@ export function multipartFile(field: string, filename: string, contentType: stri
   );
   const tailBuf = Buffer.from(`\r\n--${boundary}--\r\n`);
   return { body: Buffer.concat([head, data, tailBuf]), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+/** multipart/form-data with text fields only (a no-JavaScript form post). */
+export function multipartFields(fields: readonly (readonly [string, string])[]): { body: Buffer; contentType: string } {
+  const boundary = `----chasehire${randomBytes(12).toString("hex")}`;
+  const clean = (s: string) => s.replace(/["\r\n]/g, "_");
+  const parts = fields.map(([name, value]) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${clean(name)}"\r\n\r\n${value}\r\n`));
+  return { body: Buffer.concat([...parts, Buffer.from(`--${boundary}--\r\n`)]), contentType: `multipart/form-data; boundary=${boundary}` };
 }
 
 /** Runs async tasks with a concurrency cap, preserving order. */

@@ -1,7 +1,8 @@
 import "server-only";
 import { fail, inconclusive, informational, pass, snippet, type CheckKey, type CheckResult, type Evidence } from "./checks";
+import { tagAttributes } from "./app-login";
 import { matchOptouts, type CustomerLite, type OptoutEntry } from "./expected";
-import { crawlAuthenticated, crawlPublic, findSupabase, newFrontEnd, signInAll, type FrontEnd, type Sessions, type SupabaseTarget } from "./frontend";
+import { connect, newFrontEnd, type FrontEnd, type Sessions, type SupabaseTarget } from "./frontend";
 import { BudgetExceeded, describeError, mapPool, SsrfError, type Http, type HttpResponse } from "./http";
 import { scanSecrets } from "./jwt";
 import { describeLogins, type ParsedLogins } from "./logins";
@@ -27,6 +28,8 @@ export interface UrlCheckInput {
   deployedUrl: string;
   logins: ParsedLogins;
   optouts: OptoutEntry[];
+  /** Where the opt-out list came from (evidence). */
+  optoutSource?: string;
   overrides?: { supabaseUrl?: string | null; anonKey?: string | null };
   observatoryUrl?: string;
   burstSize?: number;
@@ -44,9 +47,19 @@ interface Ctx {
   sbProblem: string | null;
   sbCandidates: string[];
   sessions: Sessions;
-  /** Customers allocated to (visible to) each agent. */
+  /** Customers allocated to (visible to) each agent: from REST, else from the pages they see. */
   allocated: { a: string[]; b: string[] };
+  /** Where `allocated` came from. */
+  allocatedVia: "rest" | "pages" | "none";
+  /** Customer id → the name a page showed for it (customer links' text). */
+  names: Map<string, string>;
 }
+
+/** Why the REST half of a check could not run (no project / key). */
+const noRest = (ctx: Ctx) =>
+  ctx.sbProblem?.startsWith("no publishable/anon key")
+    ? "the database was not probed directly: no publishable key (enter it in the harness form, or ask the candidate to add it to the test logins; see U3)"
+    : `the database was not probed directly (${ctx.sbProblem ?? "no Supabase project and publishable key"})`;
 
 /** Runs a check, turning time-outs and unexpected errors into "inconclusive". */
 async function guard(key: CheckKey, fn: () => Promise<CheckResult>): Promise<CheckResult> {
@@ -63,7 +76,7 @@ const json = (body: unknown) => ({ body: JSON.stringify(body), headers: { "conte
 
 async function appPost(ctx: Ctx, path: string, body: unknown, session: Session | null, timeoutMs = 20_000): Promise<HttpResponse> {
   const j = json(body);
-  const auth = session && ctx.sb ? appAuthHeaders(ctx.sb.url, session) : {};
+  const auth = session ? appAuthHeaders(ctx.sb?.url ?? null, session) : {};
   return ctx.http.request(new URL(path, ctx.base), { method: "POST", body: j.body, headers: { ...j.headers, ...auth }, timeoutMs, maxBytes: 256_000 });
 }
 
@@ -147,7 +160,7 @@ function u2(ctx: Ctx): CheckResult {
 
 async function u3(ctx: Ctx): Promise<CheckResult> {
   const sb = ctx.sb;
-  if (!sb) return inconclusive("U3", ctx.sbProblem ?? "the Supabase project could not be identified", { candidates: ctx.sbCandidates });
+  if (!sb) return inconclusive("U3", ctx.sbProblem ?? "the Supabase project could not be identified", { candidates: ctx.sbCandidates.slice(0, 8) });
   const rows: Evidence[] = [];
   const exposed: string[] = [];
   const unclear: string[] = [];
@@ -181,94 +194,141 @@ type Row = Record<string, unknown>;
 const ids = (rows: Row[] | null, col = "id") => (rows ?? []).map((r) => String(r[col])).filter((x) => x && x !== "undefined" && x !== "null");
 
 async function loadAllocations(ctx: Ctx): Promise<void> {
-  const sb = ctx.sb!;
+  const sb = ctx.sb;
+  const pageKey = { a: "agent_a", b: "agent_b" } as const;
+  let via: Ctx["allocatedVia"] = "none";
   for (const who of ["a", "b"] as const) {
     const s = ctx.sessions[who];
     if (!s) continue;
-    const r = await sb.probe.select("allocations", { select: "customer_id,agent_id", agent_id: `eq.${s.userId}`, limit: "1000" }, s);
-    let list = is2xx(r.status) ? ids(r.rows, "customer_id") : [];
+    let list: string[] = [];
+    if (sb) {
+      const r = await sb.probe.select("allocations", { select: "customer_id,agent_id", agent_id: `eq.${s.userId}`, limit: "1000" }, s);
+      list = is2xx(r.status) ? ids(r.rows, "customer_id") : [];
+      if (!list.length) {
+        // No allocations table (or none for this agent): fall back to the customers this agent can see.
+        const c = await sb.probe.select("customers", { select: "id", limit: "200" }, s);
+        list = is2xx(c.status) ? ids(c.rows) : [];
+      }
+      if (list.length) via = "rest";
+    }
     if (!list.length) {
-      // No allocations table (or none for this agent): fall back to the customers this agent can see.
-      const c = await sb.probe.select("customers", { select: "id", limit: "200" }, s);
-      list = is2xx(c.status) ? ids(c.rows) : [];
+      // No REST access: the customers this agent's pages link to.
+      list = (ctx.fe.customerLinks[pageKey[who]] ?? []).map((l) => l.id);
+      if (list.length && via === "none") via = "pages";
     }
     ctx.allocated[who] = [...new Set(list)];
   }
+  ctx.allocatedVia = via;
+  for (const links of Object.values(ctx.fe.customerLinks)) for (const l of links) if (l.text.length >= 3 && !ctx.names.has(l.id)) ctx.names.set(l.id, l.text);
+}
+
+const h1Of = (html: string) =>
+  html
+    .match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]
+    ?.replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() ?? "";
+
+/** Agent A opening a page of a customer only agent B has: does A see what B sees? */
+async function pageLeak(ctx: Ctx, a: Session, b: Session, customerId: string, knownName: string | null): Promise<{ probe: Evidence; leak: string | null } | null> {
+  const fromLinks = Object.values(ctx.fe.customerLinks)
+    .flat()
+    .find((l) => l.id === customerId)?.url;
+  const paths = [...new Set([fromLinks ? new URL(fromLinks).pathname : null, `/customers/${customerId}`, `/customer/${customerId}`].filter((x): x is string => !!x))];
+  for (const path of paths) {
+    const url = new URL(path, ctx.base).toString();
+    const asB = await ctx.http.request(url, { headers: appAuthHeaders(ctx.sb?.url ?? null, b), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
+    if (!asB || asB.status !== 200) continue;
+    const bText = asB.text();
+    const marker = [knownName, h1Of(bText)].find((n): n is string => !!n && n.trim().length >= 4 && bText.toLowerCase().includes(n.toLowerCase())) ?? null;
+    if (!marker) continue;
+    const asA = await ctx.http.request(url, { headers: appAuthHeaders(ctx.sb?.url ?? null, a), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
+    const shown = !!asA && asA.status === 200 && asA.text().toLowerCase().includes(marker.toLowerCase());
+    return { probe: { probe: `GET ${path} as A (B sees "${marker.slice(0, 60)}" there)`, status: asA?.status ?? null, shows_customer: shown }, leak: shown ? `agent A can open ${path} (a customer allocated only to agent B)` : null };
+  }
+  return null;
 }
 
 async function u4(ctx: Ctx): Promise<CheckResult> {
   const { a, b } = ctx.sessions;
   const sb = ctx.sb;
-  if (!sb) return inconclusive("U4", ctx.sbProblem ?? "the Supabase project could not be identified");
   if (!a || !b) return inconclusive("U4", `two agent sign-ins are needed (${ctx.sessions.errors.join("; ") || "missing logins"})`, { logins: describeLogins(ctx.sessions.logins) });
   const leaks: string[] = [];
-  const evidence: Evidence = { agent_a: a.email, agent_b: b.email };
+  const evidence: Evidence = { agent_a: a.email, agent_b: b.email, signed_in_via: a.via ?? null, customers_from: ctx.allocatedVia };
   const bOnly = ctx.allocated.b.filter((c) => !ctx.allocated.a.includes(c));
   evidence.b_only_customers = bOnly.length;
-
-  // B's own rows (as B).
-  const bAlloc = await sb.probe.select("allocations", { select: "id,customer_id,agent_id", agent_id: `eq.${b.userId}`, limit: "200" }, b);
-  let bInter = await sb.probe.select("interactions", { select: "id,customer_id,agent_id", agent_id: `eq.${b.userId}`, limit: "200" }, b);
-  let probeCreated: string | null = null;
-  if (is2xx(bInter.status) && !(bInter.rows ?? []).length && (bOnly[0] ?? ctx.allocated.b[0])) {
-    // B has no interactions: log one as B so there is something of B's to look for.
-    const customer = bOnly[0] ?? ctx.allocated.b[0];
-    const ins = await sb.probe.insert("interactions", { customer_id: customer, agent_id: b.userId, outcome: "no_answer", notes: `${PROBE_NOTE} (U4): interaction owned by agent B` }, b, "return=representation");
-    if (is2xx(ins.status)) probeCreated = "rest";
-    else {
-      const api = await appPost(ctx, "/api/outcomes", { customerId: customer, outcome: "no_answer", notes: `${PROBE_NOTE} (U4): interaction owned by agent B` }, b).catch(() => null);
-      if (api && is2xx(api.status)) probeCreated = "api";
-    }
-    if (probeCreated) bInter = await sb.probe.select("interactions", { select: "id,customer_id,agent_id", agent_id: `eq.${b.userId}`, limit: "200" }, b);
-  }
-  const bInterIds = ids(bInter.rows);
-  const bAllocIds = ids(bAlloc.rows);
-  evidence.b_rows = { allocations: bAlloc.status === 200 ? bAllocIds.length : `HTTP ${bAlloc.status}`, interactions: bInter.status === 200 ? bInterIds.length : `HTTP ${bInter.status}`, probe_interaction: probeCreated ?? "none" };
-
-  // As A: anything of B's?
   const probes: Evidence[] = [];
-  const aInterByAgent = await sb.probe.select("interactions", { select: "id,agent_id", agent_id: `eq.${b.userId}`, limit: "50" }, a);
-  probes.push({ probe: "REST interactions where agent_id = B", status: aInterByAgent.status, rows: aInterByAgent.rows?.length ?? null });
-  if ((aInterByAgent.rows ?? []).length) leaks.push(`agent A reads ${aInterByAgent.rows!.length} of agent B's interactions via REST`);
-  if (bInterIds.length) {
-    const aInterById = await sb.probe.select("interactions", { select: "id", id: inList(bInterIds.slice(0, 50)) }, a);
-    probes.push({ probe: "REST interactions by B's ids", status: aInterById.status, rows: aInterById.rows?.length ?? null });
-    if ((aInterById.rows ?? []).length && !(aInterByAgent.rows ?? []).length) leaks.push(`agent A reads ${aInterById.rows!.length} of agent B's interactions by id`);
-  }
-  const aAlloc = await sb.probe.select("allocations", { select: "id,agent_id", agent_id: `eq.${b.userId}`, limit: "50" }, a);
-  probes.push({ probe: "REST allocations where agent_id = B", status: aAlloc.status, rows: aAlloc.rows?.length ?? null });
-  if ((aAlloc.rows ?? []).length) leaks.push(`agent A reads ${aAlloc.rows!.length} of agent B's allocations via REST`);
-  if (bOnly.length) {
-    const aCust = await sb.probe.select("customers", { select: "id", id: inList(bOnly.slice(0, 50)) }, a);
-    probes.push({ probe: "REST customers allocated only to B", status: aCust.status, rows: aCust.rows?.length ?? null });
-    if ((aCust.rows ?? []).length) leaks.push(`agent A reads ${aCust.rows!.length} customers allocated only to agent B`);
 
-    // App routes: the AI summary and the customer page for B's customer.
+  // REST: B's own rows (as B), then whether A can read any of them.
+  let bInterIds: string[] = [];
+  let bAllocIds: string[] = [];
+  let restRan = false;
+  if (sb) {
+    const bAlloc = await sb.probe.select("allocations", { select: "id,customer_id,agent_id", agent_id: `eq.${b.userId}`, limit: "200" }, b);
+    let bInter = await sb.probe.select("interactions", { select: "id,customer_id,agent_id", agent_id: `eq.${b.userId}`, limit: "200" }, b);
+    let probeCreated: string | null = null;
+    if (is2xx(bInter.status) && !(bInter.rows ?? []).length && (bOnly[0] ?? ctx.allocated.b[0])) {
+      // B has no interactions: log one as B so there is something of B's to look for.
+      const customer = bOnly[0] ?? ctx.allocated.b[0];
+      const ins = await sb.probe.insert("interactions", { customer_id: customer, agent_id: b.userId, outcome: "no_answer", notes: `${PROBE_NOTE} (U4): interaction owned by agent B` }, b, "return=representation");
+      if (is2xx(ins.status)) probeCreated = "rest";
+      else {
+        const api = await appPost(ctx, "/api/outcomes", { customerId: customer, outcome: "no_answer", notes: `${PROBE_NOTE} (U4): interaction owned by agent B` }, b).catch(() => null);
+        if (api && is2xx(api.status)) probeCreated = "api";
+      }
+      if (probeCreated) bInter = await sb.probe.select("interactions", { select: "id,customer_id,agent_id", agent_id: `eq.${b.userId}`, limit: "200" }, b);
+    }
+    bInterIds = ids(bInter.rows);
+    bAllocIds = ids(bAlloc.rows);
+    evidence.b_rows = { allocations: bAlloc.status === 200 ? bAllocIds.length : `HTTP ${bAlloc.status}`, interactions: bInter.status === 200 ? bInterIds.length : `HTTP ${bInter.status}`, probe_interaction: probeCreated ?? "none" };
+
+    const aInterByAgent = await sb.probe.select("interactions", { select: "id,agent_id", agent_id: `eq.${b.userId}`, limit: "50" }, a);
+    probes.push({ probe: "REST interactions where agent_id = B", status: aInterByAgent.status, rows: aInterByAgent.rows?.length ?? null });
+    if ((aInterByAgent.rows ?? []).length) leaks.push(`agent A reads ${aInterByAgent.rows!.length} of agent B's interactions via REST`);
+    if (bInterIds.length) {
+      const aInterById = await sb.probe.select("interactions", { select: "id", id: inList(bInterIds.slice(0, 50)) }, a);
+      probes.push({ probe: "REST interactions by B's ids", status: aInterById.status, rows: aInterById.rows?.length ?? null });
+      if ((aInterById.rows ?? []).length && !(aInterByAgent.rows ?? []).length) leaks.push(`agent A reads ${aInterById.rows!.length} of agent B's interactions by id`);
+    }
+    const aAlloc = await sb.probe.select("allocations", { select: "id,agent_id", agent_id: `eq.${b.userId}`, limit: "50" }, a);
+    probes.push({ probe: "REST allocations where agent_id = B", status: aAlloc.status, rows: aAlloc.rows?.length ?? null });
+    if ((aAlloc.rows ?? []).length) leaks.push(`agent A reads ${aAlloc.rows!.length} of agent B's allocations via REST`);
+    if (bOnly.length) {
+      const aCust = await sb.probe.select("customers", { select: "id", id: inList(bOnly.slice(0, 50)) }, a);
+      probes.push({ probe: "REST customers allocated only to B", status: aCust.status, rows: aCust.rows?.length ?? null });
+      if ((aCust.rows ?? []).length) leaks.push(`agent A reads ${aCust.rows!.length} customers allocated only to agent B`);
+    }
+    restRan = [aInterByAgent.status, aAlloc.status].some((s) => is2xx(s) || refused(s));
+  }
+
+  // App routes: the AI summary and the customer page for B's customer, as A.
+  let appProbed = false;
+  if (bOnly.length) {
     const target = bOnly[0];
     const sum = await appPost(ctx, "/api/summary", { customerId: target }, a, 25_000).catch((e) => e as Error);
     if (!(sum instanceof Error)) {
+      appProbed = true;
       probes.push({ probe: "POST /api/summary for B's customer as A", status: sum.status, body: snippet(sum.text(), 160) });
       if (is2xx(sum.status)) leaks.push(`POST /api/summary as agent A returned ${sum.status} for a customer allocated only to agent B`);
     } else probes.push({ probe: "POST /api/summary for B's customer as A", error: describeError(sum) });
-
-    const name = await sb.probe.select("customers", { select: "legal_name", id: `eq.${target}` }, b);
-    const legal = String(name.rows?.[0]?.legal_name ?? "").trim();
-    if (legal.length >= 4) {
-      for (const path of [`/customers/${target}`, `/customer/${target}`]) {
-        const url = new URL(path, ctx.base).toString();
-        const asB = await ctx.http.request(url, { headers: appAuthHeaders(sb.url, b), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
-        if (!asB || asB.status !== 200 || !asB.text().toLowerCase().includes(legal.toLowerCase())) continue;
-        const asA = await ctx.http.request(url, { headers: appAuthHeaders(sb.url, a), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
-        const shown = !!asA && asA.status === 200 && asA.text().toLowerCase().includes(legal.toLowerCase());
-        probes.push({ probe: `GET ${path} as A (B sees the customer there)`, status: asA?.status ?? null, shows_customer: shown });
-        if (shown) leaks.push(`agent A can open ${path} (a customer allocated only to agent B)`);
-        break;
-      }
+    let legal: string | null = ctx.names.get(target) ?? null;
+    if (sb) {
+      const name = await sb.probe.select("customers", { select: "legal_name", id: `eq.${target}` }, b);
+      legal = String(name.rows?.[0]?.legal_name ?? "").trim() || legal;
+    }
+    const page = await pageLeak(ctx, a, b, target, legal);
+    if (page) {
+      appProbed = true;
+      probes.push(page.probe);
+      if (page.leak) leaks.push(page.leak);
     }
   }
   evidence.probes = probes;
   if (leaks.length) return fail("U4", `Cross-tenant leak: ${leaks.join("; ")}`, evidence);
-  const restRan = [aInterByAgent.status, aAlloc.status].some((s) => is2xx(s) || refused(s));
+  if (!sb) {
+    if (!bOnly.length) return inconclusive("U4", `no customer seen only by agent B was found on B's pages, and ${noRest(ctx)}`, evidence);
+    return inconclusive("U4", `the app routes kept agent B's customer from agent A${appProbed ? "" : " (not probed)"}, but ${noRest(ctx)}`, evidence);
+  }
   if (!restRan) return inconclusive("U4", "agent A's REST probes returned neither data nor a refusal", evidence);
   if (!bInterIds.length && !bAllocIds.length) return inconclusive("U4", "agent B has no interactions or allocations to look for (and a probe interaction could not be created)", evidence);
   return pass("U4", `Agent A sees none of agent B's ${bInterIds.length} interactions or ${bAllocIds.length} allocations (REST and app routes)`, evidence);
@@ -281,7 +341,8 @@ async function burst(ctx: Ctx, session: Session | null, customerId: string, opts
   let sent = 0;
   let first429: number | null = null;
   let stopped = false;
-  const statuses: (number | string)[] = [];
+  let htmlNotFound = 0;
+  let sample: string | null = null;
   const indices = Array.from({ length: opts.size }, (_, i) => i);
   await mapPool(indices, ctx.input.burstConcurrency ?? 10, async (i) => {
     if (stopped) return;
@@ -294,30 +355,37 @@ async function burst(ctx: Ctx, session: Session | null, customerId: string, opts
     try {
       const r = await appPost(ctx, "/api/summary", { customerId }, session, 20_000);
       status = r.status;
+      if (status === 404 && looksHtml(r)) htmlNotFound++;
+      if (sample === null && ![401, 403, 429].includes(status)) sample = `${status} ${snippet(r.text(), 120)}`;
     } catch (err) {
-      if (err instanceof SsrfError) throw err;
+      if (err instanceof SsrfError || err instanceof BudgetExceeded) throw err;
     }
     const key = status === null ? "error" : String(status);
     counts.set(key, (counts.get(key) ?? 0) + 1);
-    if (statuses.length < 120) statuses.push(status ?? "err");
     if (status === 429 && first429 === null) first429 = i + 1;
     if (opts.stop(counts, status)) stopped = true;
   });
-  return { counts: Object.fromEntries(counts), sent, first429, budgetStopped: sent < opts.size && ctx.http.budget.remaining() < 8_000 };
+  return { counts: Object.fromEntries(counts), sent, first429, htmlNotFound, sample, budgetStopped: sent < opts.size && ctx.http.budget.remaining() < 8_000 };
 }
 
 async function u5(ctx: Ctx): Promise<CheckResult> {
   const size = ctx.input.burstSize ?? 100;
-  const customer = ctx.allocated.a[0] ?? ctx.allocated.b[0] ?? "00000000-0000-0000-0000-000000000000";
-  const okUnauth = (s: string) => ["401", "403", "429"].includes(s) || /^3\d\d$/.test(s);
-  // Stop early on the third anonymous success: the fault is proven and each success costs an LLM call.
-  const anon = await burst(ctx, null, customer, { size, stop: (c) => [...c.entries()].filter(([k]) => /^2/.test(k)).reduce((n, [, v]) => n + v, 0) >= 3 });
+  const anyLinked = Object.values(ctx.fe.customerLinks).flat()[0]?.id;
+  const customer = ctx.allocated.a[0] ?? ctx.allocated.b[0] ?? anyLinked ?? "00000000-0000-0000-0000-000000000000";
+  const refusal = (s: string) => ["401", "403", "429"].includes(s) || /^3\d\d$/.test(s);
+  // Stop early on the third anonymous answer that is not a refusal: the fault is proven, and a success costs an LLM call.
+  const anon = await burst(ctx, null, customer, { size, stop: (c) => [...c.entries()].filter(([k]) => k !== "error" && !refusal(k)).reduce((n, [, v]) => n + v, 0) >= 3 });
+  const evidence: Evidence = { requests: size, customer_id: customer, unauthenticated: anon.counts, unauthenticated_sent: anon.sent, unauthenticated_sample: anon.sample };
   const anonEntries = Object.entries(anon.counts);
-  const evidence: Evidence = { requests: size, customer_id: customer, unauthenticated: anon.counts, unauthenticated_sent: anon.sent };
-  const anonOk = anonEntries.filter(([k]) => /^2/.test(k)).reduce((n, [, v]) => n + v, 0);
+  const count = (pred: (k: string) => boolean) => anonEntries.filter(([k]) => pred(k)).reduce((n, [, v]) => n + v, 0);
+  const anonOk = count((k) => /^2/.test(k));
   if (anonOk > 0) return fail("U5", `/api/summary answered ${anonOk} unauthenticated request${anonOk === 1 ? "" : "s"} with 2xx (no auth on the AI route)`, evidence);
-  if ((anon.counts["404"] ?? 0) === anon.sent && anon.sent > 0) return inconclusive("U5", "/api/summary returns 404 (route renamed?)", evidence);
-  const anonBad = anonEntries.filter(([k]) => !okUnauth(k));
+  if (anon.htmlNotFound === anon.sent && anon.sent > 0) return inconclusive("U5", "/api/summary is not found (HTML 404: route renamed?)", evidence);
+  const notRefused = count((k) => k !== "error" && !refusal(k)) - anon.htmlNotFound;
+  if (notRefused > 0 && count(refusal) === 0) {
+    return fail("U5", `/api/summary never refused an unauthenticated caller with 401/403: it ran the request (${anonEntries.map(([k, v]) => `${k} x${v}`).join(", ")}), so anyone can call the AI route`, evidence);
+  }
+  const anonBad = anonEntries.filter(([k]) => !refusal(k));
   if (anonBad.length) evidence.unauthenticated_unexpected = anonBad.map(([k, v]) => `${k} x${v}`);
 
   const a = ctx.sessions.a;
@@ -326,6 +394,7 @@ async function u5(ctx: Ctx): Promise<CheckResult> {
   evidence.authenticated = authed.counts;
   evidence.authenticated_sent = authed.sent;
   evidence.first_429_at = authed.first429;
+  evidence.signed_in_via = a.via ?? null;
   if (authed.first429 !== null) {
     if (anonBad.length) return inconclusive("U5", `the per-user limit works (429 at request ${authed.first429}), but some unauthenticated requests got unexpected statuses (${anonBad.map(([k]) => k).join(", ")})`, evidence);
     return pass("U5", `Unauthenticated requests refused; authenticated burst hit 429 at request ${authed.first429}`, evidence);
@@ -340,19 +409,24 @@ async function u5(ctx: Ctx): Promise<CheckResult> {
 async function u6(ctx: Ctx): Promise<CheckResult> {
   const sb = ctx.sb;
   const a = ctx.sessions.a;
-  if (!sb) return inconclusive("U6", ctx.sbProblem ?? "the Supabase project could not be identified");
   if (!a) return inconclusive("U6", `no agent could sign in (${ctx.sessions.errors.join("; ")})`);
   const customer = ctx.allocated.a[0];
-  if (!customer) return inconclusive("U6", "agent A has no allocated customer to log an outcome for");
-  const evidence: Evidence = { agent: a.email, customer_id: customer };
+  if (!customer) return inconclusive("U6", `agent A has no allocated customer to log an outcome for${sb ? "" : ` (none linked from A's pages, and ${noRest(ctx)})`}`);
+  const evidence: Evidence = { agent: a.email, customer_id: customer, customers_from: ctx.allocatedVia };
 
   // 1. The DB path, bypassing the app: an insert without next_action_at must fail.
-  let rest = await sb.probe.insert("interactions", { customer_id: customer, agent_id: a.userId, outcome: "call_back", notes: `${PROBE_NOTE} (U6): call_back without a date` }, a, "return=representation");
-  if (rest.code === "PGRST204") rest = await sb.probe.insert("interactions", { customer_id: customer, outcome: "call_back", notes: `${PROBE_NOTE} (U6): call_back without a date` }, a, "return=representation");
-  evidence.rest = { status: rest.status, code: rest.code, message: rest.message };
-  const restCreated = is2xx(rest.status);
-  // Refused by RLS/grants (the DB path is closed) or by a constraint/trigger (23xxx, P0xxx).
-  const restHeld = !restCreated && (rest.status === 401 || rest.status === 403 || rest.code === "42501" || (rest.code !== null && /^(23|P0)/.test(rest.code)));
+  let restCreated = false;
+  let restHeld = false;
+  let rest: { status: number; code: string | null } | null = null;
+  if (sb) {
+    let r = await sb.probe.insert("interactions", { customer_id: customer, agent_id: a.userId, outcome: "call_back", notes: `${PROBE_NOTE} (U6): call_back without a date` }, a, "return=representation");
+    if (r.code === "PGRST204") r = await sb.probe.insert("interactions", { customer_id: customer, outcome: "call_back", notes: `${PROBE_NOTE} (U6): call_back without a date` }, a, "return=representation");
+    evidence.rest = { status: r.status, code: r.code, message: r.message };
+    rest = r;
+    restCreated = is2xx(r.status);
+    // Refused by RLS/grants (the DB path is closed) or by a constraint/trigger (23xxx, P0xxx).
+    restHeld = !restCreated && (r.status === 401 || r.status === 403 || r.code === "42501" || (r.code !== null && /^(23|P0)/.test(r.code)));
+  }
 
   // 2. The app route, bypassing the UI.
   const api = await appPost(ctx, "/api/outcomes", { customerId: customer, outcome: "call_back", notes: `${PROBE_NOTE} (U6): call_back without a date` }, a);
@@ -371,66 +445,162 @@ async function u6(ctx: Ctx): Promise<CheckResult> {
   evidence.control = { status: control.status, body: snippet(control.text(), 160) };
   if (!is2xx(control.status)) return inconclusive("U6", `the app also refused a valid call_back with a date (HTTP ${control.status}), so the refusal proves nothing`, evidence);
   if (!is4xx(api.status)) return inconclusive("U6", `POST /api/outcomes without a date returned HTTP ${api.status} (expected 4xx)`, evidence);
+  if (!sb || !rest) return inconclusive("U6", `POST /api/outcomes refuses a call_back without a date (${api.status}) and accepts one with a date, but ${noRest(ctx)}`, evidence);
   if (!restHeld) return inconclusive("U6", `the REST insert returned HTTP ${rest.status}${rest.code ? ` (${rest.code})` : ""}: unclear whether the DB rule holds`, evidence);
   return pass("U6", `call_back without a date refused by the API (${api.status}) and the database (${rest.code ?? rest.status}); a dated call_back is accepted`, evidence);
 }
 
 // ───────────────────────── U7 ─────────────────────────
 
+export interface PageTemplate {
+  id: string;
+  category: string | null;
+}
+
+/**
+ * Message templates offered on a customer page: a template <select> (named template…, or
+ * whose options say utility / marketing / template), the server-rendered props in the RSC
+ * payload ("templates":[{"id":…,"category":…}]), or a hidden template input. Utility first.
+ */
+export function templatesFromPage(html: string): PageTemplate[] {
+  const out = new Map<string, PageTemplate>();
+  const add = (id: string | undefined, category: string | null) => {
+    if (id && id.length <= 80 && !out.has(id)) out.set(id, { id, category });
+  };
+  for (const sel of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select\s*>/gi)) {
+    const name = tagAttributes(`<select ${sel[1]}>`).name ?? "";
+    const options = [...sel[2].matchAll(/(<option\b[^>]*>)([\s\S]*?)<\/option\s*>/gi)];
+    if (!/template/i.test(name) && !options.some((o) => /utility|marketing|template/i.test(o[2]))) continue;
+    for (const o of options) {
+      const at = tagAttributes(o[1]);
+      if (at.value && !("disabled" in at)) add(at.value, /utility/i.test(o[2]) ? "utility" : /marketing/i.test(o[2]) ? "marketing" : null);
+    }
+  }
+  const flat = html.replace(/\\"/g, '"');
+  for (const m of flat.matchAll(/"templates?"\s*:\s*\[/g)) {
+    // Each object's id, paired with the category before the next id (bodies may hold braces).
+    const region = flat.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 20_000);
+    const objects = region.split(/"id"\s*:\s*"/).slice(1);
+    for (const o of objects.slice(0, 50)) add(o.match(/^([^"]{1,80})"/)?.[1], o.match(/"category"\s*:\s*"([^"]{1,40})"/)?.[1] ?? null);
+  }
+  for (const i of html.matchAll(/<input\b[^>]*>/gi)) {
+    const at = tagAttributes(i[0]);
+    if (at.name && /template/i.test(at.name) && at.value) add(at.value, null);
+  }
+  return [...out.values()].sort((a, b) => Number(/utility/i.test(b.category ?? "")) - Number(/utility/i.test(a.category ?? "")));
+}
+
+/** Does the page show a template picker (the messaging form is not blocked for this customer)? */
+const showsTemplatePicker = (html: string) => {
+  // React marks text boundaries with <!-- --> comments: "Reminder<!-- --> (<!-- -->utility<!-- -->)".
+  const clean = html.replace(/<!--[\s\S]*?-->/g, "");
+  return /<select\b[\s\S]*?<\/select\s*>/i.test(clean) && /<option\b[^>]*>[^<]*(utility|marketing|template)/i.test(clean);
+};
+
 async function u7(ctx: Ctx): Promise<CheckResult> {
   const sb = ctx.sb;
-  if (!sb) return inconclusive("U7", ctx.sbProblem ?? "the Supabase project could not be identified");
   const sessions = [
-    ["agent A", ctx.sessions.a],
-    ["agent B", ctx.sessions.b],
-    ["manager", ctx.sessions.manager],
-  ].filter((x): x is [string, Session] => !!x[1]);
+    ["agent A", ctx.sessions.a, "agent_a"],
+    ["agent B", ctx.sessions.b, "agent_b"],
+    ["manager", ctx.sessions.manager, "manager"],
+  ].filter((x): x is [string, Session, string] => !!x[1]);
   if (!sessions.length) return inconclusive("U7", `nobody could sign in (${ctx.sessions.errors.join("; ")})`);
 
   let entries = ctx.input.optouts;
   const evidence: Evidence = {};
-  if (!entries.length && ctx.sessions.manager) {
+  if (!entries.length && sb && ctx.sessions.manager) {
     // No bundle list: use the app's own opt-out table.
     const o = await sb.probe.select("optouts", { select: "company_name,normalised_name,customer_id", limit: "200" }, ctx.sessions.manager);
     entries = (o.rows ?? []).map((r) => ({ listedName: String(r.company_name ?? ""), normalised: String(r.normalised_name ?? ""), status: "Opted out", regNo: null, accountNos: [] }));
     evidence.list_source = `app optouts table (${entries.length})`;
-  } else evidence.list_source = `bundle opt-out list (${entries.length} names)`;
+  } else evidence.list_source = ctx.input.optoutSource ?? `bundle opt-out list (${entries.length} names)`;
   if (!entries.length) return inconclusive("U7", "no opt-out list available (bundle missing and the app's optouts table is empty or unreadable)", evidence);
 
-  let pick: { who: string; session: Session; customer: CustomerLite; via: string; listed: string } | null = null;
-  for (const [who, s] of sessions) {
-    const c = await sb.probe.selectAll<CustomerLite>("customers", { select: "id,reg_no,legal_name,normalised_name" }, s, 5000);
-    const rows = c.rows ?? (await sb.probe.selectAll<CustomerLite>("customers", { select: "*" }, s, 5000)).rows ?? [];
+  // Opted-out customers one signed-in user can see.
+  type Cand = { who: string; session: Session; customer: CustomerLite; via: string; listed: string; page: string | null };
+  let cands: Cand[] = [];
+  for (const [who, s, pageKey] of sessions) {
+    if (cands.length >= 25) break;
+    let rows: CustomerLite[] = [];
+    if (sb) {
+      const c = await sb.probe.selectAll<CustomerLite>("customers", { select: "id,reg_no,legal_name,normalised_name" }, s, 5000);
+      rows = c.rows ?? (await sb.probe.selectAll<CustomerLite>("customers", { select: "*" }, s, 5000)).rows ?? [];
+    }
+    const links = ctx.fe.customerLinks[pageKey] ?? [];
+    if (!rows.length) rows = links.map((l) => ({ id: l.id, legal_name: l.text }));
     const matches = matchOptouts(rows, entries);
     evidence[`matches_${who.replace(/\s+/g, "_").toLowerCase()}`] = matches.length;
-    if (matches.length) {
-      const m = matches[0];
-      pick = { who, session: s, customer: m.customer, via: m.via, listed: m.entry.listedName };
-      break;
+    for (const m of matches.slice(0, 25)) {
+      if (!cands.some((c) => c.customer.id === m.customer.id)) cands.push({ who, session: s, customer: m.customer, via: m.via, listed: m.entry.listedName, page: links.find((l) => l.id === m.customer.id)?.url ?? null });
     }
+    // With REST every user sees their full list: the first user with matches is enough.
+    if (sb && cands.length) break;
   }
-  if (!pick) return inconclusive("U7", "none of the customers the test users can see is on the opt-out list (by reg no or normalised name)", evidence);
+  if (!cands.length) return inconclusive("U7", `none of the customers the test users can see is on the opt-out list (by reg no or normalised name)${sb ? "" : `; only customers linked from their pages were checked, and ${noRest(ctx)}`}`, evidence);
+
+  // Prefer a customer who could otherwise be messaged (a consented contact point), so a refusal
+  // is down to the opt-out and not to missing consent.
+  const pageOf = new Map<string, string>();
+  const fetchPage = async (c: Cand) => {
+    const url = c.page ?? new URL(`/customers/${c.customer.id}`, ctx.base).toString();
+    const r = await ctx.http.request(url, { headers: appAuthHeaders(sb?.url ?? null, c.session), timeoutMs: 12_000, maxBytes: 1_000_000 }).catch(() => null);
+    if (r && r.status === 200) pageOf.set(c.customer.id, r.text());
+  };
+  if (sb) {
+    const cp = await sb.probe.select("contact_points", { select: "customer_id,consent_status", customer_id: inList(cands.map((c) => c.customer.id)), limit: "1000" }, cands[0].session);
+    if (cp.rows) {
+      const consented = new Set(cp.rows.filter((r) => r.consent_status && !/opted[\s_-]?out|unknown|none|^no$|refused|withdrawn/i.test(String(r.consent_status))).map((r) => String(r.customer_id)));
+      cands = [...cands.filter((c) => consented.has(c.customer.id)), ...cands.filter((c) => !consented.has(c.customer.id))];
+      evidence.with_consented_contact = consented.size;
+    }
+  } else {
+    // No REST: a customer whose page still offers the template picker is one the app would message.
+    await mapPool(cands.slice(0, 10), 3, fetchPage);
+    const open = cands.filter((c) => showsTemplatePicker(pageOf.get(c.customer.id) ?? ""));
+    cands = [...open, ...cands.filter((c) => !open.includes(c))];
+    evidence.pages_with_message_form = open.length;
+  }
+  const pick = cands[0];
   evidence.customer = { id: pick.customer.id, legal_name: pick.customer.legal_name ?? null, listed_as: pick.listed, matched_by: pick.via, as: pick.who };
 
-  const t = await sb.probe.select<Row>("templates", { select: "id,name,category,approved", limit: "50" }, pick.session);
-  const templates = t.rows ?? [];
-  const template =
-    templates.find((x) => x.approved === true && /utility/i.test(String(x.category ?? ""))) ?? templates.find((x) => x.approved === true) ?? templates[0];
-  if (!template) return inconclusive("U7", `no message template is visible to the ${pick.who} (HTTP ${t.status})`, evidence);
-  evidence.template = { id: String(template.id), name: String(template.name ?? ""), approved: Boolean(template.approved) };
+  let templateId: string | null = null;
+  if (sb) {
+    const t = await sb.probe.select<Row>("templates", { select: "id,name,category,approved", limit: "50" }, pick.session);
+    const templates = t.rows ?? [];
+    const template = templates.find((x) => x.approved === true && /utility/i.test(String(x.category ?? ""))) ?? templates.find((x) => x.approved === true) ?? templates[0];
+    if (template) {
+      templateId = String(template.id);
+      evidence.template = { id: templateId, name: String(template.name ?? ""), approved: Boolean(template.approved), from: "rest" };
+    } else evidence.template_rest_status = t.status;
+  }
+  if (!templateId) {
+    if (!pageOf.has(pick.customer.id)) await fetchPage(pick);
+    const found = templatesFromPage(pageOf.get(pick.customer.id) ?? "")[0];
+    if (found) {
+      templateId = found.id;
+      evidence.template = { id: found.id, category: found.category, from: "customer page" };
+    }
+  }
+  if (!templateId) return inconclusive("U7", `no message template is visible to the ${pick.who} (not via REST, not on the customer's page)`, evidence);
 
-  const api = await appPost(ctx, "/api/messages", { customerId: pick.customer.id, templateId: template.id }, pick.session);
+  const api = await appPost(ctx, "/api/messages", { customerId: pick.customer.id, templateId }, pick.session);
   const body = api.text();
   evidence.api = { status: api.status, body: snippet(body, 200) };
-  const rest = await sb.probe.insert("message_queue", { customer_id: pick.customer.id, template_id: template.id, status: "queued", created_by: pick.session.userId }, pick.session, "return=representation");
-  evidence.rest = { status: rest.status, code: rest.code, message: rest.message };
+  let rest: { status: number; code: string | null } | null = null;
+  if (sb) {
+    const r = await sb.probe.insert("message_queue", { customer_id: pick.customer.id, template_id: templateId, status: "queued", created_by: pick.session.userId }, pick.session, "return=representation");
+    evidence.rest = { status: r.status, code: r.code, message: r.message };
+    rest = r;
+  }
 
-  const queued = [is2xx(api.status) ? `POST /api/messages returned ${api.status}` : null, is2xx(rest.status) ? "a REST insert into message_queue succeeded" : null].filter(Boolean);
+  const queued = [is2xx(api.status) ? `POST /api/messages returned ${api.status}` : null, rest && is2xx(rest.status) ? "a REST insert into message_queue succeeded" : null].filter(Boolean);
   if (queued.length) return fail("U7", `A message was queued to an opted-out customer (${pick.listed}): ${queued.join("; ")}`, evidence);
   if (api.status === 401) return inconclusive("U7", "POST /api/messages refused the signed-in user (401): session not accepted, test by hand", evidence);
   if (api.status === 404 && (looksHtml(api) || !/opt|consent|block/i.test(body))) return inconclusive("U7", "POST /api/messages returned 404 (route renamed?)", evidence);
   if (!is4xx(api.status)) return inconclusive("U7", `POST /api/messages returned HTTP ${api.status} (expected 4xx)`, evidence);
   const saysOptOut = /opt[\s_-]?(?:ed[\s_-]?)?out|do[\s_-]?not[\s_-]?contact|legal|unsubscrib|suppress/i.test(body);
+  if (!saysOptOut && /consent|contact/i.test(body)) return inconclusive("U7", `the message to "${pick.listed}" was refused for a missing consented contact, not the opt-out, so the opt-out rule was not tested`, evidence);
+  if (!rest) return inconclusive("U7", `POST /api/messages refused the opted-out customer "${pick.listed}" (${api.status}), but ${noRest(ctx)}`, evidence);
   return pass(
     "U7",
     `Message to opted-out customer "${pick.listed}" refused by the API (${api.status}) and the database (${rest.code ?? rest.status})`,
@@ -487,21 +657,20 @@ export async function runUrlChecks(input: UrlCheckInput): Promise<{ results: Che
     sbCandidates: [],
     sessions: { a: null, b: null, manager: null, errors: [], logins: input.logins },
     allocated: { a: [], b: [] },
+    allocatedVia: "none",
+    names: new Map(),
   };
   const u1p = guard("U1", () => u1(ctx));
   const u8p = guard("U8", () => u8(ctx));
 
-  // Public crawl → Supabase target → sign-ins → authenticated crawl.
+  // Public crawl → Supabase target → sign-ins (Supabase Auth, else the app's login form) →
+  // signed-in crawl → the key again from what signed-in pages ship → who sees which customers.
   const setup: string[] = [];
   try {
-    await crawlPublic(ctx.http, ctx.fe);
-    const found = await findSupabase(ctx.http, ctx.fe, input.overrides);
-    ctx.sb = found.target;
-    ctx.sbProblem = found.problem;
-    ctx.sbCandidates = found.candidates;
-    ctx.sessions = await signInAll(ctx.sb, input.logins);
-    if (ctx.sb && (ctx.sessions.a || ctx.sessions.manager)) await crawlAuthenticated(ctx.http, ctx.fe, ctx.sb, ctx.sessions);
-    if (ctx.sb) await loadAllocations(ctx);
+    const c = await connect(ctx.http, base, input.logins, { supabaseUrl: input.overrides?.supabaseUrl ?? null, anonKey: input.overrides?.anonKey ?? null });
+    Object.assign(ctx, { fe: c.fe, sb: c.sb, sbProblem: c.sbProblem, sbCandidates: c.sbCandidates, sessions: c.sessions });
+    setup.push(...c.setupErrors);
+    await loadAllocations(ctx);
   } catch (err) {
     setup.push(describeError(err));
   }
@@ -522,6 +691,8 @@ export async function runUrlChecks(input: UrlCheckInput): Promise<{ results: Che
     supabase_problem: ctx.sbProblem,
     logins: describeLogins(input.logins),
     signed_in: { agent_a: !!ctx.sessions.a, agent_b: !!ctx.sessions.b, manager: !!ctx.sessions.manager },
+    signed_in_via: ctx.sessions.a?.via ?? ctx.sessions.manager?.via ?? null,
+    customers_from: ctx.allocatedVia,
     sign_in_errors: ctx.sessions.errors,
     setup_errors: setup,
   };

@@ -5,7 +5,9 @@ import { PRICE_PLANS } from "@/lib/synth/base";
 import { buildBundles, scanForBanned, unresolvedPlaceholders, type BuiltFile } from "@/lib/synth";
 import { buildBundleA } from "@/lib/synth/bundle-a";
 import { buildBundleB } from "@/lib/synth/bundle-b";
-import { buildBundleC } from "@/lib/synth/bundle-c";
+import fs from "node:fs";
+import path from "node:path";
+import { buildBundleC, C_HANDOFF_SOURCE, readHandoffPack } from "@/lib/synth/bundle-c";
 import { fillStarterRepoUrl, placeholdersIn } from "@/lib/synth/placeholders";
 import { deriveBundleA, diffMonths, msisdnToE164 } from "@/lib/synth/verify";
 import { readWorkbook } from "@/lib/synth/xlsx";
@@ -45,6 +47,7 @@ describe("generator output", () => {
         "bundle_b/candidate/solution_brief.md",
         "bundle_b/candidate/templates.csv",
         "bundle_b/internal/meta.json",
+        "bundle_c/candidate/HANDOFF.md",
         "bundle_c/candidate/README.md",
         "bundle_c/candidate/base_month1.xlsx",
         "bundle_c/candidate/contacts_agent_sheets.xlsx",
@@ -393,6 +396,33 @@ describe("bundle C (SWE Test 1)", () => {
     expect(() => fillStarterRepoUrl("x STARTER_REPO_URL", "http://example.com/starter")).toThrow(/github/);
     expect(() => fillStarterRepoUrl("x STARTER_REPO_URL", "not a url")).toThrow();
   }, 120_000);
+});
+
+describe("bundle C handoff pack", () => {
+  it("ships assessment-kits/HANDOFF.md unchanged as a candidate file, listed in the README", () => {
+    const handoff = file("bundle_c/candidate/HANDOFF.md").toString();
+    expect(handoff).toBe(fs.readFileSync(path.resolve(C_HANDOFF_SOURCE), "utf8"));
+    for (let n = 1; n <= 12; n++) expect(handoff).toContain(`RD-${String(n).padStart(2, "0")}`);
+    expect(handoff).toMatch(/### RD-07 [^\n]*\(must\)/);
+    expect(handoff).toMatch(/### RD-11 [^\n]*\(must\)/);
+    expect(handoff).toMatch(/\*\*Given\*\*[^\n]*\*\*when\*\*[^\n]*\*\*then\*\*/);
+    expect(handoff).toContain("BZF150");
+    expect(handoff).toContain("## 5. Access matrix");
+    expect(findBanned(handoff)).toEqual([]);
+    expect(placeholdersIn(handoff)).toEqual([]);
+    expect(file("bundle_c/candidate/README.md").toString()).toContain("`HANDOFF.md`");
+  });
+
+  it("does not leak the internal answer key or harness contract into the handoff pack", () => {
+    const handoff = file("bundle_c/candidate/HANDOFF.md").toString();
+    expect(handoff).not.toMatch(/\bF(0[1-9]|1[0-4])\b|planted|verification_runs|harness|month[ _-]?2|expected_month2/i);
+  });
+
+  it("finds the pack from a subfolder, accepts an override, and fails clearly outside the repository", () => {
+    expect(readHandoffPack(path.resolve("lib/synth"))).toBe(readHandoffPack());
+    expect(buildBundleC(SEED, "vtest", { handoffMd: "# test pack" }).handoff).toBe("# test pack");
+    expect(() => readHandoffPack(path.parse(process.cwd()).root)).toThrow(/HANDOFF\.md not found/);
+  });
 });
 
 describe("bundle D", () => {

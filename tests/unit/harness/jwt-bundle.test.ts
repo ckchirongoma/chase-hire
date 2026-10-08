@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { cspConnectOrigins, extractPageLinks, extractScriptUrls, extractSupabaseConfig } from "@/lib/harness/bundle";
+import { cspConnectOrigins, extractCustomerLinks, extractPageLinks, extractScriptUrls, extractSupabaseConfig, routeShape } from "@/lib/harness/bundle";
 import { decodeJwt, findJwts, scanSecrets } from "@/lib/harness/jwt";
 
 // Built at run time: nothing secret-shaped is committed.
@@ -90,5 +90,29 @@ describe("bundle reading", () => {
 
   it("reports no key when there is none", () => {
     expect(extractSupabaseConfig(["console.log('hi')"]).key).toBeNull();
+  });
+});
+
+describe("signed-in crawl helpers", () => {
+  const base = new URL("https://desk.example.co.za/");
+
+  it("collects customer links with their names, decoding entities", () => {
+    const html = `<a href="/customers/0b1c2d3e-0000-4000-8000-000000000001"><span>MARULA &amp; SONS CC</span></a><a href="/customers/42">Kudu</a><a href="/customers/42">dup</a><a href="/customers/1/edit">no</a><a href="https://elsewhere.example/customers/9">no</a>`;
+    expect(extractCustomerLinks(html, base)).toEqual([
+      { url: "https://desk.example.co.za/customers/0b1c2d3e-0000-4000-8000-000000000001", id: "0b1c2d3e-0000-4000-8000-000000000001", text: "MARULA & SONS CC" },
+      { url: "https://desk.example.co.za/customers/42", id: "42", text: "Kudu" },
+    ]);
+  });
+
+  it("collapses id-like path segments into one route shape", () => {
+    expect(routeShape(new URL("https://x.example/customers/0b1c2d3e-0000-4000-8000-000000000001"))).toBe("/customers/:id");
+    expect(routeShape(new URL("https://x.example/customers/123/lines"))).toBe("/customers/:id/lines");
+    expect(routeShape(new URL("https://x.example/queue"))).toBe("/queue");
+  });
+
+  it("ignores minified fragments that only look like URLs", () => {
+    const key = publishable();
+    const cfg = extractSupabaseConfig([`var a="https://a",b="https://x";c("http://127.0.0.1:55321","${key}")`]);
+    expect(cfg.candidates.map((c) => c.url)).toEqual(["http://127.0.0.1:55321"]);
   });
 });

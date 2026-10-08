@@ -793,10 +793,17 @@ function presentAsTheBaLeftIt() {
     "/** Admin client (bypasses RLS). */\n",
     { label: "presentation" },
   );
+  edit(
+    "lib/supabase/browser.ts",
+    "/**\n * Browser client: the project URL and the publishable key only (both public by design; RLS\n * protects the data). Used to sign in, which stores the session in cookies the server reads.\n * Never put a server key here or in any NEXT_PUBLIC_ variable.\n */\n",
+    "/** Supabase client for the browser (login). */\n",
+    { label: "presentation" },
+  );
 }
 presentAsTheBaLeftIt.verify = () => {
   check(read("README.md") === STARTER_README && !exists("docs/ADR-001.md") && !exists("RELEASE_NOTES.md"), "presentation: README and docs");
   check(fs.readdirSync(abs("tests")).filter((f) => f.endsWith(".test.ts")).join() === "normalise.test.ts", "presentation: only normalise tests");
+  check(!/server key|NEXT_PUBLIC_ variable/.test(read("lib/supabase/browser.ts")), "presentation: no hint in the browser client");
 };
 
 // ───────────────────────── F13: history ─────────────────────────

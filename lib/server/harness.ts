@@ -3,12 +3,14 @@ import { NextResponse } from "next/server";
 import type { SupabaseClient, User } from "@supabase/supabase-js";
 import { z } from "zod";
 import { CHECK_KEYS, kindOf, toRunRow, type CheckKey, type CheckResult } from "@/lib/harness/checks";
-import { BUNDLE_FILES, HarnessExpected, optoutEntries } from "@/lib/harness/expected";
+import { BUNDLE_FILES, HarnessExpected, optoutEntries, optoutEntriesFromSheet, type OptoutEntry } from "@/lib/harness/expected";
 import { dispatchConfig, dispatchWorkflow, localRepoCheckCommands } from "@/lib/harness/github";
+import { isPrivilegedKey } from "@/lib/harness/jwt";
 import { Budget, createHttp } from "@/lib/harness/http";
 import { runImportChecks } from "@/lib/harness/import-checks";
 import { parseTestLogins } from "@/lib/harness/logins";
 import { runUrlChecks } from "@/lib/harness/url-checks";
+import { readFirstSheet } from "@/lib/harness/xlsx-lite";
 import { isAdmin } from "@/lib/server/auth";
 import { enqueueGrading, runGradingJob, type JobRun } from "@/lib/server/grading";
 import { routeUser } from "@/lib/server/route";
@@ -94,6 +96,24 @@ export async function loadExpected(admin: SupabaseClient, prefix: string): Promi
   return parsed.data;
 }
 
+/**
+ * The opt-out list for U7: the candidate's optouts_legal.xlsx (names only, as the app must
+ * match them), enriched with the answer key's registration numbers; else the answer key's list.
+ */
+export async function loadOptouts(admin: SupabaseClient, prefix: string, expected: HarnessExpected | null): Promise<{ entries: OptoutEntry[]; source: string }> {
+  const raw = await download(admin, `${prefix}/${BUNDLE_FILES.optouts}`);
+  if (raw) {
+    try {
+      const entries = optoutEntriesFromSheet(readFirstSheet(raw), expected);
+      if (entries?.length) return { entries, source: `bundle ${BUNDLE_FILES.optouts} (${entries.length} names)` };
+    } catch (err) {
+      console.warn("harness: could not read the opt-out sheet:", (err as Error).message);
+    }
+  }
+  const entries = optoutEntries(expected);
+  return { entries, source: entries.length ? `answer key opt-out list (${entries.length} names)` : "none" };
+}
+
 // ───────────────────────── Run log / lock ─────────────────────────
 
 async function startRun(admin: SupabaseClient, submissionId: string, kind: HarnessKind, ranBy: string | null, status: "running" | "dispatched" = "running"): Promise<string> {
@@ -145,6 +165,8 @@ export interface RunOptions {
   bundlePrefix?: string;
   budgetMs?: number;
   observatoryUrl?: string;
+  /** Tests only: re-count every N ms while an import settles (default 2.5 s). */
+  settlePollMs?: number;
 }
 
 /** Admin-entered Supabase URL/key win over what the candidate wrote next to the logins. */
@@ -158,7 +180,9 @@ export async function runUrlHarness(admin: SupabaseClient, submissionId: string,
   const runId = await startRun(admin, submissionId, "url", opts.ranBy);
   const startedAt = Date.now();
   try {
-    const expected = await loadExpected(admin, opts.bundlePrefix ?? sub.bundlePrefix).catch(() => null);
+    const prefix = opts.bundlePrefix ?? sub.bundlePrefix;
+    const expected = await loadExpected(admin, prefix).catch(() => null);
+    const optouts = await loadOptouts(admin, prefix, expected);
     const http = createHttp({ budget: new Budget(opts.budgetMs ?? URL_BUDGET_MS) });
     const logins = parseTestLogins(sub.testLogins);
     const { results, context } = sub.deployedUrl
@@ -166,14 +190,15 @@ export async function runUrlHarness(admin: SupabaseClient, submissionId: string,
           http,
           deployedUrl: sub.deployedUrl,
           logins,
-          optouts: optoutEntries(expected),
+          optouts: optouts.entries,
+          optoutSource: optouts.source,
           overrides: mergeOverrides(opts.overrides, logins),
           observatoryUrl: opts.observatoryUrl ?? process.env.HARNESS_OBSERVATORY_URL ?? undefined,
         })
       : { results: (["U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8"] as const).map((key) => ({ key, passed: null, detail: { summary: "Inconclusive: no deployed URL was submitted", inconclusive: true as const, reason: "no deployed URL was submitted" } })), context: {} };
     await writeResults(admin, submissionId, results, { ranBy: opts.ranBy, runId, target: sub.deployedUrl, startedAt });
     const t = tally(results);
-    await finishRun(admin, runId, "done", { ...t, context, opt_out_list: expected ? "bundle" : "missing" });
+    await finishRun(admin, runId, "done", { ...t, context, opt_out_list: optouts.source });
     return { runId, results: results.map(brief), skipped: [], ...t };
   } catch (err) {
     await finishRun(admin, runId, "failed", { error: err instanceof Error ? err.message.slice(0, 500) : String(err) });
@@ -195,7 +220,7 @@ export async function runImportHarness(admin: SupabaseClient, submissionId: stri
   try {
     const http = createHttp({ budget: new Budget(opts.budgetMs ?? IMPORT_BUDGET_MS) });
     const logins = parseTestLogins(sub.testLogins);
-    const run = await runImportChecks({ http, deployedUrl: sub.deployedUrl, logins, expected, files: { month2, drift }, overrides: mergeOverrides(opts.overrides, logins) });
+    const run = await runImportChecks({ http, deployedUrl: sub.deployedUrl, logins, expected, files: { month2, drift }, overrides: mergeOverrides(opts.overrides, logins), settlePollMs: opts.settlePollMs });
     await writeResults(admin, submissionId, run.results, { ranBy: opts.ranBy, runId, target: sub.deployedUrl, startedAt });
     const t = tally(run.results);
     await finishRun(admin, runId, "done", { ...t, skipped: run.skipped, context: run.context });
@@ -282,7 +307,13 @@ export const Overrides = z.object({
     .max(2000)
     .optional()
     .transform((v) => v || undefined)
-    .pipe(z.string().regex(/^[A-Za-z0-9._-]+$/, "The key may only contain letters, digits, dot, dash and underscore").optional()),
+    .pipe(
+      z
+        .string()
+        .regex(/^[A-Za-z0-9._-]+$/, "The key may only contain letters, digits, dot, dash and underscore")
+        .refine((k) => !isPrivilegedKey(k), "That is a secret or service-role key: enter the project's publishable (anon) key")
+        .optional(),
+    ),
 });
 
 export const FLASH_COOKIE = "harness_flash";

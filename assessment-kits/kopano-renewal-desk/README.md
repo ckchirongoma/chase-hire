@@ -12,10 +12,11 @@ without signing in, and the server key never reaches the browser.
 
 ```
 Browser ──► Next.js 15 (App Router, TypeScript) on Vercel / any Node host
-              │  pages and /api/* route handlers act AS THE SIGNED-IN USER
-              │  (Supabase session cookie, or `Authorization: Bearer <token>` for API clients)
-              ▼
-            Supabase
+   │          │  pages and /api/* route handlers act AS THE SIGNED-IN USER
+   │          │  (Supabase session cookie, or `Authorization: Bearer <token>` for API clients)
+   │          ▼
+   └──────► Supabase   (the browser talks to it only to sign in, with the publishable key;
+              │          the session lands in a cookie the server reads)
               ├─ Auth (email + password; logins are created by a manager or the seed)
               ├─ Postgres with RLS on every table (supabase/migrations/)
               │    ├─ rules in the database: RD-07 check constraint, RD-11 trigger,
@@ -72,6 +73,7 @@ build keeps working against the newer schema.
 
 ## Decisions
 
+- **The browser holds only public settings.** It signs in with the project URL and the publishable key (`lib/supabase/browser.ts`); everything else goes through server pages and `/api/*` routes acting as the user. No server key is used by the app at all, only by the seed script on an admin's machine.
 - **Rules live in the database as well as the UI.** RD-07 is a check constraint and RD-11 a trigger, so a REST call or a future script cannot bypass them. The API repeats the checks only to give a clear message.
 - **Imports are all-or-nothing.** The app parses and normalises the file; one Postgres function applies it in a single transaction. A changed file structure stops the import before anything is written, naming the column.
 - **Identity.** Customer: account number already known → registration number → normalised name. Line: E.164 number. Re-importing a file changes nothing (unchanged rows are not even touched).

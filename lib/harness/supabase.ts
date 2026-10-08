@@ -14,6 +14,12 @@ export interface Session {
   email: string;
   /** The token endpoint's JSON (what @supabase/ssr stores in its cookie). */
   raw: Record<string, unknown>;
+  /**
+   * The cookies the app itself set when the user signed in through its login form (no-JS
+   * fallback when the bundle carries no publishable key). Sent as-is to the app's routes.
+   */
+  cookieHeader?: string;
+  via?: "supabase-auth" | "app-login-form";
 }
 
 export class ProbeError extends Error {
@@ -94,7 +100,7 @@ export class SupabaseProbe {
     }
     const raw = { ...j };
     delete raw.weak_password;
-    return { accessToken: j.access_token, userId: user.id, email: typeof user.email === "string" ? user.email : email, raw };
+    return { accessToken: j.access_token, userId: user.id, email: typeof user.email === "string" ? user.email : email, raw, via: "supabase-auth" };
   }
 
   private async rest<T>(method: string, table: string, params: Filters, opts: { session?: Session | null; body?: unknown; prefer?: string; count?: boolean; timeoutMs?: number }): Promise<RestResult<T>> {
@@ -185,7 +191,11 @@ export function sessionCookieHeader(supabaseUrl: string, session: Session): stri
   return parts.join("; ");
 }
 
-/** Headers that authenticate an app route as this user (cookie for SSR apps, bearer for APIs). */
-export function appAuthHeaders(supabaseUrl: string, session: Session): Record<string, string> {
-  return { cookie: sessionCookieHeader(supabaseUrl, session), authorization: `Bearer ${session.accessToken}` };
+/**
+ * Headers that authenticate an app route as this user (cookie for SSR apps, bearer for APIs):
+ * the app's own cookies when it set them, else the @supabase/ssr cookie built for the project.
+ */
+export function appAuthHeaders(supabaseUrl: string | null, session: Session): Record<string, string> {
+  const cookie = session.cookieHeader ?? (supabaseUrl ? sessionCookieHeader(supabaseUrl, session) : null);
+  return { ...(cookie ? { cookie } : {}), authorization: `Bearer ${session.accessToken}` };
 }

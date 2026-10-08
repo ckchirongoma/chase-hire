@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { Workbook } from "exceljs";
 import type { ExpectedMonth2 } from "./answer-key";
 import { generateBase, monthsBucket, PRICE_PLANS, makeRegNo, type Base, type Line } from "./base";
@@ -8,8 +10,9 @@ import { addSheet, newWorkbook, type CellIn } from "./xlsx";
 
 /**
  * Bundle C (SWE Test 1, docs/07 + docs/11): the messy month-1 base, the agents' contact sheets,
- * the legal opt-out list (company names only), and the held-back month-2 files with known
- * deltas plus expected_month2.json for the import harness (M1–M7).
+ * the legal opt-out list (company names only), the BA's handoff pack (assessment-kits/HANDOFF.md),
+ * and the held-back month-2 files with known deltas plus expected_month2.json for the import
+ * harness (M1–M7).
  */
 
 export const C_FILES = {
@@ -19,7 +22,27 @@ export const C_FILES = {
   month2: "base_month2.xlsx",
   drift: "base_month2_drift.xlsx",
   expected: "expected_month2.json",
+  handoff: "HANDOFF.md",
 } as const;
+
+/** Where the candidate-facing handoff pack lives, relative to the repository root. */
+export const C_HANDOFF_SOURCE = path.join("assessment-kits", "HANDOFF.md");
+
+/**
+ * The handoff pack (stories RD-01..RD-12, business rules, access matrix), read from
+ * assessment-kits/HANDOFF.md by walking up from `from` (the generator and the tests run inside
+ * the repository). One source of truth: edit assessment-kits/HANDOFF.md, then regenerate.
+ */
+export function readHandoffPack(from: string = process.cwd()): string {
+  let dir = path.resolve(from);
+  for (;;) {
+    const candidate = path.join(dir, C_HANDOFF_SOURCE);
+    if (fs.existsSync(candidate)) return fs.readFileSync(candidate, "utf8");
+    const up = path.dirname(dir);
+    if (up === dir) throw new Error(`${C_HANDOFF_SOURCE} not found above ${from}: run the generator from inside the repository`);
+    dir = up;
+  }
+}
 
 export const C_COLUMNS = [
   "Account No", "Reg No", "Customer Name", "Msisdn", "dealer_code", "Segment", "Contract Term", "Contract End Date", "Contract Status",
@@ -112,6 +135,8 @@ export interface BundleC {
   drift: Workbook;
   expected: ExpectedMonth2;
   readme: string;
+  /** HANDOFF.md for candidate/ (the BA's handoff pack). */
+  handoff: string;
 }
 
 export const C_README = `# Kopano Renewal Desk: SWE Test 1 data pack
@@ -120,16 +145,23 @@ Everything in this pack is synthetic. Every name, number and email address is fi
 
 | File | What it is |
 |---|---|
+| \`HANDOFF.md\` | The BA's handoff pack: the problem, user stories RD-01 to RD-12 with acceptance criteria, business rules, the access matrix, edge cases and what is out of scope. |
 | \`base_month1.xlsx\` | The client's monthly base export (one row per phone line). This is the file their manager will upload every month. |
 | \`contacts_agent_sheets.xlsx\` | Three agents' personal contact sheets, one tab per agent. They overlap and they disagree. |
 | \`optouts_legal.xlsx\` | Legal's opt-out and "under legal review" list. It is keyed by company name only. |
 
-**The starter repo and the handoff pack are provided by Chase:** STARTER_REPO_URL
+## The starter repo
+
+The BA's MVP is here: STARTER_REPO_URL
+
+Clone it and push it, as it is, to a new repository on your own GitHub account, then do your work
+there. Submit that repository's URL.
 
 Read the brief in the platform for what to build. A later month's export will be used when we grade your import.
 `;
 
-export function buildBundleC(seed: number, version: string): BundleC {
+export function buildBundleC(seed: number, version: string, opts: { handoffMd?: string } = {}): BundleC {
+  const handoff = opts.handoffMd ?? readHandoffPack();
   const root = createSynthRng(seed).fork("bundle_c");
   const br = root.fork("base");
   const base: Base = generateBase(br, {
@@ -451,5 +483,5 @@ export function buildBundleC(seed: number, version: string): BundleC {
     },
   };
 
-  return { month1, contacts, optouts, month2, drift, expected, readme: C_README };
+  return { month1, contacts, optouts, month2, drift, expected, readme: C_README, handoff };
 }

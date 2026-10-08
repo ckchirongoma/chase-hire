@@ -196,9 +196,13 @@ regex = '''\\bsb_secret_[A-Za-z0-9_-]{20,}'''
 id = "env-file-secret"
 description = "Secret-looking value assigned in a committed .env file"
 path = '''(^|/)\\.env(\\.[A-Za-z0-9_-]+)*$'''
-regex = '''(?i)[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASS)[A-Z0-9_]*\\s*=\\s*["']?([A-Za-z0-9_\\-.+/=]{20,})'''
+# [ \\t]* (not \\s*): an empty "KEY=" must not swallow the next line as its value.
+regex = '''(?im)^[ \\t]*(?:export[ \\t]+)?[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASS)[A-Z0-9_]*[ \\t]*=[ \\t]*["']?([A-Za-z0-9_\\-.+/=]{20,})'''
 secretGroup = 1
 entropy = 3.0
+[[rules.allowlists]]
+description = "Example env files hold placeholders, not secrets"
+paths = ['''(^|/)\\.env(\\.[A-Za-z0-9_-]+)*\\.(example|sample|template|dist)$''']
 `;
 
 async function r1(clone: string, sha: string, files: RepoFile[], tmp: string): Promise<{ result: CheckResult; tool: string }> {
@@ -391,10 +395,13 @@ async function execSteps(clone: string, mode: "docker" | "host", steps: Step[], 
     if (mode === "docker") {
       const name = `verify-swe1-${randomBytes(4).toString("hex")}`;
       const uid = typeof process.getuid === "function" ? `${process.getuid()}:${process.getgid?.() ?? 0}` : "1000:1000";
-      const envArgs = Object.entries({ ...baseEnv, HOME: "/tmp/home", npm_config_cache: "/tmp/npm-cache" }).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+      // Behind a TLS-intercepting proxy the registry needs its CA: pass the (public) CA file through.
+      const ca = process.env.NODE_EXTRA_CA_CERTS && fs.existsSync(process.env.NODE_EXTRA_CA_CERTS) ? path.resolve(process.env.NODE_EXTRA_CA_CERTS) : null;
+      const caArgs = ca ? ["-v", `${ca}:/etc/verify-swe1-ca.crt:ro`] : [];
+      const envArgs = Object.entries({ ...baseEnv, HOME: "/tmp/home", npm_config_cache: "/tmp/npm-cache", ...(ca ? { NODE_EXTRA_CA_CERTS: "/etc/verify-swe1-ca.crt" } : {}) }).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
       ran = await run(
         "docker",
-        ["run", "--rm", "--name", name, "--memory", "6g", "--cpus", "2", "--pids-limit", "4096", "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--user", uid, "-v", `${clone}:/work`, "-w", "/work", ...envArgs, NODE_IMAGE, "sh", "-c", `mkdir -p /tmp/home && ${step.cmd}`],
+        ["run", "--rm", "--name", name, "--memory", "6g", "--cpus", "2", "--pids-limit", "4096", "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--user", uid, "-v", `${clone}:/work`, ...caArgs, "-w", "/work", ...envArgs, NODE_IMAGE, "sh", "-c", `mkdir -p /tmp/home && ${step.cmd}`],
         { timeoutMs: step.timeoutMs, onTimeout: () => spawnSync("docker", ["kill", name], { stdio: "ignore" }) },
       );
     } else {
@@ -461,8 +468,10 @@ async function r4r5(clone: string, files: RepoFile[], args: Args): Promise<Check
 
 export async function repoChecks(args: Args): Promise<{ checks: CheckResult[]; tools: Record<string, string> }> {
   dockerDisabled = args.noDocker;
-  const tmp = args.workdir ?? fs.mkdtempSync(path.join(os.tmpdir(), "verify-swe1-"));
-  fs.mkdirSync(tmp, { recursive: true });
+  // Always a fresh folder of our own (inside --workdir when given), so cleaning up never deletes
+  // anything we did not create.
+  if (args.workdir) fs.mkdirSync(args.workdir, { recursive: true });
+  const tmp = fs.mkdtempSync(path.join(args.workdir ?? os.tmpdir(), "verify-swe1-"));
   const clone = path.join(tmp, "repo");
   const tools: Record<string, string> = { node: process.version };
   const all = (reason: string) => (["R1", "R2", "R3", "R4", "R5", "R6", "R7"] as const).map((k) => inconclusive(k, reason));

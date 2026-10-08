@@ -71,6 +71,12 @@ describe("admin harness routes", () => {
     expect(Overrides.parse({ supabase_url: "", anon_key: "" })).toEqual({ supabase_url: undefined, anon_key: undefined });
     expect(Overrides.safeParse({ supabase_url: "javascript:alert(1)" }).success).toBe(false);
     expect(Overrides.safeParse({ anon_key: "abc def" }).success).toBe(false);
+    // Never a key that bypasses RLS (built at run time: nothing secret-shaped is committed).
+    expect(Overrides.safeParse({ anon_key: ["sb", "secret", "0123456789abcdef"].join("_") }).success).toBe(false);
+    const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    expect(Overrides.safeParse({ anon_key: `${b64({ alg: "HS256" })}.${b64({ role: "service_role" })}.c2ln` }).success).toBe(false);
+    expect(Overrides.safeParse({ anon_key: `${b64({ alg: "HS256" })}.${b64({ role: "anon" })}.c2ln` }).success).toBe(true);
+    expect(Overrides.safeParse({ anon_key: ["sb", "publishable", "0123456789abcdef"].join("_") }).success).toBe(true);
     expect(Overrides.parse({ supabase_url: "https://abcdefghijklmnopqrst.supabase.co" }).supabase_url).toBe("https://abcdefghijklmnopqrst.supabase.co");
   });
 });

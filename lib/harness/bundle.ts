@@ -1,3 +1,4 @@
+import { decodeEntities } from "./app-login";
 import { scanSecrets, type FoundJwt } from "./jwt";
 
 /**
@@ -59,10 +60,38 @@ export function extractPageLinks(html: string, base: URL): string[] {
   return [...out];
 }
 
+/** A path's "route shape": id-like segments (UUIDs, numbers, long tokens) become :id. */
+export function routeShape(u: URL): string {
+  return u.pathname
+    .split("/")
+    .map((seg) => (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg) || /^\d+$/.test(seg) || /^[A-Za-z0-9_-]{20,}$/.test(seg) ? ":id" : seg))
+    .join("/");
+}
+
+export interface EntityLink {
+  url: string;
+  id: string;
+  /** The link text (tags stripped), e.g. the customer's name in a queue table. */
+  text: string;
+}
+
+/** Same-origin links to a customer page (/customer/:id, /customers/:id) with their link text. */
+export function extractCustomerLinks(html: string, base: URL): EntityLink[] {
+  const out = new Map<string, EntityLink>();
+  for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi)) {
+    const u = sameOrigin(decodeEntities(m[1]), base);
+    const id = u?.pathname.match(/^\/customers?\/([A-Za-z0-9_-]{1,64})\/?$/)?.[1];
+    if (!u || !id || out.has(id)) continue;
+    const text = decodeEntities(m[2].replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 200);
+    out.set(id, { url: u.toString(), id, text });
+  }
+  return [...out.values()];
+}
+
 export interface SupabaseCandidate {
   url: string;
-  /** Why this URL was picked: supabase-host, jwt-ref, csp (connect-src), near-key, any-url. */
-  via: "supabase-host" | "jwt-ref" | "csp" | "near-key" | "any-url";
+  /** Why this URL was picked: admin override, the signed-in token's issuer, supabase-host, jwt-ref, csp (connect-src), near-key, any-url. */
+  via: "admin override" | "token-iss" | "supabase-host" | "jwt-ref" | "csp" | "near-key" | "any-url";
 }
 
 export interface SupabaseConfig {
@@ -92,6 +121,8 @@ function originOf(raw: string): string | null {
   try {
     const u = new URL(raw);
     if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    // Minified code is full of "https://a"-style fragments: a real host has a dot, or is localhost / an IP.
+    if (!/\.[a-z]{2,}$/i.test(u.hostname) && u.hostname !== "localhost" && !/^\d{1,3}(\.\d{1,3}){3}$/.test(u.hostname) && !u.hostname.startsWith("[")) return null;
     return u.origin;
   } catch {
     return null;

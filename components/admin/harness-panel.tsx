@@ -165,8 +165,13 @@ export default async function HarnessPanel({ submissionId }: { submissionId: str
             Probes the deployed app as anonymous, agent A, agent B and the manager. Writes a few labelled probe rows (notes start with &quot;Verification harness probe&quot;), sends about 200
             requests to /api/summary, and asks the MDN Observatory to scan the host. Up to 5 minutes.
           </p>
+          <p className="muted">
+            Apps that keep Supabase server-side ship no publishable key: the harness then signs in through the app&apos;s login form and tests the app&apos;s routes, but the database
+            probes (U3, and the REST halves of U4, U6, U7, plus all import checks) need the project&apos;s publishable key. It is read from a &quot;supabase: &lt;URL&gt; / &lt;publishable
+            key&gt;&quot; line in the test logins, or enter it here (it is public by design; never a secret or service-role key).
+          </p>
           <details>
-            <summary className="cursor-pointer text-xs text-slate-500">Supabase URL / key override (if the bundle scan cannot find them)</summary>
+            <summary className="cursor-pointer text-xs text-slate-500">Supabase URL / publishable key (if the bundle and the logins do not have them)</summary>
             <label className="mt-2 block text-xs">
               Supabase URL
               <input name="supabase_url" type="url" className={field} placeholder="https://xyz.supabase.co" />
